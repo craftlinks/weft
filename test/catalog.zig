@@ -19,7 +19,8 @@
 //! ## 4. Graphs
 //! Waves alone cannot notice a change in how a `Program` evaluates, so the catalog also samples
 //! whole graphs through a `State`, on the same epochs. They come after the waves in the text, so a
-//! change to either shows up on its own lines.
+//! change to either shows up on its own lines. Cues are set relative to the epoch, so a sequence
+//! of tweens runs at each one, and a test locks that it has the same bits at all of them.
 //!
 //! ## 5. TigerStyle Invariants
 //! - The text fits in `text_size_max` by construction, so `render` cannot fail.
@@ -60,8 +61,10 @@ const shapes = std.enums.values(weft.Shape);
 const Graph = enum {
     tremolo,
     drift,
+    sequence,
 
     const nodes_count_max = 8;
+    const cues_count = 3;
 };
 
 const graphs = std.enums.values(Graph);
@@ -79,7 +82,7 @@ pub const text_size_max = sample_count * line_size_max;
 
 comptime {
     assert(wave_sample_count == 1536);
-    assert(graph_sample_count == 192);
+    assert(graph_sample_count == 288);
     assert(text_size_max < 1 << 20);
     for (signals) |signal| assert(weft.Rate.from_hz(signal.rate_hz) != null);
 }
@@ -123,9 +126,18 @@ fn render_run(
 }
 
 fn render_graph_run(writer: *std.Io.Writer, graph: Graph, epoch: *const Epoch) void {
+    // Half a second into the epoch, then a second apart.
+    var cue_times: [Graph.cues_count]weft.Time = undefined;
+    var cues = weft.Cues.init(&cue_times);
+    for (0..Graph.cues_count) |index| {
+        const half_seconds: i64 = 2 * @as(i64, @intCast(index)) + 1;
+        const flicks = (2 * epoch.seconds + half_seconds) * flicks_per_half_second;
+        _ = cues.add(.{ .flicks = flicks }) catch unreachable;
+    }
+
     var nodes: [Graph.nodes_count_max]weft.Node = undefined;
     var slab: [Graph.nodes_count_max]f64 = undefined;
-    var builder = weft.Builder.init(&nodes, .{ .slab_count_max = slab.len });
+    var builder = weft.Builder.init(&nodes, .{ .slab_count_max = slab.len, .cues = cues.table() });
     const output = graph_build(graph, &builder) catch unreachable;
     var state = weft.State.init(builder.finish(), &slab);
 
@@ -144,6 +156,8 @@ fn render_graph_run(writer: *std.Io.Writer, graph: Graph, epoch: *const Epoch) v
 
 /// Spreads a run over about four seconds, nearly three cycles of the slowest wave.
 const graph_stride_ticks = 8192;
+
+const flicks_per_half_second = @divExact(weft.time.flicks_per_second, 2);
 
 fn graph_build(graph: Graph, builder: *weft.Builder) weft.Builder.Error!weft.Id {
     switch (graph) {
@@ -167,6 +181,34 @@ fn graph_build(graph: Graph, builder: *weft.Builder) weft.Builder.Error!weft.Id 
             const half = try builder.constant(0.5);
             const scaled = try builder.multiply(second, half);
             return builder.add(first, scaled);
+        },
+        // Three tweens a second each, one on each cue, with an overshoot in the middle.
+        .sequence => {
+            const second: weft.Time = .{ .flicks = weft.time.flicks_per_second };
+            const rise = try builder.tween(.{
+                .from = 0,
+                .to = 1,
+                .duration = second,
+                .ease = .in_out,
+                .start = .{ .index = 0 },
+                .previous = null,
+            });
+            const overshoot = try builder.tween(.{
+                .from = 1,
+                .to = 3,
+                .duration = second,
+                .ease = .{ .x1 = 0.34, .y1 = 1.56, .x2 = 0.64, .y2 = 1 },
+                .start = .{ .index = 1 },
+                .previous = rise,
+            });
+            return builder.tween(.{
+                .from = 3,
+                .to = -0.1,
+                .duration = second,
+                .ease = .out,
+                .start = .{ .index = 2 },
+                .previous = overshoot,
+            });
         },
     }
 }
@@ -262,6 +304,28 @@ test "a one-bit change is found and names the signal" {
     try testing.expectEqualStrings(line, mismatch.expected);
     try testing.expect(std.mem.startsWith(u8, mismatch.actual, line[0..hex_start]));
     try testing.expect(!std.mem.eql(u8, mismatch.expected, mismatch.actual));
+}
+
+// Locks what integer time gives a tween: the cues of `sequence` sit at the same place in each
+// epoch, so its samples have the same bits an hour either side of zero and a day on.
+test "a tween sequence has the same bits at every epoch" {
+    const text = render(&text_a);
+    const zero_start = std.mem.indexOf(u8, text, "graph sequence zero 0 ").?;
+    var zero_lines = std.mem.splitScalar(u8, text[zero_start..], '\n');
+    var zero_values: [samples_per_run][]const u8 = undefined;
+    for (&zero_values) |*value| {
+        const line = zero_lines.next().?;
+        value.* = line[std.mem.lastIndexOfScalar(u8, line, ' ').? + 1 ..];
+    }
+    for (epochs) |epoch| {
+        for (zero_values, 0..) |value, index| {
+            var buffer: [line_size_max]u8 = undefined;
+            const line = try std.fmt.bufPrint(&buffer, "graph sequence {s} {d} {s}\n", .{
+                epoch.name, index, value,
+            });
+            try testing.expect(std.mem.indexOf(u8, text, line) != null);
+        }
+    }
 }
 
 // Locks the answers of `compare` for equal texts, a missing line, and an extra blank line, the

@@ -27,13 +27,27 @@
 //! An `Id` is a node's index, stable for the life of the program. The program stores no names: a
 //! name belongs to whoever chose it, such as a text front end, which maps names to ids.
 //!
-//! ## 6. TigerStyle Invariants
+//! ## 6. Tweens and Cues
+//! A tween is one more pure node, so keyframes are not a second system. It refers to a cue and not
+//! to a time, so moving the cue moves the tween, and it measures its progress as a difference of
+//! integers, so it keeps every bit however far it is from zero. At and after its end it returns
+//! `to` itself, not a computed value, so it lands exactly.
+//!
+//! The cue table is the one thing a program reads that can change, which `cue.zig` explains. A move
+//! can change which tweens overlap at any time, long after building, so an overlap cannot be
+//! refused. It has one defined answer instead: a tween's `previous` is what it follows until its
+//! own start, and from then on the tween wins. A chain of tweens is a sequence, with no sequence
+//! type, and a gap between two tweens holds the earlier one's `to`.
+//!
+//! ## 7. TigerStyle Invariants
 //! - Capacities come from the caller, and the builder refuses what does not fit, by name.
 //! - `eval` allocates nothing, takes no lock, and is one bounded pass over the node array.
 //! - Offsets are consecutive from 0, so the slab has no gaps and no node overlaps another.
 
 const std = @import("std");
 const assert = std.debug.assert;
+const Cue = @import("cue.zig").Cue;
+const Ease = @import("ease.zig").Ease;
 const Time = @import("time.zig").Time;
 const Wave = @import("wave.zig").Wave;
 
@@ -70,12 +84,38 @@ pub const MapRange = struct {
     output_high: f64,
 };
 
+/// Moves from `from` to `to`, over `duration` from the time of the cue `start`.
+pub const Tween = struct {
+    from: f64,
+    to: f64,
+    /// How long the move takes, above zero. Measured from the cue, so it moves with the cue.
+    duration: Time,
+    ease: Ease,
+    start: Cue,
+    /// The signal to follow before `start`, or null to hold `from`.
+    previous: ?Id,
+
+    /// The value at or after `start_time`.
+    fn value_after(tween: *const Tween, time: Time, start_time: Time) f64 {
+        assert(time.flicks >= start_time.flicks);
+        assert(tween.duration.flicks > 0);
+        // Wrapping, because the distance between two i64 only fits in a u64.
+        const elapsed: u64 = @bitCast(time.flicks -% start_time.flicks);
+        const duration: u64 = @intCast(tween.duration.flicks);
+        if (elapsed >= duration) return tween.to;
+        const progress = @as(f64, @floatFromInt(elapsed)) / @as(f64, @floatFromInt(duration));
+        const eased = tween.ease.apply(progress);
+        return tween.from * (1 - eased) + tween.to * eased;
+    }
+};
+
 pub const Op = union(enum) {
     constant: f64,
     add: Binary,
     multiply: Binary,
     map_range: MapRange,
     wave: Wave,
+    tween: Tween,
 };
 
 pub const Node = struct {
@@ -86,15 +126,17 @@ pub const Node = struct {
 };
 
 comptime {
-    // One node per cache line at worst, on native and wasm alike.
-    assert(@sizeOf(Node) <= 64);
+    // A tween is the largest op. The array is read in order, so this costs prefetch, not misses.
+    assert(@sizeOf(Node) <= 96);
     assert(@sizeOf(Id) == @sizeOf(u32));
     assert(@alignOf(Node) == @alignOf(f64));
 }
 
-/// An immutable node array, and the size of the slab it needs. A view of memory that can move.
+/// An immutable node array, the cue times it reads, and the size of the slab it needs. A view of
+/// memory that can move.
 pub const Program = struct {
     nodes: []const Node,
+    cues: []const Time,
     slab_count: u32,
 
     fn assert_valid(program: Program) void {
@@ -109,6 +151,10 @@ pub const Program = struct {
                     assert(op.right.index < index);
                 },
                 .map_range => |op| assert(op.input.index < index),
+                .tween => |op| {
+                    assert(op.start.index < program.cues.len);
+                    if (op.previous) |previous| assert(previous.index < index);
+                },
             }
         }
         assert(offset == program.slab_count);
@@ -121,6 +167,7 @@ pub const Builder = struct {
     node_count: u32,
     slab_count: u32,
     slab_count_max: u32,
+    cues: []const Time,
     /// The extent of every node built, 1 by 1 until a later step gives each node its own.
     extent: Extent,
     finished: bool,
@@ -136,10 +183,18 @@ pub const Builder = struct {
         NotFinite,
         /// A map whose input range has no width, or one too wide for a double.
         InvalidRange,
+        /// A cue that the table given in `Options` does not have.
+        UnknownCue,
+        /// A tween whose duration is not above zero.
+        InvalidDuration,
+        /// A tween whose ease fails `Ease.valid`.
+        InvalidEase,
     };
 
     pub const Options = struct {
         slab_count_max: u32,
+        /// The cue times tweens can start from, from `Cues.table`.
+        cues: []const Time = &.{},
     };
 
     pub fn init(nodes: []Node, options: Options) Builder {
@@ -149,6 +204,7 @@ pub const Builder = struct {
             .node_count = 0,
             .slab_count = 0,
             .slab_count_max = options.slab_count_max,
+            .cues = options.cues,
             .extent = .{ .lanes = 1, .components = 1 },
             .finished = false,
         };
@@ -186,6 +242,16 @@ pub const Builder = struct {
         return builder.push(.{ .wave = source });
     }
 
+    pub fn tween(builder: *Builder, source: Tween) Error!Id {
+        if (source.previous) |previous| try builder.check_known(previous);
+        if (source.start.index >= builder.cues.len) return error.UnknownCue;
+        if (!std.math.isFinite(source.from)) return error.NotFinite;
+        if (!std.math.isFinite(source.to)) return error.NotFinite;
+        if (source.duration.flicks <= 0) return error.InvalidDuration;
+        if (!source.ease.valid()) return error.InvalidEase;
+        return builder.push(.{ .tween = source });
+    }
+
     /// The program built so far. Nothing can be added after this.
     pub fn finish(builder: *Builder) Program {
         assert(!builder.finished);
@@ -193,6 +259,7 @@ pub const Builder = struct {
         builder.finished = true;
         const program: Program = .{
             .nodes = builder.nodes[0..builder.node_count],
+            .cues = builder.cues,
             .slab_count = builder.slab_count,
         };
         program.assert_valid();
@@ -244,7 +311,7 @@ pub const State = struct {
     /// call, so a reader can ask for any time in any order.
     pub fn eval(state: *State, time: Time) void {
         assert(state.slab.len == state.program.slab_count);
-        for (state.program.nodes) |*node| eval_node(state.program.nodes, state.slab, node, time);
+        for (state.program.nodes) |*node| eval_node(&state.program, state.slab, node, time);
         state.evaluated = true;
     }
 
@@ -268,7 +335,8 @@ fn node_values(nodes: []const Node, slab: []const f64, id: Id) []const f64 {
     return slab[node.offset..][0..node.extent.count()];
 }
 
-fn eval_node(nodes: []const Node, slab: []f64, node: *const Node, time: Time) void {
+fn eval_node(program: *const Program, slab: []f64, node: *const Node, time: Time) void {
+    const nodes = program.nodes;
     const out = slab[node.offset..][0..node.extent.count()];
     switch (node.op) {
         .constant => |constant| @memset(out, constant),
@@ -282,6 +350,16 @@ fn eval_node(nodes: []const Node, slab: []f64, node: *const Node, time: Time) vo
         },
         .map_range => |*op| map_range_into(out, node_values(nodes, slab, op.input), op),
         .wave => |wave| @memset(out, wave.sample(time)),
+        .tween => |*tween| {
+            const start_time = program.cues[tween.start.index];
+            if (time.flicks >= start_time.flicks) {
+                @memset(out, tween.value_after(time, start_time));
+            } else if (tween.previous) |previous| {
+                @memcpy(out, node_values(nodes, slab, previous));
+            } else {
+                @memset(out, tween.from);
+            }
+        },
     }
 }
 
@@ -309,6 +387,7 @@ fn map_range_into(out: []f64, input: []const f64, map: *const MapRange) void {
 }
 
 const testing = std.testing;
+const Cues = @import("cue.zig").Cues;
 const Rate = @import("time.zig").Rate;
 
 const carrier = Wave{ .shape = .sine, .hz = 440 };
@@ -503,7 +582,11 @@ test "moving the memory changes nothing" {
     @memset(std.mem.asBytes(&nodes), 0xaa);
     @memset(std.mem.asBytes(&slab), 0xaa);
 
-    const program_moved: Program = .{ .nodes = &nodes_moved, .slab_count = program.slab_count };
+    const program_moved: Program = .{
+        .nodes = &nodes_moved,
+        .cues = &.{},
+        .slab_count = program.slab_count,
+    };
     var state_checkpoint: State = .{
         .program = program_moved,
         .slab = &slab_moved,
@@ -583,6 +666,247 @@ test "an empty program evaluates" {
     try testing.expectEqual(@as(usize, 0), state.slab.len);
 }
 
+/// One tween of 1.5 s starting at `cue`, over a table the test owns.
+fn tween_of(from: f64, to: f64, cue: Cue, ease: Ease) Tween {
+    return .{
+        .from = from,
+        .to = to,
+        .duration = .{ .flicks = 3 * 352_800_000 },
+        .ease = ease,
+        .start = cue,
+        .previous = null,
+    };
+}
+
+// Locks the demo of this step for 0.1 to 0.3, neither an exact f64, and for -0, whose sign only
+// survives if the end value is returned and not computed: before and at the cue is `from`, and at
+// the last flick's end and an hour later is `to`, bit for bit.
+test "a tween ends on its target value, bit for bit" {
+    var times: [1]Time = undefined;
+    var cues = Cues.init(&times);
+    const cue = try cues.add(.{ .flicks = 705_600_000 });
+
+    for ([_]f64{ 0.3, -0.0 }) |target| {
+        var nodes: [1]Node = undefined;
+        var builder = Builder.init(&nodes, .{ .slab_count_max = 1, .cues = cues.table() });
+        const tween = try builder.tween(tween_of(0.1, target, cue, .in_out));
+        var slab: [1]f64 = undefined;
+        var state = State.init(builder.finish(), &slab);
+        const end = cues.at(cue).flicks + 3 * 352_800_000;
+
+        state.eval(.{ .flicks = 0 });
+        try testing.expectEqual(@as(f64, 0.1), state.value(tween));
+        state.eval(cues.at(cue));
+        try testing.expectEqual(@as(f64, 0.1), state.value(tween));
+        state.eval(.{ .flicks = end - 1 });
+        try testing.expect(state.value(tween) != target);
+        for ([_]i64{ end, end + 3600 * 705_600_000 }) |flicks| {
+            state.eval(.{ .flicks = flicks });
+            const bits: u64 = @bitCast(state.value(tween));
+            try testing.expectEqual(@as(u64, @bitCast(target)), bits);
+        }
+    }
+}
+
+// Locks the worked middle of a tween from 10 to 20: halfway through, in-out has an eased progress
+// of exactly a half, so the value is 15, and `in` at a half gives 10 + 10 * 0.3153568.
+test "a tween follows its ease" {
+    var times: [1]Time = undefined;
+    var cues = Cues.init(&times);
+    const cue = try cues.add(.{ .flicks = 0 });
+    var nodes: [2]Node = undefined;
+    var builder = Builder.init(&nodes, .{ .slab_count_max = 2, .cues = cues.table() });
+    const symmetric = try builder.tween(tween_of(10, 20, cue, .in_out));
+    const slow_start = try builder.tween(tween_of(10, 20, cue, .in));
+    var slab: [2]f64 = undefined;
+    var state = State.init(builder.finish(), &slab);
+    state.eval(.{ .flicks = 3 * 176_400_000 });
+    try testing.expectApproxEqAbs(@as(f64, 15), state.value(symmetric), 1e-13);
+    try testing.expectApproxEqAbs(@as(f64, 13.153568125725393), state.value(slow_start), 1e-13);
+}
+
+// Locks the demo of this step: after a move of `shift`, a reader sees the values it would have
+// seen `shift` earlier, bit for bit, with no rebuild. That holds for one flick, for a shift
+// backwards, and for a day, which would cost bits if the progress went through floating seconds.
+test "moving a cue shifts its tween by exactly that time" {
+    var times: [1]Time = undefined;
+    var cues = Cues.init(&times);
+    const cue = try cues.add(.{ .flicks = 0 });
+    var nodes: [1]Node = undefined;
+    var builder = Builder.init(&nodes, .{ .slab_count_max = 1, .cues = cues.table() });
+    const tween = try builder.tween(tween_of(0.1, 0.7, cue, .in_out));
+    var slab: [1]f64 = undefined;
+    var state = State.init(builder.finish(), &slab);
+
+    var expected: [64]f64 = undefined;
+    for (&expected, 0..) |*value, index| {
+        state.eval(.{ .flicks = @as(i64, @intCast(index)) * 23_456_789 - 7 });
+        value.* = state.value(tween);
+    }
+    for ([_]i64{ 1, -12_345, 86_400 * 705_600_000 }) |shift| {
+        try cues.move(cue, .{ .flicks = shift });
+        for (expected, 0..) |value, index| {
+            state.eval(.{ .flicks = @as(i64, @intCast(index)) * 23_456_789 - 7 + shift });
+            try testing.expectEqual(value, state.value(tween));
+        }
+    }
+}
+
+// Locks a sequence of two tweens: 0 to 1 from t = 0 s for 1.5 s, then 5 to 2 from t = 2 s. The
+// first holds 0 before it starts and 1 in the gap, and the second then jumps to its own `from` and
+// holds its `to` afterwards.
+test "a chain of tweens is a sequence, and a gap holds" {
+    var times: [2]Time = undefined;
+    var cues = Cues.init(&times);
+    const first_cue = try cues.add(.{ .flicks = 0 });
+    const second_cue = try cues.add(.{ .flicks = 2 * 705_600_000 });
+    var nodes: [2]Node = undefined;
+    var builder = Builder.init(&nodes, .{ .slab_count_max = 2, .cues = cues.table() });
+    const first = try builder.tween(tween_of(0, 1, first_cue, .linear));
+    var second_tween = tween_of(5, 2, second_cue, .linear);
+    second_tween.previous = first;
+    const second = try builder.tween(second_tween);
+    var slab: [2]f64 = undefined;
+    var state = State.init(builder.finish(), &slab);
+
+    const rows = [_]struct { flicks: i64, value: f64 }{
+        .{ .flicks = -1, .value = 0 },
+        .{ .flicks = 352_800_000, .value = 1.0 / 3.0 },
+        .{ .flicks = 3 * 352_800_000, .value = 1 },
+        .{ .flicks = 2 * 705_600_000 - 1, .value = 1 },
+        .{ .flicks = 2 * 705_600_000, .value = 5 },
+        .{ .flicks = 7 * 352_800_000, .value = 2 },
+    };
+    for (rows) |row| {
+        state.eval(.{ .flicks = row.flicks });
+        try testing.expectEqual(row.value, state.value(second));
+    }
+}
+
+// Locks the decision of section 6: a tween starting while an earlier one runs wins from its start,
+// so at t = 0.75 s, a sixth of the way into a second tween from 10 to 20, the output is 11.667 and
+// not the first's 0.5. Moving the second cue onto the first gives the second from time zero, and
+// moving it past that time restores the first.
+test "a later tween wins an overlap" {
+    var times: [2]Time = undefined;
+    var cues = Cues.init(&times);
+    const first_cue = try cues.add(.{ .flicks = 0 });
+    const second_cue = try cues.add(.{ .flicks = 352_800_000 });
+    var nodes: [2]Node = undefined;
+    var builder = Builder.init(&nodes, .{ .slab_count_max = 2, .cues = cues.table() });
+    const first = try builder.tween(tween_of(0, 1, first_cue, .linear));
+    var second_tween = tween_of(10, 20, second_cue, .linear);
+    second_tween.previous = first;
+    const second = try builder.tween(second_tween);
+    var slab: [2]f64 = undefined;
+    var state = State.init(builder.finish(), &slab);
+
+    state.eval(.{ .flicks = 529_200_000 });
+    try testing.expectEqual(@as(f64, 0.5), state.value(first));
+    try testing.expectApproxEqAbs(@as(f64, 11.666666666666666), state.value(second), 1e-13);
+
+    try cues.move(second_cue, .{ .flicks = 0 });
+    state.eval(.{ .flicks = 0 });
+    try testing.expectEqual(@as(f64, 10), state.value(second));
+    try cues.move(second_cue, .{ .flicks = 2 * 705_600_000 });
+    state.eval(.{ .flicks = 529_200_000 });
+    try testing.expectEqual(@as(f64, 0.5), state.value(second));
+}
+
+// Locks that `previous` can be any signal: a tween follows a wave until its cue, sample for
+// sample, and leaves it at its own `from`.
+test "a tween can follow any signal until its cue" {
+    var times: [1]Time = undefined;
+    var cues = Cues.init(&times);
+    const cue = try cues.add(.{ .flicks = 705_600_000 });
+    var nodes: [2]Node = undefined;
+    var builder = Builder.init(&nodes, .{ .slab_count_max = 2, .cues = cues.table() });
+    const wave = try builder.wave(swell);
+    var source = tween_of(3, 4, cue, .linear);
+    source.previous = wave;
+    const tween = try builder.tween(source);
+    var slab: [2]f64 = undefined;
+    var state = State.init(builder.finish(), &slab);
+
+    const time = Time{ .flicks = 123_456_789 };
+    state.eval(time);
+    try testing.expectEqual(swell.sample(time), state.value(tween));
+    state.eval(cues.at(cue));
+    try testing.expectEqual(@as(f64, 3), state.value(tween));
+}
+
+// Locks the far ends of an i64: a cue at the earliest time, read at the latest, is 2^64 - 1 flicks
+// apart, which does not fit in an i64, and the tween must land and not wrap into its start. Its
+// progress at 2^62 flicks in, half of a duration of 2^63 - 1, rounds to exactly a half.
+test "a tween survives the full range of time" {
+    var times: [1]Time = undefined;
+    var cues = Cues.init(&times);
+    const cue = try cues.add(.{ .flicks = std.math.minInt(i64) });
+    var nodes: [1]Node = undefined;
+    var builder = Builder.init(&nodes, .{ .slab_count_max = 1, .cues = cues.table() });
+    var source = tween_of(1, 2, cue, .linear);
+    source.duration = .{ .flicks = std.math.maxInt(i64) };
+    const tween = try builder.tween(source);
+    var slab: [1]f64 = undefined;
+    var state = State.init(builder.finish(), &slab);
+    state.eval(.{ .flicks = std.math.maxInt(i64) });
+    try testing.expectEqual(@as(f64, 2), state.value(tween));
+    state.eval(.{ .flicks = -1 });
+    try testing.expectEqual(@as(f64, 2), state.value(tween));
+    state.eval(.{ .flicks = std.math.minInt(i64) + (1 << 62) });
+    try testing.expectEqual(@as(f64, 1.5), state.value(tween));
+}
+
+// Locks each refusal of `tween` by name. The first is the case of a tween with no table at all.
+test "the builder refuses a tween it cannot evaluate" {
+    var nodes: [2]Node = undefined;
+    var empty = Builder.init(&nodes, .{ .slab_count_max = 2 });
+    const cue_none: Cue = .{ .index = 0 };
+    try testing.expectError(error.UnknownCue, empty.tween(tween_of(0, 1, cue_none, .linear)));
+
+    var times: [1]Time = undefined;
+    var cues = Cues.init(&times);
+    const cue = try cues.add(.{ .flicks = 0 });
+    var builder = Builder.init(&nodes, .{ .slab_count_max = 2, .cues = cues.table() });
+    const nan = std.math.nan(f64);
+    try testing.expectError(error.NotFinite, builder.tween(tween_of(nan, 1, cue, .linear)));
+    try testing.expectError(error.NotFinite, builder.tween(tween_of(0, nan, cue, .linear)));
+
+    var source = tween_of(0, 1, cue, .linear);
+    source.duration = .{ .flicks = 0 };
+    try testing.expectError(error.InvalidDuration, builder.tween(source));
+    source.duration = .{ .flicks = -1 };
+    try testing.expectError(error.InvalidDuration, builder.tween(source));
+
+    source = tween_of(0, 1, cue, .{ .x1 = 2, .y1 = 0, .x2 = 1, .y2 = 1 });
+    try testing.expectError(error.InvalidEase, builder.tween(source));
+
+    source = tween_of(0, 1, cue, .linear);
+    source.previous = .{ .index = 0 };
+    try testing.expectError(error.UnknownNode, builder.tween(source));
+    try testing.expectEqual(@as(u32, 0), builder.node_count);
+}
+
+// Locks that a tween fills every lane of its extent, from itself and from `previous`.
+test "a tween loops over the extent of its node" {
+    var times: [1]Time = undefined;
+    var cues = Cues.init(&times);
+    const cue = try cues.add(.{ .flicks = 705_600_000 });
+    var nodes: [2]Node = undefined;
+    var builder = Builder.init(&nodes, .{ .slab_count_max = 12, .cues = cues.table() });
+    builder.extent = .{ .lanes = 3, .components = 2 };
+    const before = try builder.constant(7);
+    var source = tween_of(1, 9, cue, .linear);
+    source.previous = before;
+    const tween = try builder.tween(source);
+    var slab: [12]f64 = undefined;
+    var state = State.init(builder.finish(), &slab);
+    state.eval(.{ .flicks = 0 });
+    try testing.expectEqualSlices(f64, &@as([6]f64, @splat(7)), state.values(tween));
+    state.eval(.{ .flicks = 3 * 705_600_000 });
+    try testing.expectEqualSlices(f64, &@as([6]f64, @splat(9)), state.values(tween));
+}
+
 const Reader = struct {
     program: Program,
     output: Id,
@@ -603,8 +927,8 @@ const Reader = struct {
     }
 };
 
-// Locks the rule of section 1: two states on one program, at different rates and far-apart times on
-// two threads, each match the formula on all 200,000 evals.
+// Locks the rule of section 1: two states on one program, at different rates and far-apart times
+// on two threads, each match the formula on all 200,000 evals.
 test "two states on one program never disturb each other" {
     var nodes: [4]Node = undefined;
     var builder = Builder.init(&nodes, .{ .slab_count_max = 4 });
