@@ -16,7 +16,12 @@
 //! later, where a float of seconds would have lost bits, and an hour before zero. The stride makes
 //! a run cover about a cycle at the slow frequencies and a few cycles at the fast ones.
 //!
-//! ## 4. TigerStyle Invariants
+//! ## 4. Graphs
+//! Waves alone cannot notice a change in how a `Program` evaluates, so the catalog also samples
+//! whole graphs through a `State`, on the same epochs. They come after the waves in the text, so a
+//! change to either shows up on its own lines.
+//!
+//! ## 5. TigerStyle Invariants
 //! - The text fits in `text_size_max` by construction, so `render` cannot fail.
 
 const std = @import("std");
@@ -51,16 +56,30 @@ const epochs = [_]Epoch{
 
 const shapes = std.enums.values(weft.Shape);
 
+/// Each graph's nodes are built by `graph_build`.
+const Graph = enum {
+    tremolo,
+    drift,
+
+    const nodes_count_max = 8;
+};
+
+const graphs = std.enums.values(Graph);
+
 const samples_per_run = 24;
 
-pub const sample_count = shapes.len * signals.len * epochs.len * samples_per_run;
+const wave_sample_count = shapes.len * signals.len * epochs.len * samples_per_run;
+const graph_sample_count = graphs.len * epochs.len * samples_per_run;
+
+pub const sample_count = wave_sample_count + graph_sample_count;
 
 const line_size_max = 64;
 
 pub const text_size_max = sample_count * line_size_max;
 
 comptime {
-    assert(sample_count == 1536);
+    assert(wave_sample_count == 1536);
+    assert(graph_sample_count == 192);
     assert(text_size_max < 1 << 20);
     for (signals) |signal| assert(weft.Rate.from_hz(signal.rate_hz) != null);
 }
@@ -72,6 +91,9 @@ pub fn render(text: *[text_size_max]u8) []const u8 {
         for (&signals) |*signal| {
             for (&epochs) |*epoch| render_run(&writer, shape, signal, epoch);
         }
+    }
+    for (graphs) |graph| {
+        for (&epochs) |*epoch| render_graph_run(&writer, graph, epoch);
     }
     assert(writer.buffered().len > sample_count);
     assert(writer.buffered()[writer.buffered().len - 1] == '\n');
@@ -97,6 +119,55 @@ fn render_run(
             shape, signal.name, epoch.name, index, value,
         }) catch unreachable;
         assert(writer.buffered().len - size_before <= line_size_max);
+    }
+}
+
+fn render_graph_run(writer: *std.Io.Writer, graph: Graph, epoch: *const Epoch) void {
+    var nodes: [Graph.nodes_count_max]weft.Node = undefined;
+    var slab: [Graph.nodes_count_max]f64 = undefined;
+    var builder = weft.Builder.init(&nodes, .{ .slab_count_max = slab.len });
+    const output = graph_build(graph, &builder) catch unreachable;
+    var state = weft.State.init(builder.finish(), &slab);
+
+    const rate = weft.Rate.from_hz(48_000).?;
+    const tick_first = epoch.seconds * 48_000;
+    for (0..samples_per_run) |index| {
+        const tick = tick_first + @as(i64, @intCast(index)) * graph_stride_ticks;
+        state.eval(weft.Time.from_ticks(tick, rate).?);
+        const size_before = writer.buffered().len;
+        writer.print("graph {t} {s} {d} {x}\n", .{
+            graph, epoch.name, index, state.value(output),
+        }) catch unreachable;
+        assert(writer.buffered().len - size_before <= line_size_max);
+    }
+}
+
+/// Spreads a run over about four seconds, nearly three cycles of the slowest wave.
+const graph_stride_ticks = 8192;
+
+fn graph_build(graph: Graph, builder: *weft.Builder) weft.Builder.Error!weft.Id {
+    switch (graph) {
+        // 440 Hz scaled by a slower wave moved into [0.25, 1].
+        .tremolo => {
+            const fast = try builder.wave(.{ .shape = .sine, .hz = 440 });
+            const slow = try builder.wave(.{ .shape = .triangle, .hz = 0.7 });
+            const depth = try builder.map_range(.{
+                .input = slow,
+                .input_low = -1,
+                .input_high = 1,
+                .output_low = 0.25,
+                .output_high = 1,
+            });
+            return builder.multiply(fast, depth);
+        },
+        // Two slow waves added, with an offset, as a position would be.
+        .drift => {
+            const first = try builder.wave(.{ .shape = .sine, .hz = 0.7 });
+            const second = try builder.wave(.{ .shape = .saw, .hz = 1 });
+            const half = try builder.constant(0.5);
+            const scaled = try builder.multiply(second, half);
+            return builder.add(first, scaled);
+        },
     }
 }
 
