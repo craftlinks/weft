@@ -4,22 +4,31 @@
 //!
 //! ## 1. The Contract
 //! Every frame is a function of t: a reader supplies a `Time` and gets a value, and it cannot tell
-//! how the value was computed. So far that is `Wave`; the signal graph comes next.
+//! how the value was computed. A `Wave` is the simplest case, and a graph of them is a `Program`
+//! that each reader evaluates into a `State` of its own.
 //!
 //! ## 2. Rules That Hold From the First File
 //! - Weft imports nothing but `std`, and links nothing. A client glues it to a destination.
 //! - Everything here is realtime-safe: no allocation, no locks, no unbounded work.
 //! - A sampled signal has the same bits on native and wasm, which `zig build regress` enforces.
 
+pub const graph = @import("core/graph.zig");
 pub const time = @import("core/time.zig");
 pub const wave = @import("core/wave.zig");
 
+pub const Builder = graph.Builder;
+pub const Extent = graph.Extent;
+pub const Id = graph.Id;
+pub const Node = graph.Node;
+pub const Program = graph.Program;
+pub const State = graph.State;
 pub const Rate = time.Rate;
 pub const Time = time.Time;
 pub const Shape = wave.Shape;
 pub const Wave = wave.Wave;
 
 test {
+    _ = graph;
     _ = time;
     _ = wave;
 }

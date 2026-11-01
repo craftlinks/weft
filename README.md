@@ -1,7 +1,8 @@
 # Weft
 
 A Zig library for composable motion: motion as an object of its own, separate from whatever it
-moves. It has no dependencies and knows nothing about pixels. So far it has a clock and four waves.
+moves. It has no dependencies and knows nothing about pixels. So far it has a clock, four waves,
+and a graph that composes them.
 
 Every frame is a function of t. A reader supplies the time and gets a value, and it can ask for any
 time in any order. Nothing on that path allocates, locks, or runs unbounded, and a sampled signal
@@ -31,6 +32,7 @@ zig build wasm                      # the wasm32-freestanding build
 src/
   weft.zig            the library root
   core/
+    graph.zig         Program, Builder, and State: a flat node array and one slab per reader
     time.zig          Time and Rate: an integer count of flicks
     wave.zig          Wave: sine, triangle, saw, and square, pure functions of time
 test/
@@ -59,11 +61,43 @@ const value = wave.sample(time);               // in [-1, 1]
 audio rates. Rounding happens only where a formula meets a time: `seconds` for a duration, and
 `turns` for a position in a cycle. `turns` stays precise far from zero; see `time.zig`, section 3.
 
+## Graph
+
+```zig
+var nodes: [4]weft.Node = undefined;           // capacities come from the caller
+var builder = weft.Builder.init(&nodes, .{ .slab_count_max = 4 });
+const fast = try builder.wave(.{ .shape = .sine, .hz = 440 });
+const slow = try builder.wave(.{ .shape = .triangle, .hz = 0.7 });
+const depth = try builder.map_range(.{
+    .input = slow,
+    .input_low = -1,
+    .input_high = 1,
+    .output_low = 0.25,
+    .output_high = 1,
+});
+const output = try builder.multiply(fast, depth);
+const program = builder.finish();              // immutable from here
+
+var slab: [4]f64 = undefined;                  // one reader's memory
+var state = weft.State.init(program, &slab);
+state.eval(time);                              // allocates nothing, locks nothing
+const value = state.value(output);
+```
+
+The ops are `constant`, `add`, `multiply`, `map_range`, and `wave`. The builder refuses by name what
+does not fit or cannot be evaluated: `error.NodeCapacityExceeded`, `error.SlabCapacityExceeded`,
+`error.UnknownNode`, `error.NotFinite`, and `error.InvalidRange`.
+
+A node can only refer to earlier nodes, so a cycle cannot be expressed. Neither the node array nor
+the slab holds a pointer: copied as bytes, the nodes are the same program and the slab is a
+checkpoint. Each reader holds its own state, so readers on different threads never disturb each
+other. `graph.zig` explains the layout.
+
 ## Regress
 
 `zig build regress` renders `test/catalog.zig` on native and on wasm and compares both with
-`test/golden/signals.txt`, byte for byte. There is one sample per line, as a hex float, so any
-changed bit fails and the report names the sample:
+`test/golden/signals.txt`, byte for byte. It samples each wave and a few whole graphs. There is one
+sample per line, as a hex float, so any changed bit fails and the report names the sample:
 
 ```txt
 regress: native differs from golden at line 700
