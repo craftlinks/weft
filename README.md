@@ -2,7 +2,7 @@
 
 A Zig library for composable motion: motion as an object of its own, separate from whatever it
 moves. It has no dependencies and knows nothing about pixels. So far it has a clock, four waves,
-and a graph that composes them.
+easing, tweens on named cues, and a graph that composes them.
 
 Every frame is a function of t. A reader supplies the time and gets a value, and it can ask for any
 time in any order. Nothing on that path allocates, locks, or runs unbounded, and a sampled signal
@@ -32,6 +32,8 @@ zig build wasm                      # the wasm32-freestanding build
 src/
   weft.zig            the library root
   core/
+    cue.zig           Cues: a sorted, bounded table of times
+    ease.zig          Ease: cubic Bezier curves, with a bounded solver
     graph.zig         Program, Builder, and State: a flat node array and one slab per reader
     time.zig          Time and Rate: an integer count of flicks
     wave.zig          Wave: sine, triangle, saw, and square, pure functions of time
@@ -84,14 +86,44 @@ state.eval(time);                              // allocates nothing, locks nothi
 const value = state.value(output);
 ```
 
-The ops are `constant`, `add`, `multiply`, `map_range`, and `wave`. The builder refuses by name what
-does not fit or cannot be evaluated: `error.NodeCapacityExceeded`, `error.SlabCapacityExceeded`,
-`error.UnknownNode`, `error.NotFinite`, and `error.InvalidRange`.
+The ops are `constant`, `add`, `multiply`, `map_range`, `wave`, and `tween`. The builder refuses by
+name what does not fit or cannot be evaluated: `error.NodeCapacityExceeded`,
+`error.SlabCapacityExceeded`, `error.UnknownNode`, `error.NotFinite`, `error.InvalidRange`,
+`error.UnknownCue`, `error.InvalidDuration`, and `error.InvalidEase`.
 
 A node can only refer to earlier nodes, so a cycle cannot be expressed. Neither the node array nor
 the slab holds a pointer: copied as bytes, the nodes are the same program and the slab is a
 checkpoint. Each reader holds its own state, so readers on different threads never disturb each
 other. `graph.zig` explains the layout.
+
+## Cues and Tweens
+
+```zig
+var times: [8]weft.Time = undefined;           // a bounded table, always in order
+var cues = weft.Cues.init(&times);
+const beat = try cues.add(.{ .flicks = 2 * weft.time.flicks_per_second });
+
+var nodes: [2]weft.Node = undefined;
+var builder = weft.Builder.init(&nodes, .{ .slab_count_max = 2, .cues = cues.table() });
+const rise = try builder.tween(.{
+    .from = 0,
+    .to = 1,
+    .duration = .{ .flicks = weft.time.flicks_per_second },
+    .ease = .in_out,                           // or .linear, .in, .out, or any Bezier
+    .start = beat,
+    .previous = null,                          // what to follow before the cue: null holds `from`
+});
+
+try cues.move(beat, new_time);                 // readers see it at their next eval
+```
+
+A tween is one more pure node, and it refers to a cue, so moving the cue moves the tween by exactly
+that time, with no rebuild. It lands on `to` bit for bit. A cue's id is its position, so a move that
+would pass a neighbour is refused, and the table stays in order. A move must not overlap an eval: a
+reader on another thread takes its own copy of the table.
+
+A chain through `previous` is a sequence. A gap holds the earlier value, and in an overlap the later
+tween wins from its start. `cue.zig` and `graph.zig`, section 6, explain why.
 
 ## Regress
 
