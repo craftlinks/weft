@@ -14,7 +14,7 @@
 //! serves both. A tick count that would overflow is refused, not wrapped.
 //!
 //! ## 3. Where Rounding Happens
-//! Rounding happens only where a formula meets a time, and there are two such places.
+//! Rounding happens only where a formula meets a time, and there are three such places.
 //! `seconds` is for formulas that need a duration. `turns` is for periodic formulas, and it does
 //! not go through `seconds`: it splits the time into whole seconds and the part of a second, and
 //! drops the whole cycles of each piece before adding them. The precision of a periodic signal
@@ -22,9 +22,16 @@
 //! of Hz, the whole seconds contribute exactly nothing, so a signal one second later has the same
 //! bits, however far it is from zero.
 //!
+//! `cycles` is the same split for a formula that also needs to know which cycle it is in, such as
+//! noise, which holds a different value in each. It keeps the whole cycles as an integer instead
+//! of dropping them. That count must fit in an f64 without rounding at every time an i64 holds,
+//! which is what bounds its frequency to `cycles_hz_max`.
+//!
 //! ## 4. TigerStyle Invariants
 //! - No allocation, no state, no libc: every function here is pure and safe on an audio thread.
 //! - `turns` returns a value in [0, 1) for every time and every finite frequency.
+//! - `cycles` returns a fraction in [0, 1) and an exact count for every time, for a frequency in
+//!   (0, `cycles_hz_max`].
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -33,12 +40,23 @@ pub const flicks_per_second: i64 = 705_600_000;
 
 const flicks_per_second_float: f64 = @floatFromInt(flicks_per_second);
 
+/// The fastest frequency `cycles` can count: 2^19 Hz, above every audio rate.
+pub const cycles_hz_max: f64 = 1 << 19;
+
+/// The whole seconds of the earliest and latest `Time`.
+const seconds_whole_min = @divFloor(std.math.minInt(i64), flicks_per_second);
+const seconds_whole_max = @divFloor(std.math.maxInt(i64), flicks_per_second);
+
 comptime {
     // 2^9 * 3^2 * 5^5 * 7^2: the factors that 44.1 kHz, 48 kHz, 96 kHz and the frame rates need.
     assert(flicks_per_second == (1 << 9) * 9 * 3125 * 49);
     // The whole seconds of any `Time` are an exact f64, which `turns` relies on.
-    assert(@divFloor(std.math.minInt(i64), flicks_per_second) > -(1 << 53));
-    assert(@divFloor(std.math.maxInt(i64), flicks_per_second) < (1 << 53));
+    assert(seconds_whole_min > -(1 << 53));
+    assert(seconds_whole_max < (1 << 53));
+    // The cycles of any `Time` at `cycles_hz_max`, plus one for the part of a second, are an exact
+    // f64, which `cycles` relies on.
+    assert(-seconds_whole_min * (1 << 19) + (1 << 19) < 1 << 53);
+    assert(seconds_whole_max * (1 << 19) + (1 << 19) < 1 << 53);
     assert(@sizeOf(Time) == @sizeOf(i64));
 }
 
@@ -55,6 +73,13 @@ pub const Rate = struct {
         assert(@as(i64, flicks_per_tick) * hz == flicks_per_second);
         return .{ .flicks_per_tick = flicks_per_tick };
     }
+};
+
+/// A position in a run of cycles: which cycle, counted from the one that starts at time zero, and
+/// how far through it.
+pub const Cycles = struct {
+    whole: i64,
+    fraction: f64,
 };
 
 pub const Time = struct {
@@ -89,6 +114,32 @@ pub const Time = struct {
         const result = fraction(fraction(hz * whole) + hz * part_seconds);
         assert(result >= 0);
         assert(result < 1);
+        return result;
+    }
+
+    /// How many cycles of `hz` have started since time zero, and how far the current one has run,
+    /// in [0, 1). `hz` is above 0 and at most `cycles_hz_max`. Section 3 explains the split.
+    pub fn cycles(time: Time, hz: f64) Cycles {
+        assert(hz > 0);
+        assert(hz <= cycles_hz_max);
+        const whole: f64 = @floatFromInt(@divFloor(time.flicks, flicks_per_second));
+        const part: f64 = @floatFromInt(@mod(time.flicks, flicks_per_second));
+        const part_seconds = part / flicks_per_second_float;
+        assert(part_seconds >= 0);
+        assert(part_seconds < 1);
+        // Below 2^53 in magnitude, so a floor and the difference from it are both exact.
+        const from_whole = hz * whole;
+        const from_whole_floor = @floor(from_whole);
+        const from_part = (from_whole - from_whole_floor) + hz * part_seconds;
+        assert(from_part >= 0);
+        const from_part_floor = @floor(from_part);
+        const result: Cycles = .{
+            .whole = @as(i64, @intFromFloat(from_whole_floor)) +
+                @as(i64, @intFromFloat(from_part_floor)),
+            .fraction = from_part - from_part_floor,
+        };
+        assert(result.fraction >= 0);
+        assert(result.fraction < 1);
         return result;
     }
 
@@ -218,5 +269,72 @@ test "a fractional frequency keeps its precision at an hour and a day" {
             try testing.expect(slow < 8e-12);
             try testing.expect(fast < 8e-12);
         }
+    }
+}
+
+/// The exact cycle count and fraction of `numerator / denominator` Hz, in integers.
+fn cycles_exact(time: Time, numerator: i128, denominator: i128) Cycles {
+    const modulus = denominator * flicks_per_second;
+    const product = time.flicks * numerator;
+    const remainder = @mod(product, modulus);
+    return .{
+        .whole = @intCast(@divFloor(product, modulus)),
+        .fraction = @as(f64, @floatFromInt(remainder)) / @as(f64, @floatFromInt(modulus)),
+    };
+}
+
+// Locks `cycles` against exact integer arithmetic at 3 Hz and 261.63 Hz, at zero, a day, and an
+// hour before zero: the position, the count plus the fraction, is within 8e-12 of a cycle, and the
+// count is exact wherever the exact fraction is further than that from a boundary.
+test "cycles count exactly and keep their precision far from zero" {
+    const rate = Rate.from_hz(44_100).?;
+    const epochs_seconds = [_]i64{ 0, 86_400, -3600 };
+    const frequencies = [_]struct { hz: f64, numerator: i128, denominator: i128 }{
+        .{ .hz = 3, .numerator = 3, .denominator = 1 },
+        .{ .hz = 261.63, .numerator = 26_163, .denominator = 100 },
+    };
+    for (epochs_seconds) |epoch_seconds| {
+        for (frequencies) |frequency| {
+            var tick: i64 = 0;
+            while (tick < 44_100) : (tick += 97) {
+                const time = Time.from_ticks(epoch_seconds * 44_100 + tick, rate).?;
+                const actual = time.cycles(frequency.hz);
+                const exact = cycles_exact(time, frequency.numerator, frequency.denominator);
+                const wholes: f64 = @floatFromInt(actual.whole - exact.whole);
+                try testing.expect(@abs(wholes + actual.fraction - exact.fraction) < 8e-12);
+                if (exact.fraction > 8e-12 and exact.fraction < 1 - 8e-12) {
+                    try testing.expectEqual(exact.whole, actual.whole);
+                }
+            }
+        }
+    }
+}
+
+// Locks the count at whole Hz, where it is exact everywhere: 1 Hz a quarter second either side of
+// zero is cycle 0 at 0.25 and cycle -1 at 0.75, and 48 kHz at the sample a day in is cycle
+// 4,147,200,000 at 0.
+test "cycles are counted from the floor, before and after zero" {
+    const quarter = Rate.from_hz(4).?;
+    const after = Time.from_ticks(1, quarter).?.cycles(1);
+    try testing.expectEqual(Cycles{ .whole = 0, .fraction = 0.25 }, after);
+    const before = Time.from_ticks(-1, quarter).?.cycles(1);
+    try testing.expectEqual(Cycles{ .whole = -1, .fraction = 0.75 }, before);
+    const sample = Rate.from_hz(48_000).?;
+    const day = Time.from_ticks(86_400 * 48_000, sample).?.cycles(48_000);
+    try testing.expectEqual(Cycles{ .whole = 4_147_200_000, .fraction = 0 }, day);
+}
+
+// Locks the bound of section 3 at both ends of an i64 and at `cycles_hz_max`: the counts are
+// exact, as integer arithmetic gives them, and the fraction is in [0, 1) and within 1e-10.
+test "cycles reach both ends of time at the fastest frequency" {
+    const ends = [_]i64{ std.math.minInt(i64), std.math.maxInt(i64) };
+    for (ends) |flicks| {
+        const time = Time{ .flicks = flicks };
+        const actual = time.cycles(cycles_hz_max);
+        const exact = cycles_exact(time, 1 << 19, 1);
+        try testing.expectEqual(exact.whole, actual.whole);
+        try testing.expect(actual.fraction >= 0);
+        try testing.expect(actual.fraction < 1);
+        try testing.expectApproxEqAbs(exact.fraction, actual.fraction, 1e-10);
     }
 }

@@ -16,13 +16,19 @@
 //! later, where a float of seconds would have lost bits, and an hour before zero. The stride makes
 //! a run cover about a cycle at the slow frequencies and a few cycles at the fast ones.
 //!
-//! ## 4. Graphs
-//! Waves alone cannot notice a change in how a `Program` evaluates, so the catalog also samples
-//! whole graphs through a `State`, on the same epochs. They come after the waves in the text, so a
-//! change to either shows up on its own lines. Cues are set relative to the epoch, so a sequence
-//! of tweens runs at each one, and a test locks that it has the same bits at all of them.
+//! ## 4. Noise
+//! Each noise shape runs on the same signals and epochs as the waves, after them in the text, with
+//! one fixed seed. A noise is a hash of its seed, so these lines also lock the hash: a change to it
+//! changes every one of them.
 //!
-//! ## 5. TigerStyle Invariants
+//! ## 5. Graphs
+//! Signals alone cannot notice a change in how a `Program` evaluates, so the catalog also samples
+//! whole graphs through a `State`, on the same epochs. They come after the signals in the text, so
+//! a change to either shows up on its own lines. Cues are set relative to the epoch, so a sequence
+//! of tweens runs at each one, and a test locks that it has the same bits at all of them. One graph
+//! has noise, so a change to how the builder derives a node's seed changes its lines.
+//!
+//! ## 6. TigerStyle Invariants
 //! - The text fits in `text_size_max` by construction, so `render` cannot fail.
 
 const std = @import("std");
@@ -57,11 +63,16 @@ const epochs = [_]Epoch{
 
 const shapes = std.enums.values(weft.Shape);
 
+const noise_shapes = std.enums.values(weft.noise.Shape);
+
+const noise_seed: u64 = 0x5eed;
+
 /// Each graph's nodes are built by `graph_build`.
 const Graph = enum {
     tremolo,
     drift,
     sequence,
+    wander,
 
     const nodes_count_max = 8;
     const cues_count = 3;
@@ -72,9 +83,10 @@ const graphs = std.enums.values(Graph);
 const samples_per_run = 24;
 
 const wave_sample_count = shapes.len * signals.len * epochs.len * samples_per_run;
+const noise_sample_count = noise_shapes.len * signals.len * epochs.len * samples_per_run;
 const graph_sample_count = graphs.len * epochs.len * samples_per_run;
 
-pub const sample_count = wave_sample_count + graph_sample_count;
+pub const sample_count = wave_sample_count + noise_sample_count + graph_sample_count;
 
 const line_size_max = 64;
 
@@ -82,7 +94,8 @@ pub const text_size_max = sample_count * line_size_max;
 
 comptime {
     assert(wave_sample_count == 1536);
-    assert(graph_sample_count == 288);
+    assert(noise_sample_count == 768);
+    assert(graph_sample_count == 384);
     assert(text_size_max < 1 << 20);
     for (signals) |signal| assert(weft.Rate.from_hz(signal.rate_hz) != null);
 }
@@ -93,6 +106,11 @@ pub fn render(text: *[text_size_max]u8) []const u8 {
     for (shapes) |shape| {
         for (&signals) |*signal| {
             for (&epochs) |*epoch| render_run(&writer, shape, signal, epoch);
+        }
+    }
+    for (noise_shapes) |shape| {
+        for (&signals) |*signal| {
+            for (&epochs) |*epoch| render_noise_run(&writer, shape, signal, epoch);
         }
     }
     for (graphs) |graph| {
@@ -125,6 +143,28 @@ fn render_run(
     }
 }
 
+fn render_noise_run(
+    writer: *std.Io.Writer,
+    shape: weft.noise.Shape,
+    signal: *const Signal,
+    epoch: *const Epoch,
+) void {
+    assert(signal.stride_ticks > 0);
+    assert(signal.hz > 0);
+    const noise = weft.Noise{ .shape = shape, .hz = signal.hz, .seed = noise_seed };
+    const rate = weft.Rate.from_hz(signal.rate_hz).?;
+    const tick_first = epoch.seconds * signal.rate_hz;
+    for (0..samples_per_run) |index| {
+        const tick = tick_first + @as(i64, @intCast(index * signal.stride_ticks));
+        const value = noise.sample(weft.Time.from_ticks(tick, rate).?);
+        const size_before = writer.buffered().len;
+        writer.print("{t} {s} {s} {d} {x}\n", .{
+            shape, signal.name, epoch.name, index, value,
+        }) catch unreachable;
+        assert(writer.buffered().len - size_before <= line_size_max);
+    }
+}
+
 fn render_graph_run(writer: *std.Io.Writer, graph: Graph, epoch: *const Epoch) void {
     // Half a second into the epoch, then a second apart.
     var cue_times: [Graph.cues_count]weft.Time = undefined;
@@ -137,7 +177,11 @@ fn render_graph_run(writer: *std.Io.Writer, graph: Graph, epoch: *const Epoch) v
 
     var nodes: [Graph.nodes_count_max]weft.Node = undefined;
     var slab: [Graph.nodes_count_max]f64 = undefined;
-    var builder = weft.Builder.init(&nodes, .{ .slab_count_max = slab.len, .cues = cues.table() });
+    var builder = weft.Builder.init(&nodes, .{
+        .slab_count_max = slab.len,
+        .cues = cues.table(),
+        .seed = noise_seed,
+    });
     const output = graph_build(graph, &builder) catch unreachable;
     var state = weft.State.init(builder.finish(), &slab);
 
@@ -209,6 +253,14 @@ fn graph_build(graph: Graph, builder: *weft.Builder) weft.Builder.Error!weft.Id 
                 .start = .{ .index = 2 },
                 .previous = overshoot,
             });
+        },
+        // A slow smooth noise with a quarter of a faster stepped one added, as a hand would drift.
+        .wander => {
+            const slow = try builder.noise(.{ .shape = .smooth, .hz = 0.7, .seed = 1 });
+            const fast = try builder.noise(.{ .shape = .steps, .hz = 3, .seed = 2 });
+            const quarter = try builder.constant(0.25);
+            const jitter = try builder.multiply(fast, quarter);
+            return builder.add(slow, jitter);
         },
     }
 }
