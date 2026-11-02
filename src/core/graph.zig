@@ -14,6 +14,10 @@
 //! value and the time it came from must not differ in precision, and because a client converting
 //! to f32 at its boundary pays less than Weft would pay for two kinds of slab.
 //!
+//! A motion node also keeps a cursor in the slab, right after its output: `cursor_count` f64 that
+//! cache where it was at the last goal it reached. Section 8 explains why a cache cannot change a
+//! value. It is reader memory like any other, so a copy of the slab still is a checkpoint.
+//!
 //! ## 3. No Pointers
 //! Nodes refer to each other by `Id`, and neither a node nor the slab holds an address. So both can
 //! move as bytes: a copy of the node array is the same program, and a copy of the slab is a
@@ -45,15 +49,28 @@
 //! together, so the graph's seed gives a new take of every noise at once, and inserting a node
 //! does not reshuffle the others. Two noises with the same `seed` in one graph are one signal.
 //!
-//! ## 8. TigerStyle Invariants
+//! ## 8. Springs and Newtonian Moves
+//! A motion node heads for goals at cues, from a `Goals` table that the program holds like the
+//! cue table, and that is immutable once built. Reaching a time means folding over the goal
+//! changes before it, which `motion.zig` explains, so each motion node keeps a cursor in the slab.
+//! The cursor is a cache and not history: a sample from it performs the very operations a sample
+//! from the first goal would, so `eval` still depends only on the time, bit for bit. The cursor
+//! records the cue table's generation, and a cue move makes it stale.
+//!
+//! ## 9. TigerStyle Invariants
 //! - Capacities come from the caller, and the builder refuses what does not fit, by name.
-//! - `eval` allocates nothing, takes no lock, and is one bounded pass over the node array.
+//! - `eval` allocates nothing, takes no lock, and is one bounded pass over the node array. A motion
+//!   node folds over at most its own goals.
 //! - Offsets are consecutive from 0, so the slab has no gaps and no node overlaps another.
 
 const std = @import("std");
 const assert = std.debug.assert;
 const Cue = @import("cue.zig").Cue;
+const Cues = @import("cue.zig").Cues;
 const Ease = @import("ease.zig").Ease;
+const motion = @import("motion.zig");
+const Goal = motion.Goal;
+const Motion = motion.Motion;
 const Noise = @import("noise.zig").Noise;
 const Time = @import("time.zig").Time;
 const Wave = @import("wave.zig").Wave;
@@ -124,6 +141,15 @@ pub const Op = union(enum) {
     wave: Wave,
     tween: Tween,
     noise: Noise,
+    motion: Motion,
+
+    /// The f64 a node of this op keeps in the slab after its output, for a cache.
+    fn cache_count(op: *const Op) u32 {
+        return switch (op.*) {
+            .motion => motion.cursor_count,
+            else => 0,
+        };
+    }
 };
 
 pub const Node = struct {
@@ -140,18 +166,19 @@ comptime {
     assert(@alignOf(Node) == @alignOf(f64));
 }
 
-/// An immutable node array, the cue times it reads, and the size of the slab it needs. A view of
-/// memory that can move.
+/// An immutable node array, the cue and goal tables it reads, and the size of the slab it needs.
+/// A view of memory that can move.
 pub const Program = struct {
     nodes: []const Node,
-    cues: []const Time,
+    cues: *const Cues,
+    goals: []const Goal,
     slab_count: u32,
 
     fn assert_valid(program: Program) void {
         var offset: u32 = 0;
         for (program.nodes, 0..) |*node, index| {
             assert(node.offset == offset);
-            offset += node.extent.count();
+            offset += node.extent.count() + node.op.cache_count();
             switch (node.op) {
                 .constant, .wave, .noise => {},
                 .add, .multiply => |op| {
@@ -160,8 +187,14 @@ pub const Program = struct {
                 },
                 .map_range => |op| assert(op.input.index < index),
                 .tween => |op| {
-                    assert(op.start.index < program.cues.len);
+                    assert(op.start.index < program.cues.count);
                     if (op.previous) |previous| assert(previous.index < index);
+                },
+                .motion => |op| {
+                    assert(op.goals.count > 0);
+                    assert(op.goals.first + op.goals.count <= program.goals.len);
+                    const path = program.goals[op.goals.first..][0..op.goals.count];
+                    for (path) |goal| assert(goal.cue.index < program.cues.count);
                 },
             }
         }
@@ -175,7 +208,8 @@ pub const Builder = struct {
     node_count: u32,
     slab_count: u32,
     slab_count_max: u32,
-    cues: []const Time,
+    cues: *const Cues,
+    goals: []const Goal,
     seed: u64,
     /// The extent of every node built, 1 by 1 until a later step gives each node its own.
     extent: Extent,
@@ -200,12 +234,21 @@ pub const Builder = struct {
         InvalidEase,
         /// A noise whose frequency is not above 0 and at most `Noise.hz_max`.
         InvalidRate,
+        /// A path that the goal table given in `Options` does not hold.
+        UnknownGoals,
+        /// A spring whose overshoot is not in [0, 1).
+        InvalidOvershoot,
+        /// A Newtonian move whose speed, accel, or decel is not above zero.
+        InvalidLimit,
     };
 
     pub const Options = struct {
         slab_count_max: u32,
-        /// The cue times tweens can start from, from `Cues.table`.
-        cues: []const Time = &.{},
+        /// The cues that tweens and goals refer to. The program reads this table, so it sees
+        /// later moves.
+        cues: *const Cues = &Cues.empty,
+        /// The goals that motions head for, from `Goals.table`.
+        goals: []const Goal = &.{},
         /// Hashed into the seed of every noise, as section 7 explains.
         seed: u64 = 0,
     };
@@ -218,6 +261,7 @@ pub const Builder = struct {
             .slab_count = 0,
             .slab_count_max = options.slab_count_max,
             .cues = options.cues,
+            .goals = options.goals,
             .seed = options.seed,
             .extent = .{ .lanes = 1, .components = 1 },
             .finished = false,
@@ -258,7 +302,7 @@ pub const Builder = struct {
 
     pub fn tween(builder: *Builder, source: Tween) Error!Id {
         if (source.previous) |previous| try builder.check_known(previous);
-        if (source.start.index >= builder.cues.len) return error.UnknownCue;
+        if (source.start.index >= builder.cues.count) return error.UnknownCue;
         if (!std.math.isFinite(source.from)) return error.NotFinite;
         if (!std.math.isFinite(source.to)) return error.NotFinite;
         if (source.duration.flicks <= 0) return error.InvalidDuration;
@@ -274,6 +318,48 @@ pub const Builder = struct {
         return builder.push(.{ .noise = source.derive(builder.seed) });
     }
 
+    /// A spring toward the goals of `source.goals`, as `motion.zig` explains.
+    pub fn spring(builder: *Builder, source: motion.Spring) Error!Id {
+        try builder.check_goals(source.goals, source.from);
+        if (source.time.flicks <= 0) return error.InvalidDuration;
+        if (std.math.isNan(source.overshoot)) return error.NotFinite;
+        if (!(source.overshoot >= 0 and source.overshoot < 1)) return error.InvalidOvershoot;
+        return builder.push(.{ .motion = .{
+            .from = source.from,
+            .goals = source.goals,
+            .law = .{ .spring = motion.SpringLaw.of(source.time, source.overshoot) },
+        } });
+    }
+
+    /// A Newtonian move toward the goals of `source.goals`, as `motion.zig` explains.
+    pub fn newtonian(builder: *Builder, source: motion.Newtonian) Error!Id {
+        try builder.check_goals(source.goals, source.from);
+        const limits = [_]f64{ source.speed, source.accel, source.decel };
+        for (limits) |limit| {
+            if (!std.math.isFinite(limit)) return error.NotFinite;
+            if (limit <= 0) return error.InvalidLimit;
+        }
+        return builder.push(.{ .motion = .{
+            .from = source.from,
+            .goals = source.goals,
+            .law = .{ .newtonian = .{
+                .speed = source.speed,
+                .accel = source.accel,
+                .decel = source.decel,
+            } },
+        } });
+    }
+
+    fn check_goals(builder: *const Builder, path: motion.Path, from: f64) Error!void {
+        if (!std.math.isFinite(from)) return error.NotFinite;
+        if (path.count == 0) return error.UnknownGoals;
+        if (path.first > builder.goals.len) return error.UnknownGoals;
+        if (path.count > builder.goals.len - path.first) return error.UnknownGoals;
+        for (builder.goals[path.first..][0..path.count]) |goal| {
+            if (goal.cue.index >= builder.cues.count) return error.UnknownCue;
+        }
+    }
+
     /// The program built so far. Nothing can be added after this.
     pub fn finish(builder: *Builder) Program {
         assert(!builder.finished);
@@ -282,6 +368,7 @@ pub const Builder = struct {
         const program: Program = .{
             .nodes = builder.nodes[0..builder.node_count],
             .cues = builder.cues,
+            .goals = builder.goals,
             .slab_count = builder.slab_count,
         };
         program.assert_valid();
@@ -297,7 +384,8 @@ pub const Builder = struct {
         assert(!builder.finished);
         assert(builder.slab_count <= builder.slab_count_max);
         if (builder.node_count == builder.nodes.len) return error.NodeCapacityExceeded;
-        const count = @as(u64, builder.extent.lanes) * builder.extent.components;
+        const count = @as(u64, builder.extent.lanes) * builder.extent.components +
+            op.cache_count();
         assert(count > 0);
         if (builder.slab_count + count > builder.slab_count_max) {
             return error.SlabCapacityExceeded;
@@ -359,7 +447,8 @@ fn node_values(nodes: []const Node, slab: []const f64, id: Id) []const f64 {
 
 fn eval_node(program: *const Program, slab: []f64, node: *const Node, time: Time) void {
     const nodes = program.nodes;
-    const out = slab[node.offset..][0..node.extent.count()];
+    const output_count = node.extent.count();
+    const out = slab[node.offset..][0..output_count];
     switch (node.op) {
         .constant => |constant| @memset(out, constant),
         .add => |op| {
@@ -373,8 +462,12 @@ fn eval_node(program: *const Program, slab: []f64, node: *const Node, time: Time
         .map_range => |*op| map_range_into(out, node_values(nodes, slab, op.input), op),
         .wave => |wave| @memset(out, wave.sample(time)),
         .noise => |noise| @memset(out, noise.sample(time)),
+        .motion => |*op| {
+            const cursor = slab[node.offset + output_count ..][0..motion.cursor_count];
+            @memset(out, motion.sample(op, program.goals, program.cues, cursor, time));
+        },
         .tween => |*tween| {
-            const start_time = program.cues[tween.start.index];
+            const start_time = program.cues.at(tween.start);
             if (time.flicks >= start_time.flicks) {
                 @memset(out, tween.value_after(time, start_time));
             } else if (tween.previous) |previous| {
@@ -410,7 +503,6 @@ fn map_range_into(out: []f64, input: []const f64, map: *const MapRange) void {
 }
 
 const testing = std.testing;
-const Cues = @import("cue.zig").Cues;
 const Rate = @import("time.zig").Rate;
 
 const carrier = Wave{ .shape = .sine, .hz = 440 };
@@ -607,7 +699,8 @@ test "moving the memory changes nothing" {
 
     const program_moved: Program = .{
         .nodes = &nodes_moved,
-        .cues = &.{},
+        .cues = &Cues.empty,
+        .goals = &.{},
         .slab_count = program.slab_count,
     };
     var state_checkpoint: State = .{
@@ -711,7 +804,7 @@ test "a tween ends on its target value, bit for bit" {
 
     for ([_]f64{ 0.3, -0.0 }) |target| {
         var nodes: [1]Node = undefined;
-        var builder = Builder.init(&nodes, .{ .slab_count_max = 1, .cues = cues.table() });
+        var builder = Builder.init(&nodes, .{ .slab_count_max = 1, .cues = &cues });
         const tween = try builder.tween(tween_of(0.1, target, cue, .in_out));
         var slab: [1]f64 = undefined;
         var state = State.init(builder.finish(), &slab);
@@ -738,7 +831,7 @@ test "a tween follows its ease" {
     var cues = Cues.init(&times);
     const cue = try cues.add(.{ .flicks = 0 });
     var nodes: [2]Node = undefined;
-    var builder = Builder.init(&nodes, .{ .slab_count_max = 2, .cues = cues.table() });
+    var builder = Builder.init(&nodes, .{ .slab_count_max = 2, .cues = &cues });
     const symmetric = try builder.tween(tween_of(10, 20, cue, .in_out));
     const slow_start = try builder.tween(tween_of(10, 20, cue, .in));
     var slab: [2]f64 = undefined;
@@ -756,7 +849,7 @@ test "moving a cue shifts its tween by exactly that time" {
     var cues = Cues.init(&times);
     const cue = try cues.add(.{ .flicks = 0 });
     var nodes: [1]Node = undefined;
-    var builder = Builder.init(&nodes, .{ .slab_count_max = 1, .cues = cues.table() });
+    var builder = Builder.init(&nodes, .{ .slab_count_max = 1, .cues = &cues });
     const tween = try builder.tween(tween_of(0.1, 0.7, cue, .in_out));
     var slab: [1]f64 = undefined;
     var state = State.init(builder.finish(), &slab);
@@ -784,7 +877,7 @@ test "a chain of tweens is a sequence, and a gap holds" {
     const first_cue = try cues.add(.{ .flicks = 0 });
     const second_cue = try cues.add(.{ .flicks = 2 * 705_600_000 });
     var nodes: [2]Node = undefined;
-    var builder = Builder.init(&nodes, .{ .slab_count_max = 2, .cues = cues.table() });
+    var builder = Builder.init(&nodes, .{ .slab_count_max = 2, .cues = &cues });
     const first = try builder.tween(tween_of(0, 1, first_cue, .linear));
     var second_tween = tween_of(5, 2, second_cue, .linear);
     second_tween.previous = first;
@@ -816,7 +909,7 @@ test "a later tween wins an overlap" {
     const first_cue = try cues.add(.{ .flicks = 0 });
     const second_cue = try cues.add(.{ .flicks = 352_800_000 });
     var nodes: [2]Node = undefined;
-    var builder = Builder.init(&nodes, .{ .slab_count_max = 2, .cues = cues.table() });
+    var builder = Builder.init(&nodes, .{ .slab_count_max = 2, .cues = &cues });
     const first = try builder.tween(tween_of(0, 1, first_cue, .linear));
     var second_tween = tween_of(10, 20, second_cue, .linear);
     second_tween.previous = first;
@@ -843,7 +936,7 @@ test "a tween can follow any signal until its cue" {
     var cues = Cues.init(&times);
     const cue = try cues.add(.{ .flicks = 705_600_000 });
     var nodes: [2]Node = undefined;
-    var builder = Builder.init(&nodes, .{ .slab_count_max = 2, .cues = cues.table() });
+    var builder = Builder.init(&nodes, .{ .slab_count_max = 2, .cues = &cues });
     const wave = try builder.wave(swell);
     var source = tween_of(3, 4, cue, .linear);
     source.previous = wave;
@@ -866,7 +959,7 @@ test "a tween survives the full range of time" {
     var cues = Cues.init(&times);
     const cue = try cues.add(.{ .flicks = std.math.minInt(i64) });
     var nodes: [1]Node = undefined;
-    var builder = Builder.init(&nodes, .{ .slab_count_max = 1, .cues = cues.table() });
+    var builder = Builder.init(&nodes, .{ .slab_count_max = 1, .cues = &cues });
     var source = tween_of(1, 2, cue, .linear);
     source.duration = .{ .flicks = std.math.maxInt(i64) };
     const tween = try builder.tween(source);
@@ -890,7 +983,7 @@ test "the builder refuses a tween it cannot evaluate" {
     var times: [1]Time = undefined;
     var cues = Cues.init(&times);
     const cue = try cues.add(.{ .flicks = 0 });
-    var builder = Builder.init(&nodes, .{ .slab_count_max = 2, .cues = cues.table() });
+    var builder = Builder.init(&nodes, .{ .slab_count_max = 2, .cues = &cues });
     const nan = std.math.nan(f64);
     try testing.expectError(error.NotFinite, builder.tween(tween_of(nan, 1, cue, .linear)));
     try testing.expectError(error.NotFinite, builder.tween(tween_of(0, nan, cue, .linear)));
@@ -916,7 +1009,7 @@ test "a tween loops over the extent of its node" {
     var cues = Cues.init(&times);
     const cue = try cues.add(.{ .flicks = 705_600_000 });
     var nodes: [2]Node = undefined;
-    var builder = Builder.init(&nodes, .{ .slab_count_max = 12, .cues = cues.table() });
+    var builder = Builder.init(&nodes, .{ .slab_count_max = 12, .cues = &cues });
     builder.extent = .{ .lanes = 3, .components = 2 };
     const before = try builder.constant(7);
     var source = tween_of(1, 9, cue, .linear);
@@ -1066,4 +1159,261 @@ test "a noise loops over the extent of its node" {
     state.eval(time);
     const expected = source.derive(0).sample(time);
     try testing.expectEqualSlices(f64, &@as([6]f64, @splat(expected)), state.values(noise));
+}
+
+/// Cues at 0, 0.4, 1.1, and 1.5 s, and two paths over them: 1, 0, 3, -2 for a spring, and 10, 2,
+/// 6 for a Newtonian move from the second cue.
+const Track = struct {
+    times: [4]Time,
+    cues: Cues,
+    entries: [7]Goal,
+    goals: motion.Goals,
+    spring_path: motion.Path,
+    newtonian_path: motion.Path,
+
+    fn init(track: *Track) !void {
+        track.cues = Cues.init(&track.times);
+        const seconds_tenths = [_]i64{ 0, 4, 11, 15 };
+        var cues: [4]Cue = undefined;
+        for (seconds_tenths, &cues) |tenths, *cue| {
+            cue.* = try track.cues.add(.{ .flicks = tenths * 70_560_000 });
+        }
+        track.goals = motion.Goals.init(&track.entries);
+        track.spring_path = try track.goals.add(&.{
+            .{ .cue = cues[0], .value = 1 },
+            .{ .cue = cues[1], .value = 0 },
+            .{ .cue = cues[2], .value = 3 },
+            .{ .cue = cues[3], .value = -2 },
+        });
+        track.newtonian_path = try track.goals.add(&.{
+            .{ .cue = cues[1], .value = 10 },
+            .{ .cue = cues[2], .value = 2 },
+            .{ .cue = cues[3], .value = 6 },
+        });
+    }
+
+    /// A spring of overshoot 0.2 and a Newtonian move, built in `nodes`.
+    fn build(track: *const Track, nodes: []Node) ![2]Id {
+        var builder = Builder.init(nodes, .{
+            .slab_count_max = 2 * (1 + motion.cursor_count),
+            .cues = &track.cues,
+            .goals = track.goals.table(),
+        });
+        const bouncy = try builder.spring(.{
+            .from = -1,
+            .goals = track.spring_path,
+            .time = .{ .flicks = 352_800_000 },
+            .overshoot = 0.2,
+        });
+        const newtonian = try builder.newtonian(.{
+            .from = 0,
+            .goals = track.newtonian_path,
+            .speed = 12,
+            .accel = 40,
+            .decel = 30,
+        });
+        _ = builder.finish();
+        return .{ bouncy, newtonian };
+    }
+};
+
+// Locks the rule of section 8: 2.5 s of a spring and a Newtonian move at 240 Hz, read forwards
+// with the cursor, backwards, in a scattered order, and each from a fresh slab, give the same
+// bits.
+test "a motion's cursor never changes a value" {
+    var track: Track = undefined;
+    try track.init();
+    var nodes: [2]Node = undefined;
+    const ids = try track.build(&nodes);
+    const program: Program = .{
+        .nodes = &nodes,
+        .cues = &track.cues,
+        .goals = track.goals.table(),
+        .slab_count = 2 * (1 + motion.cursor_count),
+    };
+    const rate = Rate.from_hz(240).?;
+    const frames_count = 600;
+    var slab: [10]f64 = undefined;
+    var state = State.init(program, &slab);
+    var forward: [frames_count][2]f64 = undefined;
+    for (&forward, 0..) |*values, frame| {
+        state.eval(Time.from_ticks(@intCast(frame), rate).?);
+        values.* = .{ state.value(ids[0]), state.value(ids[1]) };
+    }
+
+    var frame: usize = frames_count;
+    while (frame > 0) {
+        frame -= 1;
+        state.eval(Time.from_ticks(@intCast(frame), rate).?);
+        try testing.expectEqual(forward[frame], [2]f64{ state.value(ids[0]), state.value(ids[1]) });
+    }
+    var hop: usize = 0;
+    for (0..frames_count) |_| {
+        hop = (hop + 389) % frames_count;
+        state.eval(Time.from_ticks(@intCast(hop), rate).?);
+        try testing.expectEqual(forward[hop], [2]f64{ state.value(ids[0]), state.value(ids[1]) });
+        var slab_fresh: [10]f64 = undefined;
+        var fresh = State.init(program, &slab_fresh);
+        fresh.eval(Time.from_ticks(@intCast(hop), rate).?);
+        try testing.expectEqual(forward[hop], [2]f64{ fresh.value(ids[0]), fresh.value(ids[1]) });
+    }
+    try testing.expectEqual(@as(f64, -1), forward[0][0]);
+    try testing.expectEqual(@as(f64, 6), forward[frames_count - 1][1]);
+}
+
+// Locks the demo of this step: stepping at 24, 60, 240, and 960 Hz through 2.5 s of retargets gives
+// the same value at every instant the rates share, every 1/12 s. The tolerance is zero: a value
+// depends on the time and the goals, never on the frames before it.
+test "springs ignore the frame rate" {
+    var track: Track = undefined;
+    try track.init();
+    var nodes: [2]Node = undefined;
+    const ids = try track.build(&nodes);
+    const program: Program = .{
+        .nodes = &nodes,
+        .cues = &track.cues,
+        .goals = track.goals.table(),
+        .slab_count = 2 * (1 + motion.cursor_count),
+    };
+    const rates_hz = [_]u32{ 24, 60, 240, 960 };
+    var shared: [rates_hz.len][31][2]f64 = undefined;
+    for (rates_hz, &shared) |hz, *values| {
+        var slab: [10]f64 = undefined;
+        var state = State.init(program, &slab);
+        const per_shared = hz / 12;
+        for (0..31 * per_shared) |frame| {
+            state.eval(Time.from_ticks(@intCast(frame), Rate.from_hz(hz).?).?);
+            if (frame % per_shared == 0) {
+                values[frame / per_shared] = .{ state.value(ids[0]), state.value(ids[1]) };
+            }
+        }
+    }
+    for (shared[1..]) |values| try testing.expectEqual(shared[0], values);
+}
+
+// Locks that a cue move makes a cursor stale: a reader that has played past the second goal sees
+// the move at its next eval, with the value a fresh reader computes, which differs from before.
+test "moving a cue reaches a motion's cursor" {
+    var track: Track = undefined;
+    try track.init();
+    var nodes: [2]Node = undefined;
+    const ids = try track.build(&nodes);
+    const program: Program = .{
+        .nodes = &nodes,
+        .cues = &track.cues,
+        .goals = track.goals.table(),
+        .slab_count = 2 * (1 + motion.cursor_count),
+    };
+    var slab: [10]f64 = undefined;
+    var state = State.init(program, &slab);
+    const time: Time = .{ .flicks = 13 * 70_560_000 };
+    for (0..14) |tenth| state.eval(.{ .flicks = @as(i64, @intCast(tenth)) * 70_560_000 });
+    state.eval(time);
+    const before = [2]f64{ state.value(ids[0]), state.value(ids[1]) };
+
+    try track.cues.move(.{ .index = 1 }, .{ .flicks = 3 * 70_560_000 });
+    state.eval(time);
+    const after = [2]f64{ state.value(ids[0]), state.value(ids[1]) };
+    var slab_fresh: [10]f64 = undefined;
+    var fresh = State.init(program, &slab_fresh);
+    fresh.eval(time);
+    try testing.expectEqual([2]f64{ fresh.value(ids[0]), fresh.value(ids[1]) }, after);
+    try testing.expect(before[0] != after[0]);
+    try testing.expect(before[1] != after[1]);
+}
+
+// Locks the layout of section 2 for a motion: 3 lanes of output then 4 f64 of cursor, so the next
+// node starts at 7, and every lane holds the value.
+test "a motion keeps its cursor after its output" {
+    var times: [1]Time = undefined;
+    var cues = Cues.init(&times);
+    const cue = try cues.add(.{ .flicks = 0 });
+    var entries: [1]Goal = undefined;
+    var goals = motion.Goals.init(&entries);
+    const path = try goals.add(&.{.{ .cue = cue, .value = 2 }});
+    var nodes: [2]Node = undefined;
+    var builder = Builder.init(&nodes, .{
+        .slab_count_max = 10,
+        .cues = &cues,
+        .goals = goals.table(),
+    });
+    builder.extent = .{ .lanes = 3, .components = 1 };
+    const move = try builder.newtonian(.{
+        .from = 0,
+        .goals = path,
+        .speed = 1,
+        .accel = 1,
+        .decel = 1,
+    });
+    const after = try builder.constant(5);
+    const program = builder.finish();
+    try testing.expectEqual(@as(u32, 7), program.nodes[after.index].offset);
+    try testing.expectEqual(@as(u32, 10), program.slab_count);
+    var slab: [10]f64 = undefined;
+    var state = State.init(program, &slab);
+    state.eval(.{ .flicks = 705_600_000 });
+    try testing.expectEqualSlices(f64, &@as([3]f64, @splat(0.5)), state.values(move));
+}
+
+// Locks each refusal of `spring` and `newtonian` by name, and that nothing refused was built.
+test "the builder refuses a motion it cannot evaluate" {
+    var times: [1]Time = undefined;
+    var cues = Cues.init(&times);
+    const cue = try cues.add(.{ .flicks = 0 });
+    var entries: [2]Goal = undefined;
+    var goals = motion.Goals.init(&entries);
+    const path = try goals.add(&.{.{ .cue = cue, .value = 1 }});
+    const beyond = try goals.add(&.{.{ .cue = .{ .index = 1 }, .value = 1 }});
+    var nodes: [2]Node = undefined;
+    var builder = Builder.init(&nodes, .{
+        .slab_count_max = 10,
+        .cues = &cues,
+        .goals = goals.table(),
+    });
+    const second: Time = .{ .flicks = 705_600_000 };
+    var spring: motion.Spring = .{ .from = 0, .goals = path, .time = second, .overshoot = 0 };
+    const unknowns = [_]motion.Path{
+        .{ .first = 0, .count = 0 },
+        .{ .first = 1, .count = 2 },
+        .{ .first = 3, .count = 1 },
+    };
+    for (unknowns) |unknown| {
+        spring.goals = unknown;
+        try testing.expectError(error.UnknownGoals, builder.spring(spring));
+    }
+    spring.goals = beyond;
+    try testing.expectError(error.UnknownCue, builder.spring(spring));
+    spring.goals = path;
+    spring.from = std.math.inf(f64);
+    try testing.expectError(error.NotFinite, builder.spring(spring));
+    spring.from = 0;
+    spring.time = .{ .flicks = 0 };
+    try testing.expectError(error.InvalidDuration, builder.spring(spring));
+    spring.time = second;
+    for ([_]f64{ -0.1, 1, 2 }) |overshoot| {
+        spring.overshoot = overshoot;
+        try testing.expectError(error.InvalidOvershoot, builder.spring(spring));
+    }
+    spring.overshoot = std.math.nan(f64);
+    try testing.expectError(error.NotFinite, builder.spring(spring));
+
+    var newtonian: motion.Newtonian = .{
+        .from = 0,
+        .goals = path,
+        .speed = 1,
+        .accel = 1,
+        .decel = 1,
+    };
+    newtonian.decel = 0;
+    try testing.expectError(error.InvalidLimit, builder.newtonian(newtonian));
+    newtonian.decel = 1;
+    newtonian.speed = -1;
+    try testing.expectError(error.InvalidLimit, builder.newtonian(newtonian));
+    newtonian.speed = std.math.inf(f64);
+    try testing.expectError(error.NotFinite, builder.newtonian(newtonian));
+    try testing.expectEqual(@as(u32, 0), builder.node_count);
+    newtonian.speed = 1;
+    _ = try builder.newtonian(newtonian);
+    spring.overshoot = 0.999;
+    _ = try builder.spring(spring);
 }
