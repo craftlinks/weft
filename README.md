@@ -2,7 +2,7 @@
 
 A Zig library for composable motion: motion as an object of its own, separate from whatever it
 moves. It has no dependencies and knows nothing about pixels. So far it has a clock, four waves,
-easing, tweens on named cues, and a graph that composes them.
+seeded noise, easing, tweens on named cues, and a graph that composes them.
 
 Every frame is a function of t. A reader supplies the time and gets a value, and it can ask for any
 time in any order. Nothing on that path allocates, locks, or runs unbounded, and a sampled signal
@@ -35,6 +35,7 @@ src/
     cue.zig           Cues: a sorted, bounded table of times
     ease.zig          Ease: cubic Bezier curves, with a bounded solver
     graph.zig         Program, Builder, and State: a flat node array and one slab per reader
+    noise.zig         Noise: smooth and stepped, pure functions of a seed and time
     time.zig          Time and Rate: an integer count of flicks
     wave.zig          Wave: sine, triangle, saw, and square, pure functions of time
 test/
@@ -60,8 +61,9 @@ const value = wave.sample(time);               // in [-1, 1]
 ```
 
 `Time` is a signed 64-bit count of flicks, 1/705,600,000 s, which is exact for the common frame and
-audio rates. Rounding happens only where a formula meets a time: `seconds` for a duration, and
-`turns` for a position in a cycle. `turns` stays precise far from zero; see `time.zig`, section 3.
+audio rates. Rounding happens only where a formula meets a time: `seconds` for a duration, `turns`
+for a position in a cycle, and `cycles` for that position and the count of cycles before it. Both
+stay precise far from zero; see `time.zig`, section 3.
 
 ## Graph
 
@@ -86,15 +88,34 @@ state.eval(time);                              // allocates nothing, locks nothi
 const value = state.value(output);
 ```
 
-The ops are `constant`, `add`, `multiply`, `map_range`, `wave`, and `tween`. The builder refuses by
-name what does not fit or cannot be evaluated: `error.NodeCapacityExceeded`,
+The ops are `constant`, `add`, `multiply`, `map_range`, `wave`, `noise`, and `tween`. The builder
+refuses by name what does not fit or cannot be evaluated: `error.NodeCapacityExceeded`,
 `error.SlabCapacityExceeded`, `error.UnknownNode`, `error.NotFinite`, `error.InvalidRange`,
-`error.UnknownCue`, `error.InvalidDuration`, and `error.InvalidEase`.
+`error.UnknownCue`, `error.InvalidDuration`, `error.InvalidEase`, and `error.InvalidRate`.
 
 A node can only refer to earlier nodes, so a cycle cannot be expressed. Neither the node array nor
 the slab holds a pointer: copied as bytes, the nodes are the same program and the slab is a
 checkpoint. Each reader holds its own state, so readers on different threads never disturb each
 other. `graph.zig` explains the layout.
+
+## Noise
+
+```zig
+const drift = weft.Noise{ .shape = .smooth, .hz = 0.7, .seed = 42 };
+const value = drift.sample(time);              // in [-1, 1], the same at any time, in any order
+
+var builder = weft.Builder.init(&nodes, .{ .slab_count_max = 4, .seed = take });
+const wobble = try builder.noise(.{ .shape = .steps, .hz = 4, .seed = 1 });
+```
+
+There is no random generator. A noise holds one value per cycle of `hz`, a hash of its seed and the
+cycle's index, so it is a pure function of time like a wave. `.steps` holds each value for a cycle;
+`.smooth` is a cubic B-spline over them, with continuous velocity and acceleration, and it cannot
+leave [-1, 1]. `hz` is above 0 and at most `Noise.hz_max`, 2^19 Hz.
+
+In a graph, a noise's seed is hashed with the graph's seed from `Builder.Options`. So one graph seed
+gives a new take of every noise at once, and since a node's seed is a stable id the caller chooses,
+not its position, inserting a node does not reshuffle the others. `noise.zig` explains the hash.
 
 ## Cues and Tweens
 
@@ -128,8 +149,9 @@ tween wins from its start. `cue.zig` and `graph.zig`, section 6, explain why.
 ## Regress
 
 `zig build regress` renders `test/catalog.zig` on native and on wasm and compares both with
-`test/golden/signals.txt`, byte for byte. It samples each wave and a few whole graphs. There is one
-sample per line, as a hex float, so any changed bit fails and the report names the sample:
+`test/golden/signals.txt`, byte for byte. It samples each wave, each noise, and a few whole graphs.
+There is one sample per line, as a hex float, so any changed bit fails and the report names the
+sample:
 
 ```txt
 regress: native differs from golden at line 700

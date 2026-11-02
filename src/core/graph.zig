@@ -39,7 +39,13 @@
 //! own start, and from then on the tween wins. A chain of tweens is a sequence, with no sequence
 //! type, and a gap between two tweens holds the earlier one's `to`.
 //!
-//! ## 7. TigerStyle Invariants
+//! ## 7. Seeds
+//! A graph has one seed, from `Builder.Options`, and a noise node has a `seed` of its own, which is
+//! a stable id the caller chooses and not the node's position. The builder stores the two hashed
+//! together, so the graph's seed gives a new take of every noise at once, and inserting a node
+//! does not reshuffle the others. Two noises with the same `seed` in one graph are one signal.
+//!
+//! ## 8. TigerStyle Invariants
 //! - Capacities come from the caller, and the builder refuses what does not fit, by name.
 //! - `eval` allocates nothing, takes no lock, and is one bounded pass over the node array.
 //! - Offsets are consecutive from 0, so the slab has no gaps and no node overlaps another.
@@ -48,6 +54,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const Cue = @import("cue.zig").Cue;
 const Ease = @import("ease.zig").Ease;
+const Noise = @import("noise.zig").Noise;
 const Time = @import("time.zig").Time;
 const Wave = @import("wave.zig").Wave;
 
@@ -116,6 +123,7 @@ pub const Op = union(enum) {
     map_range: MapRange,
     wave: Wave,
     tween: Tween,
+    noise: Noise,
 };
 
 pub const Node = struct {
@@ -145,7 +153,7 @@ pub const Program = struct {
             assert(node.offset == offset);
             offset += node.extent.count();
             switch (node.op) {
-                .constant, .wave => {},
+                .constant, .wave, .noise => {},
                 .add, .multiply => |op| {
                     assert(op.left.index < index);
                     assert(op.right.index < index);
@@ -168,6 +176,7 @@ pub const Builder = struct {
     slab_count: u32,
     slab_count_max: u32,
     cues: []const Time,
+    seed: u64,
     /// The extent of every node built, 1 by 1 until a later step gives each node its own.
     extent: Extent,
     finished: bool,
@@ -189,12 +198,16 @@ pub const Builder = struct {
         InvalidDuration,
         /// A tween whose ease fails `Ease.valid`.
         InvalidEase,
+        /// A noise whose frequency is not above 0 and at most `Noise.hz_max`.
+        InvalidRate,
     };
 
     pub const Options = struct {
         slab_count_max: u32,
         /// The cue times tweens can start from, from `Cues.table`.
         cues: []const Time = &.{},
+        /// Hashed into the seed of every noise, as section 7 explains.
+        seed: u64 = 0,
     };
 
     pub fn init(nodes: []Node, options: Options) Builder {
@@ -205,6 +218,7 @@ pub const Builder = struct {
             .slab_count = 0,
             .slab_count_max = options.slab_count_max,
             .cues = options.cues,
+            .seed = options.seed,
             .extent = .{ .lanes = 1, .components = 1 },
             .finished = false,
         };
@@ -250,6 +264,14 @@ pub const Builder = struct {
         if (source.duration.flicks <= 0) return error.InvalidDuration;
         if (!source.ease.valid()) return error.InvalidEase;
         return builder.push(.{ .tween = source });
+    }
+
+    /// A noise whose seed is `source.seed` hashed with the graph's seed.
+    pub fn noise(builder: *Builder, source: Noise) Error!Id {
+        if (!std.math.isFinite(source.hz)) return error.NotFinite;
+        if (source.hz <= 0) return error.InvalidRate;
+        if (source.hz > Noise.hz_max) return error.InvalidRate;
+        return builder.push(.{ .noise = source.derive(builder.seed) });
     }
 
     /// The program built so far. Nothing can be added after this.
@@ -350,6 +372,7 @@ fn eval_node(program: *const Program, slab: []f64, node: *const Node, time: Time
         },
         .map_range => |*op| map_range_into(out, node_values(nodes, slab, op.input), op),
         .wave => |wave| @memset(out, wave.sample(time)),
+        .noise => |noise| @memset(out, noise.sample(time)),
         .tween => |*tween| {
             const start_time = program.cues[tween.start.index];
             if (time.flicks >= start_time.flicks) {
@@ -955,4 +978,92 @@ test "two states on one program never disturb each other" {
     thread_audio.join();
     try testing.expectEqual(@as(u32, 0), video.mismatches);
     try testing.expectEqual(@as(u32, 0), audio.mismatches);
+}
+
+/// Two noises keyed 1 and 2 and summed, with `inserted` nodes built before them, including a noise
+/// keyed 3. Returns the two noises.
+fn build_noises(builder: *Builder, inserted: bool) Builder.Error![2]Id {
+    if (inserted) {
+        _ = try builder.wave(carrier);
+        _ = try builder.noise(.{ .shape = .smooth, .hz = 5, .seed = 3 });
+    }
+    const first = try builder.noise(.{ .shape = .smooth, .hz = 0.7, .seed = 1 });
+    const second = try builder.noise(.{ .shape = .steps, .hz = 4, .seed = 2 });
+    _ = try builder.add(first, second);
+    return .{ first, second };
+}
+
+// Locks the demo of section 7: inserting a wave and a third noise before two noises moves their
+// ids but not their values, which match `Noise.derive` sample for sample; and another graph seed
+// changes both.
+test "inserting a node does not reshuffle the noises" {
+    var nodes_plain: [3]Node = undefined;
+    var builder_plain = Builder.init(&nodes_plain, .{ .slab_count_max = 3, .seed = 77 });
+    const plain = try build_noises(&builder_plain, false);
+    var slab_plain: [3]f64 = undefined;
+    var state_plain = State.init(builder_plain.finish(), &slab_plain);
+
+    var nodes_inserted: [5]Node = undefined;
+    var builder_inserted = Builder.init(&nodes_inserted, .{ .slab_count_max = 5, .seed = 77 });
+    const inserted = try build_noises(&builder_inserted, true);
+    var slab_inserted: [5]f64 = undefined;
+    var state_inserted = State.init(builder_inserted.finish(), &slab_inserted);
+    try testing.expect(inserted[0].index != plain[0].index);
+
+    var nodes_other: [3]Node = undefined;
+    var builder_other = Builder.init(&nodes_other, .{ .slab_count_max = 3, .seed = 78 });
+    const other = try build_noises(&builder_other, false);
+    var slab_other: [3]f64 = undefined;
+    var state_other = State.init(builder_other.finish(), &slab_other);
+
+    const first: Noise = .{ .shape = .smooth, .hz = 0.7, .seed = 1 };
+    var tick: i64 = 0;
+    var differences: u32 = 0;
+    while (tick < 10 * 48_000) : (tick += 997) {
+        const time = Time.from_ticks(tick, Rate.from_hz(48_000).?).?;
+        state_plain.eval(time);
+        state_inserted.eval(time);
+        state_other.eval(time);
+        for (plain, inserted) |id_plain, id_inserted| {
+            try testing.expectEqual(state_plain.value(id_plain), state_inserted.value(id_inserted));
+        }
+        try testing.expectEqual(first.derive(77).sample(time), state_plain.value(plain[0]));
+        if (state_other.value(other[0]) != state_plain.value(plain[0])) differences += 1;
+    }
+    try testing.expect(differences > 400);
+}
+
+// Locks each refusal of `noise` by name, and the edges that are accepted: `Noise.hz_max` itself,
+// and the smallest positive double.
+test "the builder refuses a noise it cannot evaluate" {
+    var nodes: [2]Node = undefined;
+    var builder = Builder.init(&nodes, .{ .slab_count_max = 2 });
+    var source: Noise = .{ .shape = .steps, .hz = std.math.nan(f64), .seed = 0 };
+    try testing.expectError(error.NotFinite, builder.noise(source));
+    source.hz = std.math.inf(f64);
+    try testing.expectError(error.NotFinite, builder.noise(source));
+    for ([_]f64{ 0, -0.0, -1, Noise.hz_max * 2 }) |hz| {
+        source.hz = hz;
+        try testing.expectError(error.InvalidRate, builder.noise(source));
+    }
+    try testing.expectEqual(@as(u32, 0), builder.node_count);
+    source.hz = Noise.hz_max;
+    _ = try builder.noise(source);
+    source.hz = std.math.floatTrueMin(f64);
+    _ = try builder.noise(source);
+}
+
+// Locks that a noise fills every lane of its extent.
+test "a noise loops over the extent of its node" {
+    var nodes: [1]Node = undefined;
+    var builder = Builder.init(&nodes, .{ .slab_count_max = 6 });
+    builder.extent = .{ .lanes = 3, .components = 2 };
+    const source: Noise = .{ .shape = .smooth, .hz = 2, .seed = 4 };
+    const noise = try builder.noise(source);
+    var slab: [6]f64 = undefined;
+    var state = State.init(builder.finish(), &slab);
+    const time = Time{ .flicks = 444_444_444 };
+    state.eval(time);
+    const expected = source.derive(0).sample(time);
+    try testing.expectEqualSlices(f64, &@as([6]f64, @splat(expected)), state.values(noise));
 }
