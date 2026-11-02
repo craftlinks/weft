@@ -14,7 +14,9 @@
 
 pub const cue = @import("core/cue.zig");
 pub const ease = @import("core/ease.zig");
+pub const elementary = @import("core/elementary.zig");
 pub const graph = @import("core/graph.zig");
+pub const motion = @import("core/motion.zig");
 pub const noise = @import("core/noise.zig");
 pub const time = @import("core/time.zig");
 pub const wave = @import("core/wave.zig");
@@ -29,6 +31,11 @@ pub const Node = graph.Node;
 pub const Program = graph.Program;
 pub const State = graph.State;
 pub const Tween = graph.Tween;
+pub const Goal = motion.Goal;
+pub const Goals = motion.Goals;
+pub const Newtonian = motion.Newtonian;
+pub const Path = motion.Path;
+pub const Spring = motion.Spring;
 pub const Noise = noise.Noise;
 pub const Rate = time.Rate;
 pub const Time = time.Time;
@@ -38,7 +45,9 @@ pub const Wave = wave.Wave;
 test {
     _ = cue;
     _ = ease;
+    _ = elementary;
     _ = graph;
+    _ = motion;
     _ = noise;
     _ = time;
     _ = wave;

@@ -25,8 +25,9 @@
 //! Signals alone cannot notice a change in how a `Program` evaluates, so the catalog also samples
 //! whole graphs through a `State`, on the same epochs. They come after the signals in the text, so
 //! a change to either shows up on its own lines. Cues are set relative to the epoch, so a sequence
-//! of tweens runs at each one, and a test locks that it has the same bits at all of them. One graph
-//! has noise, so a change to how the builder derives a node's seed changes its lines.
+//! of tweens runs at each one, and a test locks that it has the same bits at all of them, as do a
+//! spring and a Newtonian move, which head for goals at the same cues. One graph has noise, so a
+//! change to how the builder derives a node's seed changes its lines.
 //!
 //! ## 6. TigerStyle Invariants
 //! - The text fits in `text_size_max` by construction, so `render` cannot fail.
@@ -73,10 +74,23 @@ const Graph = enum {
     drift,
     sequence,
     wander,
+    spring,
+    glide,
 
     const nodes_count_max = 8;
+    /// Room for the outputs of `nodes_count_max` nodes, and for two motions' cursors.
+    const slab_count_max = nodes_count_max + 2 * weft.motion.cursor_count;
     const cues_count = 3;
+
+    /// The goals of the motion graphs, one at each cue, as two paths in one table.
+    const goals_count = 6;
+    const spring_goals: weft.Path = .{ .first = 0, .count = 3 };
+    const glide_goals: weft.Path = .{ .first = 3, .count = 3 };
 };
+
+/// The graphs whose bits are the same at every epoch, because they read only differences of cue
+/// times and the time.
+const graphs_epoch_free = [_]Graph{ .sequence, .spring, .glide };
 
 const graphs = std.enums.values(Graph);
 
@@ -95,7 +109,7 @@ pub const text_size_max = sample_count * line_size_max;
 comptime {
     assert(wave_sample_count == 1536);
     assert(noise_sample_count == 768);
-    assert(graph_sample_count == 384);
+    assert(graph_sample_count == 576);
     assert(text_size_max < 1 << 20);
     for (signals) |signal| assert(weft.Rate.from_hz(signal.rate_hz) != null);
 }
@@ -169,17 +183,33 @@ fn render_graph_run(writer: *std.Io.Writer, graph: Graph, epoch: *const Epoch) v
     // Half a second into the epoch, then a second apart.
     var cue_times: [Graph.cues_count]weft.Time = undefined;
     var cues = weft.Cues.init(&cue_times);
-    for (0..Graph.cues_count) |index| {
+    var cue_ids: [Graph.cues_count]weft.Cue = undefined;
+    for (&cue_ids, 0..) |*cue, index| {
         const half_seconds: i64 = 2 * @as(i64, @intCast(index)) + 1;
         const flicks = (2 * epoch.seconds + half_seconds) * flicks_per_half_second;
-        _ = cues.add(.{ .flicks = flicks }) catch unreachable;
+        cue.* = cues.add(.{ .flicks = flicks }) catch unreachable;
     }
+    var goal_entries: [Graph.goals_count]weft.Goal = undefined;
+    var goals = weft.Goals.init(&goal_entries);
+    const spring_goals = goals.add(&.{
+        .{ .cue = cue_ids[0], .value = 1 },
+        .{ .cue = cue_ids[1], .value = -0.5 },
+        .{ .cue = cue_ids[2], .value = 0.25 },
+    }) catch unreachable;
+    const glide_goals = goals.add(&.{
+        .{ .cue = cue_ids[0], .value = 1 },
+        .{ .cue = cue_ids[1], .value = -1 },
+        .{ .cue = cue_ids[2], .value = 0.5 },
+    }) catch unreachable;
+    assert(std.meta.eql(spring_goals, Graph.spring_goals));
+    assert(std.meta.eql(glide_goals, Graph.glide_goals));
 
     var nodes: [Graph.nodes_count_max]weft.Node = undefined;
-    var slab: [Graph.nodes_count_max]f64 = undefined;
+    var slab: [Graph.slab_count_max]f64 = undefined;
     var builder = weft.Builder.init(&nodes, .{
         .slab_count_max = slab.len,
-        .cues = cues.table(),
+        .cues = &cues,
+        .goals = goals.table(),
         .seed = noise_seed,
     });
     const output = graph_build(graph, &builder) catch unreachable;
@@ -262,6 +292,21 @@ fn graph_build(graph: Graph, builder: *weft.Builder) weft.Builder.Error!weft.Id 
             const jitter = try builder.multiply(fast, quarter);
             return builder.add(slow, jitter);
         },
+        // A spring of overshoot 0.2 and a period of 0.6 s, retargeted at each cue, mid-swing.
+        .spring => return builder.spring(.{
+            .from = 0,
+            .goals = Graph.spring_goals,
+            .time = .{ .flicks = 6 * @divExact(weft.time.flicks_per_second, 10) },
+            .overshoot = 0.2,
+        }),
+        // A Newtonian move, retargeted behind it at the second cue, before it can stop.
+        .glide => return builder.newtonian(.{
+            .from = 0,
+            .goals = Graph.glide_goals,
+            .speed = 1.5,
+            .accel = 6,
+            .decel = 4,
+        }),
     }
 }
 
@@ -358,24 +403,29 @@ test "a one-bit change is found and names the signal" {
     try testing.expect(!std.mem.eql(u8, mismatch.expected, mismatch.actual));
 }
 
-// Locks what integer time gives a tween: the cues of `sequence` sit at the same place in each
-// epoch, so its samples have the same bits an hour either side of zero and a day on.
-test "a tween sequence has the same bits at every epoch" {
+// Locks what integer time gives tweens and motions: the cues of `sequence`, `spring`, and `glide`
+// sit at the same place in each epoch, so their samples have the same bits an hour either side of
+// zero and a day on.
+test "tweens and motions have the same bits at every epoch" {
     const text = render(&text_a);
-    const zero_start = std.mem.indexOf(u8, text, "graph sequence zero 0 ").?;
-    var zero_lines = std.mem.splitScalar(u8, text[zero_start..], '\n');
-    var zero_values: [samples_per_run][]const u8 = undefined;
-    for (&zero_values) |*value| {
-        const line = zero_lines.next().?;
-        value.* = line[std.mem.lastIndexOfScalar(u8, line, ' ').? + 1 ..];
-    }
-    for (epochs) |epoch| {
-        for (zero_values, 0..) |value, index| {
-            var buffer: [line_size_max]u8 = undefined;
-            const line = try std.fmt.bufPrint(&buffer, "graph sequence {s} {d} {s}\n", .{
-                epoch.name, index, value,
-            });
-            try testing.expect(std.mem.indexOf(u8, text, line) != null);
+    for (graphs_epoch_free) |graph| {
+        var buffer_start: [line_size_max]u8 = undefined;
+        const start = try std.fmt.bufPrint(&buffer_start, "graph {t} zero 0 ", .{graph});
+        const zero_start = std.mem.indexOf(u8, text, start).?;
+        var zero_lines = std.mem.splitScalar(u8, text[zero_start..], '\n');
+        var zero_values: [samples_per_run][]const u8 = undefined;
+        for (&zero_values) |*value| {
+            const line = zero_lines.next().?;
+            value.* = line[std.mem.lastIndexOfScalar(u8, line, ' ').? + 1 ..];
+        }
+        for (epochs) |epoch| {
+            for (zero_values, 0..) |value, index| {
+                var buffer: [line_size_max]u8 = undefined;
+                const line = try std.fmt.bufPrint(&buffer, "graph {t} {s} {d} {s}\n", .{
+                    graph, epoch.name, index, value,
+                });
+                try testing.expect(std.mem.indexOf(u8, text, line) != null);
+            }
         }
     }
 }

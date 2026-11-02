@@ -18,9 +18,14 @@
 //! builds a new table.
 //!
 //! ## 3. Moving and Readers
-//! A `Program` sees the table as a slice, so a move reaches its readers at their next eval with no
+//! A `Program` refers to the table, so a move reaches its readers at their next eval with no
 //! rebuild. The table is the one thing a program reads that can change. A move must not overlap an
 //! eval: a reader on another thread takes its own copy of the table, as it would of the nodes.
+//!
+//! Every move adds one to `generation`. A reader that caches something worked out from cue times,
+//! such as where a spring was at its last goal, keeps the generation it saw, and a different one
+//! tells it the cache is stale. Adding a cue does not change the generation, because nothing could
+//! refer to a cue before it existed.
 //!
 //! ## 4. TigerStyle Invariants
 //! - The caller owns the memory, and the table holds no pointers.
@@ -38,6 +43,14 @@ pub const Cue = struct {
 pub const Cues = struct {
     times: []Time,
     count: u32,
+    /// How many moves the table has had. Section 3 explains why.
+    generation: u64,
+
+    /// A table with no cues, for a program that has none.
+    pub const empty: Cues = .{ .times = &.{}, .count = 0, .generation = 0 };
+
+    /// A generation at or above this could not be cached exactly in an f64.
+    pub const generation_max: u64 = 1 << 53;
 
     pub const Error = error{
         /// The array the caller gave `init` is full.
@@ -50,7 +63,7 @@ pub const Cues = struct {
 
     pub fn init(times: []Time) Cues {
         assert(times.len <= std.math.maxInt(u32));
-        return .{ .times = times, .count = 0 };
+        return .{ .times = times, .count = 0, .generation = 0 };
     }
 
     /// A new cue at `time`, which must not be before the last cue.
@@ -78,6 +91,8 @@ pub const Cues = struct {
             if (time.flicks > cues.times[cue.index + 1].flicks) return error.CueOutOfOrder;
         }
         cues.times[cue.index] = time;
+        cues.generation += 1;
+        assert(cues.generation < generation_max);
         cues.assert_sorted();
     }
 
@@ -87,7 +102,7 @@ pub const Cues = struct {
         return cues.times[cue.index];
     }
 
-    /// The cues so far, in order. A `Program` reads this slice, so it sees later moves.
+    /// The cues so far, in order.
     pub fn table(cues: *const Cues) []const Time {
         cues.assert_sorted();
         return cues.times[0..cues.count];
@@ -130,8 +145,8 @@ test "adding refuses a full table and a time out of order" {
 }
 
 // Locks the edges of a move among cues at 100, 200, and 300: the middle cue can reach exactly 100
-// or 300 but not 99 or 301, a refused move changes nothing, and the end cues are only bounded on
-// their inner side.
+// or 300 but not 99 or 301, a refused move changes nothing, not even the generation, which counts
+// the three moves, and the end cues are only bounded on their inner side.
 test "a move can reach a neighbour but not pass it" {
     var times: [3]Time = undefined;
     var cues = Cues.init(&times);
@@ -143,10 +158,12 @@ test "a move can reach a neighbour but not pass it" {
     try cues.move(middle, .{ .flicks = 300 });
     try testing.expectEqual(@as(i64, 300), cues.at(middle).flicks);
     try cues.move(middle, .{ .flicks = 200 });
+    try testing.expectEqual(@as(u64, 3), cues.generation);
 
     try testing.expectError(error.CueOutOfOrder, cues.move(middle, .{ .flicks = 99 }));
     try testing.expectError(error.CueOutOfOrder, cues.move(middle, .{ .flicks = 301 }));
     try testing.expectEqual(@as(i64, 200), cues.at(middle).flicks);
+    try testing.expectEqual(@as(u64, 3), cues.generation);
 
     try cues.move(first, .{ .flicks = std.math.minInt(i64) });
     try cues.move(last, .{ .flicks = std.math.maxInt(i64) });

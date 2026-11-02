@@ -2,7 +2,8 @@
 
 A Zig library for composable motion: motion as an object of its own, separate from whatever it
 moves. It has no dependencies and knows nothing about pixels. So far it has a clock, four waves,
-seeded noise, easing, tweens on named cues, and a graph that composes them.
+seeded noise, easing, tweens on named cues, springs and Newtonian moves toward goals at cues, and a
+graph that composes them.
 
 Every frame is a function of t. A reader supplies the time and gets a value, and it can ask for any
 time in any order. Nothing on that path allocates, locks, or runs unbounded, and a sampled signal
@@ -34,7 +35,9 @@ src/
   core/
     cue.zig           Cues: a sorted, bounded table of times
     ease.zig          Ease: cubic Bezier curves, with a bounded solver
+    elementary.zig    sine and cosine in turns, exp, and log, the same bits on every target
     graph.zig         Program, Builder, and State: a flat node array and one slab per reader
+    motion.zig        Goals, springs, and Newtonian moves, solved exactly between goal changes
     noise.zig         Noise: smooth and stepped, pure functions of a seed and time
     time.zig          Time and Rate: an integer count of flicks
     wave.zig          Wave: sine, triangle, saw, and square, pure functions of time
@@ -88,10 +91,12 @@ state.eval(time);                              // allocates nothing, locks nothi
 const value = state.value(output);
 ```
 
-The ops are `constant`, `add`, `multiply`, `map_range`, `wave`, `noise`, and `tween`. The builder
-refuses by name what does not fit or cannot be evaluated: `error.NodeCapacityExceeded`,
-`error.SlabCapacityExceeded`, `error.UnknownNode`, `error.NotFinite`, `error.InvalidRange`,
-`error.UnknownCue`, `error.InvalidDuration`, `error.InvalidEase`, and `error.InvalidRate`.
+The ops are `constant`, `add`, `multiply`, `map_range`, `wave`, `noise`, `tween`, `spring`, and
+`newtonian`. The builder refuses by name what does not fit or cannot be evaluated:
+`error.NodeCapacityExceeded`, `error.SlabCapacityExceeded`, `error.UnknownNode`,
+`error.NotFinite`, `error.InvalidRange`, `error.UnknownCue`, `error.InvalidDuration`,
+`error.InvalidEase`, `error.InvalidRate`, `error.UnknownGoals`, `error.InvalidOvershoot`, and
+`error.InvalidLimit`.
 
 A node can only refer to earlier nodes, so a cycle cannot be expressed. Neither the node array nor
 the slab holds a pointer: copied as bytes, the nodes are the same program and the slab is a
@@ -125,7 +130,7 @@ var cues = weft.Cues.init(&times);
 const beat = try cues.add(.{ .flicks = 2 * weft.time.flicks_per_second });
 
 var nodes: [2]weft.Node = undefined;
-var builder = weft.Builder.init(&nodes, .{ .slab_count_max = 2, .cues = cues.table() });
+var builder = weft.Builder.init(&nodes, .{ .slab_count_max = 2, .cues = &cues });
 const rise = try builder.tween(.{
     .from = 0,
     .to = 1,
@@ -146,12 +151,50 @@ reader on another thread takes its own copy of the table.
 A chain through `previous` is a sequence. A gap holds the earlier value, and in an overlap the later
 tween wins from its start. `cue.zig` and `graph.zig`, section 6, explain why.
 
+## Springs and Newtonian Moves
+
+```zig
+var entries: [8]weft.Goal = undefined;         // a bounded table, filled before building
+var goals = weft.Goals.init(&entries);
+const path = try goals.add(&.{                 // in cue order: a goal changes at each cue
+    .{ .cue = beat, .value = 1 },
+    .{ .cue = next_beat, .value = 0.25 },
+});
+
+var builder = weft.Builder.init(&nodes, .{
+    .slab_count_max = 2 * (1 + weft.motion.cursor_count),
+    .cues = &cues,
+    .goals = goals.table(),
+});
+const settle = try builder.spring(.{
+    .from = 0,                                 // held, at rest, until the first cue
+    .goals = path,
+    .time = .{ .flicks = weft.time.flicks_per_second / 4 }, // the period: omega is 2 pi / time
+    .overshoot = 0.1,                          // the peak of a move from rest; 0 is critical
+});
+const glide = try builder.newtonian(.{
+    .from = 0,
+    .goals = path,
+    .speed = 2,                                // units per second
+    .accel = 8,                                // units per second squared, speeding up
+    .decel = 4,                                // and slowing down, to stop exactly on the goal
+});
+```
+
+Both are solved exactly between goal changes, so the value at any time is computed, not stepped,
+and it does not depend on the frame rate. A new goal starts from wherever the last one left the
+motion, at that velocity. A spring is settled once what is left of the move is below 2^-53 of its
+scale, and from then on it returns its goal exactly; a Newtonian move lands exactly when its plan
+ends. Each motion node keeps a cursor after its output in the slab, `weft.motion.cursor_count` f64,
+so forward play costs one closed form per frame; it is a cache that cannot change a value, and a
+cue move makes it stale. `motion.zig` explains the closed forms and the cursor.
+
 ## Regress
 
 `zig build regress` renders `test/catalog.zig` on native and on wasm and compares both with
-`test/golden/signals.txt`, byte for byte. It samples each wave, each noise, and a few whole graphs.
-There is one sample per line, as a hex float, so any changed bit fails and the report names the
-sample:
+`test/golden/signals.txt`, byte for byte. It samples each wave, each noise, and a few whole graphs,
+among them a spring and a Newtonian move. There is one sample per line, as a hex float, so any
+changed bit fails and the report names the sample:
 
 ```txt
 regress: native differs from golden at line 700
