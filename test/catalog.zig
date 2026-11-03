@@ -29,7 +29,13 @@
 //! spring and a Newtonian move, which head for goals at the same cues. One graph has noise, so a
 //! change to how the builder derives a node's seed changes its lines.
 //!
-//! ## 6. TigerStyle Invariants
+//! ## 6. Simulated Graphs
+//! A chase, a follower, a shift register, and a feedback loop through a delay start at the first
+//! cue, so they too have the same bits at every epoch. They come last, so the lines before them
+//! are the lines of step 5. After the start their samples never land on a step, so each also
+//! locks the interpolation between steps, and the follower and the shift register lock the draws.
+//!
+//! ## 7. TigerStyle Invariants
 //! - The text fits in `text_size_max` by construction, so `render` cannot fail.
 
 const std = @import("std");
@@ -76,11 +82,20 @@ const Graph = enum {
     wander,
     spring,
     glide,
+    chase,
+    follow,
+    shift,
+    feedback,
 
     const nodes_count_max = 8;
-    /// Room for the outputs of `nodes_count_max` nodes, and for two motions' cursors.
-    const slab_count_max = nodes_count_max + 2 * weft.motion.cursor_count;
+    /// Room for the outputs of `nodes_count_max` nodes, and for the largest cache: two motions'
+    /// cursors, or a shift register's state.
+    const slab_count_max = nodes_count_max + shift_buckets + 4;
     const cues_count = 3;
+    const shift_buckets = 8;
+
+    /// The regions of the follower, as one span.
+    const regions_count = 2;
 
     /// The goals of the motion graphs, one at each cue, as two paths in one table.
     const goals_count = 6;
@@ -90,7 +105,9 @@ const Graph = enum {
 
 /// The graphs whose bits are the same at every epoch, because they read only differences of cue
 /// times and the time.
-const graphs_epoch_free = [_]Graph{ .sequence, .spring, .glide };
+const graphs_epoch_free = [_]Graph{
+    .sequence, .spring, .glide, .chase, .follow, .shift, .feedback,
+};
 
 const graphs = std.enums.values(Graph);
 
@@ -109,7 +126,8 @@ pub const text_size_max = sample_count * line_size_max;
 comptime {
     assert(wave_sample_count == 1536);
     assert(noise_sample_count == 768);
-    assert(graph_sample_count == 576);
+    assert(graph_sample_count == 960);
+    assert(Graph.slab_count_max >= Graph.nodes_count_max + 2 * weft.motion.cursor_count);
     assert(text_size_max < 1 << 20);
     for (signals) |signal| assert(weft.Rate.from_hz(signal.rate_hz) != null);
 }
@@ -203,6 +221,12 @@ fn render_graph_run(writer: *std.Io.Writer, graph: Graph, epoch: *const Epoch) v
     }) catch unreachable;
     assert(std.meta.eql(spring_goals, Graph.spring_goals));
     assert(std.meta.eql(glide_goals, Graph.glide_goals));
+    var region_entries: [Graph.regions_count]weft.Region = undefined;
+    var regions = weft.Regions.init(&region_entries);
+    _ = regions.add(&.{
+        .{ .low = -1, .high = -0.5 },
+        .{ .low = 0.25, .high = 1 },
+    }) catch unreachable;
 
     var nodes: [Graph.nodes_count_max]weft.Node = undefined;
     var slab: [Graph.slab_count_max]f64 = undefined;
@@ -210,6 +234,8 @@ fn render_graph_run(writer: *std.Io.Writer, graph: Graph, epoch: *const Epoch) v
         .slab_count_max = slab.len,
         .cues = &cues,
         .goals = goals.table(),
+        .regions = regions.table(),
+        .start = cue_ids[0],
         .seed = noise_seed,
     });
     const output = graph_build(graph, &builder) catch unreachable;
@@ -257,33 +283,7 @@ fn graph_build(graph: Graph, builder: *weft.Builder) weft.Builder.Error!weft.Id 
             return builder.add(first, scaled);
         },
         // Three tweens a second each, one on each cue, with an overshoot in the middle.
-        .sequence => {
-            const second: weft.Time = .{ .flicks = weft.time.flicks_per_second };
-            const rise = try builder.tween(.{
-                .from = 0,
-                .to = 1,
-                .duration = second,
-                .ease = .in_out,
-                .start = .{ .index = 0 },
-                .previous = null,
-            });
-            const overshoot = try builder.tween(.{
-                .from = 1,
-                .to = 3,
-                .duration = second,
-                .ease = .{ .x1 = 0.34, .y1 = 1.56, .x2 = 0.64, .y2 = 1 },
-                .start = .{ .index = 1 },
-                .previous = rise,
-            });
-            return builder.tween(.{
-                .from = 3,
-                .to = -0.1,
-                .duration = second,
-                .ease = .out,
-                .start = .{ .index = 2 },
-                .previous = overshoot,
-            });
-        },
+        .sequence => return build_sequence(builder),
         // A slow smooth noise with a quarter of a faster stepped one added, as a hand would drift.
         .wander => {
             const slow = try builder.noise(.{ .shape = .smooth, .hz = 0.7, .seed = 1 });
@@ -307,7 +307,86 @@ fn graph_build(graph: Graph, builder: *weft.Builder) weft.Builder.Error!weft.Id 
             .accel = 6,
             .decel = 4,
         }),
+        // A bouncy spring chasing the sequence of tweens, overshoot and jump included.
+        .chase => {
+            const target = try build_sequence(builder);
+            return builder.chase(.{
+                .target = target,
+                .from = -0.5,
+                .time = .{ .flicks = 4 * @divExact(weft.time.flicks_per_second, 10) },
+                .overshoot = 0.15,
+            });
+        },
+        // A follower on a critical spring, between two regions at random, pausing a little.
+        .follow => return builder.follow(.{
+            .from = 0,
+            .regions = .{ .first = 0, .count = Graph.regions_count },
+            .pick = .random,
+            .mover = .{ .spring = .{
+                .time = .{ .flicks = 3 * @divExact(weft.time.flicks_per_second, 10) },
+                .overshoot = 0,
+            } },
+            .tolerance = 0.02,
+            .pause_min = .{ .flicks = @divExact(weft.time.flicks_per_second, 10) },
+            .pause_max = .{ .flicks = 4 * @divExact(weft.time.flicks_per_second, 10) },
+            .seed = 5,
+        }),
+        // A smooth shift register of eight buckets, a pass every 2 s, half of them changing.
+        .shift => return builder.shift(.{
+            .buckets = Graph.shift_buckets,
+            .period = .{ .flicks = 2 * weft.time.flicks_per_second },
+            .low = -1,
+            .high = 1,
+            .odds = 0.5,
+            .shape = .smooth,
+            .seed = 6,
+        }),
+        // A spring chasing 1 - 0.8 times its own delay, which settles at 1 / 1.8.
+        .feedback => {
+            const echo = try builder.delay(0);
+            const gain = try builder.constant(-0.8);
+            const scaled = try builder.multiply(echo, gain);
+            const one = try builder.constant(1);
+            const target = try builder.add(one, scaled);
+            const result = try builder.chase(.{
+                .target = target,
+                .from = 0,
+                .time = .{ .flicks = @divExact(weft.time.flicks_per_second, 2) },
+                .overshoot = 0.2,
+            });
+            try builder.close(echo, result);
+            return result;
+        },
     }
+}
+
+/// The three tweens of `sequence`, a second each, one on each cue, with an overshoot in the middle.
+fn build_sequence(builder: *weft.Builder) weft.Builder.Error!weft.Id {
+    const second: weft.Time = .{ .flicks = weft.time.flicks_per_second };
+    const rise = try builder.tween(.{
+        .from = 0,
+        .to = 1,
+        .duration = second,
+        .ease = .in_out,
+        .start = .{ .index = 0 },
+        .previous = null,
+    });
+    const overshoot = try builder.tween(.{
+        .from = 1,
+        .to = 3,
+        .duration = second,
+        .ease = .{ .x1 = 0.34, .y1 = 1.56, .x2 = 0.64, .y2 = 1 },
+        .start = .{ .index = 1 },
+        .previous = rise,
+    });
+    return builder.tween(.{
+        .from = 3,
+        .to = -0.1,
+        .duration = second,
+        .ease = .out,
+        .start = .{ .index = 2 },
+        .previous = overshoot,
+    });
 }
 
 pub const Mismatch = struct {
@@ -403,10 +482,10 @@ test "a one-bit change is found and names the signal" {
     try testing.expect(!std.mem.eql(u8, mismatch.expected, mismatch.actual));
 }
 
-// Locks what integer time gives tweens and motions: the cues of `sequence`, `spring`, and `glide`
-// sit at the same place in each epoch, so their samples have the same bits an hour either side of
-// zero and a day on.
-test "tweens and motions have the same bits at every epoch" {
+// Locks what integer time gives tweens, motions, and simulations: the cues of `sequence`,
+// `spring`, `glide`, and the simulated graphs sit at the same place in each epoch, so their samples
+// have the same bits an hour either side of zero and a day on.
+test "tweens, motions, and simulations have the same bits at every epoch" {
     const text = render(&text_a);
     for (graphs_epoch_free) |graph| {
         var buffer_start: [line_size_max]u8 = undefined;
