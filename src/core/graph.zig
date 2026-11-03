@@ -16,7 +16,8 @@
 //!
 //! A motion node also keeps a cursor in the slab, right after its output: `cursor_count` f64 that
 //! cache where it was at the last goal it reached. Section 8 explains why a cache cannot change a
-//! value. It is reader memory like any other, so a copy of the slab still is a checkpoint.
+//! value. A simulated node keeps its state there too, as section 9 explains. It is reader memory
+//! like any other, so a copy of the slab still is a checkpoint.
 //!
 //! ## 3. No Pointers
 //! Nodes refer to each other by `Id`, and neither a node nor the slab holds an address. So both can
@@ -25,7 +26,8 @@
 //!
 //! ## 4. Sorted Means No Cycles
 //! A node can only refer to nodes built before it, which `Builder` enforces. So the array is
-//! already in topological order, eval is one pass over it, and a cycle cannot be expressed.
+//! already in topological order, and eval is one pass over it. The one exception is a delay's
+//! input, which section 10 explains: a cycle can only pass through a delay.
 //!
 //! ## 5. Ids and Names
 //! An `Id` is a node's index, stable for the life of the program. The program stores no names: a
@@ -47,7 +49,8 @@
 //! A graph has one seed, from `Builder.Options`, and a noise node has a `seed` of its own, which is
 //! a stable id the caller chooses and not the node's position. The builder stores the two hashed
 //! together, so the graph's seed gives a new take of every noise at once, and inserting a node
-//! does not reshuffle the others. Two noises with the same `seed` in one graph are one signal.
+//! does not reshuffle the others. Two noises with the same `seed` in one graph are one signal. A
+//! follower and a shift register derive their seeds the same way.
 //!
 //! ## 8. Springs and Newtonian Moves
 //! A motion node heads for goals at cues, from a `Goals` table that the program holds like the
@@ -57,10 +60,35 @@
 //! from the first goal would, so `eval` still depends only on the time, bit for bit. The cursor
 //! records the cue table's generation, and a cue move makes it stale.
 //!
-//! ## 9. TigerStyle Invariants
+//! ## 9. Simulated Nodes
+//! A chase, a follower, a shift register, and a delay have no closed form, so they run on the
+//! fixed step of `simulation.zig`, from the cue `Program.start`. Each keeps its state in the slab
+//! after its output: its values at the step before and the step after the time read, then its own
+//! state. One step is a pass over every node at the step's time, with each simulated node giving
+//! its value there, then an update of each simulated node from that pass. A read at t between
+//! steps k and k + 1 brings the slab to step k + 1, then a pass at t gives each simulated node
+//! `before * (1 - w) + after * w`, where w is how far t is past step k. So a reader at any rate
+//! sees the same value at the same time, and a step only reads inputs at times up to t.
+//!
+//! Reaching a step costs steps, so a reader keeps checkpoints: copies of its slab, one a second,
+//! in memory it gives `State.init_with_checkpoints`. A read restores the nearest checkpoint before
+//! it, or goes on from the slab's own step when that is nearer, and stores each checkpoint it
+//! steps past. The checkpoints are a cache like a motion's cursor: a step is a function of the
+//! step before and its index, so a value never depends on the memory a reader gave or the order
+//! of its reads. A cue move drops them all, since a step can read cue times.
+//!
+//! ## 10. Cycles Through a Delay
+//! Every op but a delay refers only to earlier nodes, so a pass has no cycle. A delay's input can
+//! be any node, set by `close` after it is built, and is read only by the update after a pass,
+//! never during one: a delay gives its input's value from one step before. So every cycle passes
+//! through a delay, and a cycle without one cannot be expressed.
+//!
+//! ## 11. TigerStyle Invariants
 //! - Capacities come from the caller, and the builder refuses what does not fit, by name.
 //! - `eval` allocates nothing, takes no lock, and is one bounded pass over the node array. A motion
-//!   node folds over at most its own goals.
+//!   node folds over at most its own goals. A simulated program first runs at most
+//!   `checkpoint_interval - 1` steps once the checkpoints before the time are filled, and the
+//!   steps since the last one filled otherwise.
 //! - Offsets are consecutive from 0, so the slab has no gaps and no node overlaps another.
 
 const std = @import("std");
@@ -72,6 +100,8 @@ const motion = @import("motion.zig");
 const Goal = motion.Goal;
 const Motion = motion.Motion;
 const Noise = @import("noise.zig").Noise;
+const noise_hash = @import("noise.zig").hash;
+const simulation = @import("simulation.zig");
 const Time = @import("time.zig").Time;
 const Wave = @import("wave.zig").Wave;
 
@@ -133,6 +163,67 @@ pub const Tween = struct {
     }
 };
 
+/// A spring whose goal is a signal, `target`, as a client describes it. Section 9 explains how it
+/// runs: each step it heads for the target's value at that step.
+pub const Chase = struct {
+    target: Id,
+    /// The value at the start, at rest.
+    from: f64,
+    /// The period of the undamped oscillation, above zero, as `motion.Spring.time`.
+    time: Time,
+    /// The peak overshoot of a move from rest, in [0, 1), as `motion.Spring.overshoot`.
+    overshoot: f64,
+};
+
+/// A chase as a graph node holds it.
+pub const ChaseNode = struct {
+    target: Id,
+    from: f64,
+    law: motion.SpringLaw,
+};
+
+/// A goal follower, as a client describes it. `simulation.zig`, section 4, explains it.
+pub const Follow = struct {
+    /// The value at the start, at rest.
+    from: f64,
+    /// The regions its goals are drawn from, in the table given in `Builder.Options`.
+    regions: simulation.Span,
+    pick: simulation.Pick,
+    mover: simulation.Mover,
+    /// Within this of the goal, and at most this fast in units per second, is arrived. At least 0.
+    tolerance: f64,
+    /// The shortest pause after arriving, at least 0. Rounded up to a whole step.
+    pause_min: Time,
+    /// The longest pause, at least `pause_min`. Rounded up to a whole step.
+    pause_max: Time,
+    /// Hashed with the graph's seed, as a noise's seed is.
+    seed: u64,
+};
+
+/// A shift register, as a client describes it. `simulation.zig`, section 5, explains it.
+pub const Shift = struct {
+    /// How many values it holds, from 1 to `simulation.buckets_max`.
+    buckets: u32,
+    /// One pass over every bucket. Above zero, and at least one step per bucket.
+    period: Time,
+    /// Bucket values are drawn between `low` and `high`.
+    low: f64,
+    high: f64,
+    /// The chance, in [0, 1], that a bucket changes once per pass.
+    odds: f64,
+    shape: simulation.ShiftShape,
+    /// Hashed with the graph's seed, as a noise's seed is.
+    seed: u64,
+};
+
+/// A delay as a graph node holds it: its input's values from one step before.
+pub const Delay = struct {
+    /// Null until `Builder.close` gives the delay its input.
+    input: ?Id,
+    /// The value at the start, before a step has passed.
+    initial: f64,
+};
+
 pub const Op = union(enum) {
     constant: f64,
     add: Binary,
@@ -142,15 +233,37 @@ pub const Op = union(enum) {
     tween: Tween,
     noise: Noise,
     motion: Motion,
+    chase: ChaseNode,
+    follow: simulation.Follower,
+    shift: simulation.ShiftRegister,
+    delay: Delay,
 
-    /// The f64 a node of this op keeps in the slab after its output, for a cache.
-    fn cache_count(op: *const Op) u32 {
+    /// The f64 a node of this op keeps in the slab after an output of `output_count` f64, for a
+    /// cache or a simulation's state. Section 9 explains the layout of a simulated node.
+    fn cache_count(op: *const Op, output_count: u64) u64 {
+        assert(output_count > 0);
         return switch (op.*) {
             .motion => motion.cursor_count,
-            else => 0,
+            .chase => 3 * output_count,
+            .delay => 2 * output_count,
+            .follow => 2 * output_count + follower_slots,
+            .shift => |shift| 2 * output_count + 1 + shift.buckets,
+            .constant, .add, .multiply, .map_range, .wave, .tween, .noise => 0,
+        };
+    }
+
+    /// Whether a node of this op runs on the fixed step, as section 9 explains.
+    fn simulated(op: *const Op) bool {
+        return switch (op.*) {
+            .chase, .follow, .shift, .delay => true,
+            .constant, .add, .multiply, .map_range, .wave, .tween, .noise, .motion => false,
         };
     }
 };
+
+/// A follower's own state after its before and after values: velocity, goal, goals drawn, and
+/// steps of pause left.
+const follower_slots = 4;
 
 pub const Node = struct {
     op: Op,
@@ -160,27 +273,40 @@ pub const Node = struct {
 };
 
 comptime {
-    // A tween is the largest op. The array is read in order, so this costs prefetch, not misses.
-    assert(@sizeOf(Node) <= 96);
+    // A follower is the largest op. The array is read in order, so this costs prefetch, not misses.
+    assert(@sizeOf(Node) <= 112);
     assert(@sizeOf(Id) == @sizeOf(u32));
     assert(@alignOf(Node) == @alignOf(f64));
 }
 
-/// An immutable node array, the cue and goal tables it reads, and the size of the slab it needs.
-/// A view of memory that can move.
+/// An immutable node array, the cue, goal, and region tables it reads, and the size of the slab
+/// it needs. A view of memory that can move.
 pub const Program = struct {
     nodes: []const Node,
     cues: *const Cues,
     goals: []const Goal,
+    regions: []const simulation.Region,
+    /// The cue simulated nodes start at, read only when `simulated`.
+    start: Cue,
+    /// Whether any node runs on the fixed step, so a read may cost steps.
+    simulated: bool,
     slab_count: u32,
 
     fn assert_valid(program: Program) void {
-        var offset: u32 = 0;
+        var offset: u64 = 0;
+        var simulated_count: u32 = 0;
         for (program.nodes, 0..) |*node, index| {
             assert(node.offset == offset);
-            offset += node.extent.count() + node.op.cache_count();
+            offset += node.extent.count() + node.op.cache_count(node.extent.count());
+            if (node.op.simulated()) simulated_count += 1;
             switch (node.op) {
-                .constant, .wave, .noise => {},
+                .constant, .wave, .noise, .shift => {},
+                .chase => |op| assert(op.target.index < index),
+                .delay => |op| if (op.input) |input| assert(input.index < program.nodes.len),
+                .follow => |op| {
+                    assert(op.regions.count > 0);
+                    assert(op.regions.first + op.regions.count <= program.regions.len);
+                },
                 .add, .multiply => |op| {
                     assert(op.left.index < index);
                     assert(op.right.index < index);
@@ -199,6 +325,8 @@ pub const Program = struct {
             }
         }
         assert(offset == program.slab_count);
+        assert(program.simulated == (simulated_count > 0));
+        if (program.simulated) assert(program.start.index < program.cues.count);
     }
 };
 
@@ -210,9 +338,15 @@ pub const Builder = struct {
     slab_count_max: u32,
     cues: *const Cues,
     goals: []const Goal,
+    regions: []const simulation.Region,
+    start: Cue,
     seed: u64,
     /// The extent of every node built, 1 by 1 until a later step gives each node its own.
     extent: Extent,
+    /// Whether a simulated node has been built.
+    simulated: bool,
+    /// Delays built and not yet closed, which `finish` requires to be none.
+    delays_open: u32,
     finished: bool,
 
     pub const Error = error{
@@ -226,9 +360,12 @@ pub const Builder = struct {
         NotFinite,
         /// A map whose input range has no width, or one too wide for a double.
         InvalidRange,
-        /// A cue that the table given in `Options` does not have.
+        /// A cue that the table given in `Options` does not have, including the start cue of a
+        /// simulated node.
         UnknownCue,
-        /// A tween whose duration is not above zero.
+        /// A tween or a spring time that is not above zero, or a shift register period that is not
+        /// above zero, is longer than `simulation.period_flicks_max`, or gives a bucket less than
+        /// one step.
         InvalidDuration,
         /// A tween whose ease fails `Ease.valid`.
         InvalidEase,
@@ -240,6 +377,21 @@ pub const Builder = struct {
         InvalidOvershoot,
         /// A Newtonian move whose speed, accel, or decel is not above zero.
         InvalidLimit,
+        /// A span that the region table given in `Options` does not hold.
+        UnknownRegions,
+        /// A follower whose tolerance is below zero.
+        InvalidTolerance,
+        /// A follower whose shortest pause is below zero or above its longest, or whose longest
+        /// is above `simulation.pause_steps_max` steps.
+        InvalidPause,
+        /// A shift register whose odds are not in [0, 1].
+        InvalidOdds,
+        /// A shift register with no buckets, or more than `simulation.buckets_max`.
+        InvalidBuckets,
+        /// A `close` of a node that is not a delay.
+        NotADelay,
+        /// A `close` of a delay that already has its input.
+        DelayClosed,
     };
 
     pub const Options = struct {
@@ -249,7 +401,12 @@ pub const Builder = struct {
         cues: *const Cues = &Cues.empty,
         /// The goals that motions head for, from `Goals.table`.
         goals: []const Goal = &.{},
-        /// Hashed into the seed of every noise, as section 7 explains.
+        /// The regions that followers draw goals from, from `Regions.table`.
+        regions: []const simulation.Region = &.{},
+        /// The cue every simulated node starts at, as section 9 explains.
+        start: Cue = .{ .index = 0 },
+        /// Hashed into the seed of every noise, follower, and shift register, as section 7
+        /// explains.
         seed: u64 = 0,
     };
 
@@ -262,8 +419,12 @@ pub const Builder = struct {
             .slab_count_max = options.slab_count_max,
             .cues = options.cues,
             .goals = options.goals,
+            .regions = options.regions,
+            .start = options.start,
             .seed = options.seed,
             .extent = .{ .lanes = 1, .components = 1 },
+            .simulated = false,
+            .delays_open = 0,
             .finished = false,
         };
     }
@@ -321,33 +482,121 @@ pub const Builder = struct {
     /// A spring toward the goals of `source.goals`, as `motion.zig` explains.
     pub fn spring(builder: *Builder, source: motion.Spring) Error!Id {
         try builder.check_goals(source.goals, source.from);
-        if (source.time.flicks <= 0) return error.InvalidDuration;
-        if (std.math.isNan(source.overshoot)) return error.NotFinite;
-        if (!(source.overshoot >= 0 and source.overshoot < 1)) return error.InvalidOvershoot;
+        const law = try spring_law(source.time, source.overshoot);
         return builder.push(.{ .motion = .{
             .from = source.from,
             .goals = source.goals,
-            .law = .{ .spring = motion.SpringLaw.of(source.time, source.overshoot) },
+            .law = .{ .spring = law },
         } });
     }
 
     /// A Newtonian move toward the goals of `source.goals`, as `motion.zig` explains.
     pub fn newtonian(builder: *Builder, source: motion.Newtonian) Error!Id {
         try builder.check_goals(source.goals, source.from);
-        const limits = [_]f64{ source.speed, source.accel, source.decel };
-        for (limits) |limit| {
-            if (!std.math.isFinite(limit)) return error.NotFinite;
-            if (limit <= 0) return error.InvalidLimit;
-        }
+        const limits = try newtonian_limits(source.speed, source.accel, source.decel);
         return builder.push(.{ .motion = .{
             .from = source.from,
             .goals = source.goals,
-            .law = .{ .newtonian = .{
-                .speed = source.speed,
-                .accel = source.accel,
-                .decel = source.decel,
-            } },
+            .law = .{ .newtonian = limits },
         } });
+    }
+
+    /// A spring chasing the signal `source.target`, as section 9 explains.
+    pub fn chase(builder: *Builder, source: Chase) Error!Id {
+        try builder.check_known(source.target);
+        try builder.check_start();
+        if (!std.math.isFinite(source.from)) return error.NotFinite;
+        const law = try spring_law(source.time, source.overshoot);
+        return builder.push(.{ .chase = .{
+            .target = source.target,
+            .from = source.from,
+            .law = law,
+        } });
+    }
+
+    /// A goal follower, as `simulation.zig` explains, whose seed is `source.seed` hashed with the
+    /// graph's seed.
+    pub fn follow(builder: *Builder, source: Follow) Error!Id {
+        try builder.check_start();
+        if (!std.math.isFinite(source.from)) return error.NotFinite;
+        const span = source.regions;
+        if (span.count == 0) return error.UnknownRegions;
+        if (span.first > builder.regions.len) return error.UnknownRegions;
+        if (span.count > builder.regions.len - span.first) return error.UnknownRegions;
+        const law: motion.Law = switch (source.mover) {
+            .spring => |mover| .{ .spring = try spring_law(mover.time, mover.overshoot) },
+            .newtonian => |mover| .{
+                .newtonian = try newtonian_limits(mover.speed, mover.accel, mover.decel),
+            },
+        };
+        if (!std.math.isFinite(source.tolerance)) return error.NotFinite;
+        if (source.tolerance < 0) return error.InvalidTolerance;
+        if (source.pause_min.flicks < 0) return error.InvalidPause;
+        if (source.pause_max.flicks < source.pause_min.flicks) return error.InvalidPause;
+        const pause_max_steps = steps_rounded_up(source.pause_max);
+        if (pause_max_steps > simulation.pause_steps_max) return error.InvalidPause;
+        return builder.push(.{ .follow = .{
+            .from = source.from,
+            .tolerance = source.tolerance,
+            .seed = noise_hash(builder.seed, source.seed),
+            .law = law,
+            .regions = span,
+            .pause_min_steps = @intCast(steps_rounded_up(source.pause_min)),
+            .pause_max_steps = @intCast(pause_max_steps),
+            .pick = source.pick,
+        } });
+    }
+
+    /// A shift register, as `simulation.zig` explains, whose seed is `source.seed` hashed with
+    /// the graph's seed.
+    pub fn shift(builder: *Builder, source: Shift) Error!Id {
+        try builder.check_start();
+        if (source.buckets == 0) return error.InvalidBuckets;
+        if (source.buckets > simulation.buckets_max) return error.InvalidBuckets;
+        if (!std.math.isFinite(source.low)) return error.NotFinite;
+        if (!std.math.isFinite(source.high)) return error.NotFinite;
+        if (std.math.isNan(source.odds)) return error.NotFinite;
+        if (!(source.odds >= 0 and source.odds <= 1)) return error.InvalidOdds;
+        if (source.period.flicks <= 0) return error.InvalidDuration;
+        const period_flicks: u64 = @intCast(source.period.flicks);
+        if (period_flicks > simulation.period_flicks_max) return error.InvalidDuration;
+        if (period_flicks < source.buckets * step_flicks) return error.InvalidDuration;
+        return builder.push(.{ .shift = .{
+            .low = source.low,
+            .high = source.high,
+            .odds = source.odds,
+            .seed = noise_hash(builder.seed, source.seed),
+            .period_flicks = period_flicks,
+            .buckets = source.buckets,
+            .shape = source.shape,
+        } });
+    }
+
+    /// A delay, open until `close` gives it its input, as section 10 explains.
+    pub fn delay(builder: *Builder, initial: f64) Error!Id {
+        try builder.check_start();
+        if (!std.math.isFinite(initial)) return error.NotFinite;
+        const id = try builder.push(.{ .delay = .{ .input = null, .initial = initial } });
+        builder.delays_open += 1;
+        return id;
+    }
+
+    /// Gives the delay `delay_id` its input, which can be any node built so far, before or after
+    /// the delay, itself included.
+    pub fn close(builder: *Builder, delay_id: Id, input: Id) Error!void {
+        assert(!builder.finished);
+        try builder.check_known(delay_id);
+        try builder.check_known(input);
+        const node = &builder.nodes[delay_id.index];
+        switch (node.op) {
+            .delay => |*op| {
+                if (op.input != null) return error.DelayClosed;
+                assert(builder.delays_open > 0);
+                op.input = input;
+                builder.delays_open -= 1;
+            },
+            else => return error.NotADelay,
+        }
     }
 
     fn check_goals(builder: *const Builder, path: motion.Path, from: f64) Error!void {
@@ -360,15 +609,24 @@ pub const Builder = struct {
         }
     }
 
-    /// The program built so far. Nothing can be added after this.
+    fn check_start(builder: *const Builder) Error!void {
+        assert(builder.cues.count <= builder.cues.times.len);
+        if (builder.start.index >= builder.cues.count) return error.UnknownCue;
+    }
+
+    /// The program built so far. Nothing can be added after this, and every delay must be closed.
     pub fn finish(builder: *Builder) Program {
         assert(!builder.finished);
         assert(builder.slab_count <= builder.slab_count_max);
+        assert(builder.delays_open == 0);
         builder.finished = true;
         const program: Program = .{
             .nodes = builder.nodes[0..builder.node_count],
             .cues = builder.cues,
             .goals = builder.goals,
+            .regions = builder.regions,
+            .start = builder.start,
+            .simulated = builder.simulated,
             .slab_count = builder.slab_count,
         };
         program.assert_valid();
@@ -384,8 +642,8 @@ pub const Builder = struct {
         assert(!builder.finished);
         assert(builder.slab_count <= builder.slab_count_max);
         if (builder.node_count == builder.nodes.len) return error.NodeCapacityExceeded;
-        const count = @as(u64, builder.extent.lanes) * builder.extent.components +
-            op.cache_count();
+        const output_count = @as(u64, builder.extent.lanes) * builder.extent.components;
+        const count = output_count + op.cache_count(output_count);
         assert(count > 0);
         if (builder.slab_count + count > builder.slab_count_max) {
             return error.SlabCapacityExceeded;
@@ -398,30 +656,88 @@ pub const Builder = struct {
         };
         builder.node_count += 1;
         builder.slab_count += @intCast(count);
+        if (op.simulated()) builder.simulated = true;
         return id;
     }
 };
 
-/// One reader's values, in a slab the reader owns.
+/// The law of a spring with this `time` and `overshoot`, or the refusal of either.
+fn spring_law(time: Time, overshoot: f64) Builder.Error!motion.SpringLaw {
+    if (time.flicks <= 0) return error.InvalidDuration;
+    if (std.math.isNan(overshoot)) return error.NotFinite;
+    if (!(overshoot >= 0 and overshoot < 1)) return error.InvalidOvershoot;
+    return motion.SpringLaw.of(time, overshoot);
+}
+
+/// The limits of a Newtonian move, or the refusal of one of them.
+fn newtonian_limits(speed: f64, accel: f64, decel: f64) Builder.Error!motion.Limits {
+    for ([_]f64{ speed, accel, decel }) |limit| {
+        if (!std.math.isFinite(limit)) return error.NotFinite;
+        if (limit <= 0) return error.InvalidLimit;
+    }
+    return .{ .speed = speed, .accel = accel, .decel = decel };
+}
+
+/// The whole steps that `duration`, at least zero, lasts, rounded up.
+fn steps_rounded_up(duration: Time) u64 {
+    assert(duration.flicks >= 0);
+    const flicks: u64 = @intCast(duration.flicks);
+    return std.math.divCeil(u64, flicks, step_flicks) catch unreachable;
+}
+
+/// One reader's values, in a slab the reader owns, and its checkpoints of a simulation.
 pub const State = struct {
     program: Program,
     slab: []f64,
     evaluated: bool,
+    /// Copies of the slab at every `checkpoint_interval` steps, from the first interval on.
+    checkpoints: []f64,
+    /// How many of `checkpoints` hold a copy, always the first ones.
+    checkpoints_filled: u32,
+    /// The step the slab's simulated state is at, or null if it holds none.
+    step: ?u64,
+    /// The cue generation the simulated state and the checkpoints were worked out under.
+    generation: u64,
+    /// Steps run since `init`, for measuring what reads cost.
+    steps_run: u64,
 
-    /// `slab` needs at least `program.slab_count` values, and only those are used.
+    /// `slab` needs at least `program.slab_count` values, and only those are used. A simulated
+    /// program has no checkpoints this way, so each read before the slab's own step runs every
+    /// step from the start.
     pub fn init(program: Program, slab: []f64) State {
+        return init_with_checkpoints(program, slab, &.{});
+    }
+
+    /// As `init`, with room for `checkpoints.len / program.slab_count` checkpoints, which each
+    /// cover a second of a simulated program, as section 9 explains.
+    pub fn init_with_checkpoints(program: Program, slab: []f64, checkpoints: []f64) State {
         assert(slab.len >= program.slab_count);
         program.assert_valid();
         const slab_used = slab[0..program.slab_count];
         @memset(slab_used, 0);
-        return .{ .program = program, .slab = slab_used, .evaluated = false };
+        var room: usize = 0;
+        if (program.simulated) {
+            room = @min(checkpoints.len / program.slab_count, std.math.maxInt(u32));
+        }
+        return .{
+            .program = program,
+            .slab = slab_used,
+            .evaluated = false,
+            .checkpoints = checkpoints[0 .. room * program.slab_count],
+            .checkpoints_filled = 0,
+            .step = null,
+            .generation = program.cues.generation,
+            .steps_run = 0,
+        };
     }
 
-    /// Fills the slab with every node's value at `time`. Nothing carries over from an earlier
-    /// call, so a reader can ask for any time in any order.
+    /// Fills the slab with every node's value at `time`. A reader can ask for any time in any
+    /// order: what carries over from an earlier call is a cache that cannot change a value.
     pub fn eval(state: *State, time: Time) void {
         assert(state.slab.len == state.program.slab_count);
-        for (state.program.nodes) |*node| eval_node(&state.program, state.slab, node, time);
+        var weight: f64 = 0;
+        if (state.program.simulated) weight = state.simulate_to(time);
+        pass(&state.program, state.slab, time, .{ .between = weight });
         state.evaluated = true;
     }
 
@@ -438,6 +754,96 @@ pub const State = struct {
         assert(id.index < state.program.nodes.len);
         return node_values(state.program.nodes, state.slab, id);
     }
+
+    /// How many checkpoints the state has room for.
+    pub fn checkpoints_count(state: *const State) u32 {
+        if (state.checkpoints.len == 0) return 0;
+        return @intCast(state.checkpoints.len / state.program.slab_count);
+    }
+
+    /// Brings the simulated state to the step after `time`, and returns how far `time` is past
+    /// the step before it, as a fraction of a step. Section 9 explains.
+    fn simulate_to(state: *State, time: Time) f64 {
+        assert(state.program.simulated);
+        const cues = state.program.cues;
+        if (cues.generation != state.generation) {
+            state.generation = cues.generation;
+            state.checkpoints_filled = 0;
+            state.step = null;
+        }
+        const start = cues.at(state.program.start);
+        var target: u64 = 0;
+        var weight: f64 = 0;
+        if (time.flicks >= start.flicks) {
+            // Wrapping, because the distance between two i64 only fits in a u64.
+            const elapsed: u64 = @bitCast(time.flicks -% start.flicks);
+            target = elapsed / step_flicks + 1;
+            weight = @as(f64, @floatFromInt(elapsed % step_flicks)) / step_flicks_float;
+        }
+        state.run_to(target, start);
+        assert(state.step.? == target);
+        assert(weight >= 0);
+        assert(weight < 1);
+        return weight;
+    }
+
+    /// Brings the simulated state to step `target`, from the nearest of the slab's own step and
+    /// the checkpoints before `target`.
+    fn run_to(state: *State, target: u64, start: Time) void {
+        const interval = simulation.checkpoint_interval;
+        const nearest = @min(target / interval, state.checkpoints_filled);
+        const live_usable = if (state.step) |live|
+            live >= nearest * interval and live <= target
+        else
+            false;
+        if (!live_usable) state.restore(nearest);
+        var live = state.step.?;
+        assert(live <= target);
+        while (live < target) {
+            step_once(&state.program, state.slab, start, live);
+            live += 1;
+            state.steps_run += 1;
+            if (live % interval == 0) state.store(live / interval);
+        }
+        state.step = live;
+    }
+
+    /// Copies the slab into checkpoint `index`, at step `index * checkpoint_interval`, if it is
+    /// the next one to fill and there is room.
+    fn store(state: *State, index: u64) void {
+        assert(index > 0);
+        assert(state.checkpoints_filled <= state.checkpoints_count());
+        if (index != @as(u64, state.checkpoints_filled) + 1) return;
+        if (index > state.checkpoints_count()) return;
+        const size = state.slab.len;
+        const first: usize = @intCast((index - 1) * size);
+        @memcpy(state.checkpoints[first..][0..size], state.slab);
+        state.checkpoints_filled += 1;
+    }
+
+    /// Puts the slab at checkpoint `index`, where checkpoint 0 is the start, rebuilt.
+    fn restore(state: *State, index: u64) void {
+        assert(index <= state.checkpoints_filled);
+        if (index == 0) {
+            for (state.program.nodes) |*node| reset_node(&state.program, state.slab, node);
+        } else {
+            const size = state.slab.len;
+            const first: usize = @intCast((index - 1) * size);
+            @memcpy(state.slab, state.checkpoints[first..][0..size]);
+        }
+        state.step = index * simulation.checkpoint_interval;
+    }
+};
+
+const step_flicks: u64 = @intCast(simulation.step.flicks);
+const step_flicks_float: f64 = @floatFromInt(simulation.step.flicks);
+
+/// How a pass gives a simulated node's value.
+const Sampling = union(enum) {
+    /// At a step: the value the slab's state holds.
+    at_step,
+    /// This fraction of a step past the step before, interpolated.
+    between: f64,
 };
 
 fn node_values(nodes: []const Node, slab: []const f64, id: Id) []const f64 {
@@ -445,7 +851,19 @@ fn node_values(nodes: []const Node, slab: []const f64, id: Id) []const f64 {
     return slab[node.offset..][0..node.extent.count()];
 }
 
-fn eval_node(program: *const Program, slab: []f64, node: *const Node, time: Time) void {
+/// Evaluates every node at `time`, in order.
+fn pass(program: *const Program, slab: []f64, time: Time, sampling: Sampling) void {
+    assert(slab.len == program.slab_count);
+    for (program.nodes) |*node| eval_node(program, slab, node, time, sampling);
+}
+
+fn eval_node(
+    program: *const Program,
+    slab: []f64,
+    node: *const Node,
+    time: Time,
+    sampling: Sampling,
+) void {
     const nodes = program.nodes;
     const output_count = node.extent.count();
     const out = slab[node.offset..][0..output_count];
@@ -476,7 +894,132 @@ fn eval_node(program: *const Program, slab: []f64, node: *const Node, time: Time
                 @memset(out, tween.from);
             }
         },
+        .chase, .follow, .shift, .delay => {
+            const cache = slab[node.offset + output_count ..][0 .. 2 * output_count];
+            sample_into(out, cache[0..output_count], cache[output_count..], sampling);
+        },
     }
+}
+
+/// A simulated node's output from its values at the steps `before` and `after` the time.
+fn sample_into(out: []f64, before: []const f64, after: []const f64, sampling: Sampling) void {
+    assert(before.len == out.len);
+    assert(after.len == out.len);
+    switch (sampling) {
+        .at_step => @memcpy(out, after),
+        .between => |weight| {
+            assert(weight >= 0);
+            assert(weight < 1);
+            for (out, before, after) |*value, a, b| value.* = a * (1 - weight) + b * weight;
+        },
+    }
+}
+
+/// Runs the step from step `index` to the next: a pass at its time, then an update of every
+/// simulated node from that pass, as section 9 explains.
+fn step_once(program: *const Program, slab: []f64, start: Time, index: u64) void {
+    // Wrapping, because the step's time fits an i64 even where its distance from start does not.
+    const offset: i64 = @bitCast(index * step_flicks);
+    const time: Time = .{ .flicks = start.flicks +% offset };
+    assert(time.flicks >= start.flicks or offset < 0);
+    pass(program, slab, time, .at_step);
+    for (program.nodes) |*node| {
+        if (node.op.simulated()) update_node(program, slab, node, index + 1);
+    }
+}
+
+/// Moves a simulated node's state to step `index`, from the pass at the step before.
+fn update_node(program: *const Program, slab: []f64, node: *const Node, index: u64) void {
+    assert(index > 0);
+    const output_count = node.extent.count();
+    const cache_count: u32 = @intCast(node.op.cache_count(output_count));
+    const cache = slab[node.offset + output_count ..][0..cache_count];
+    const before = cache[0..output_count];
+    const after = cache[output_count..][0..output_count];
+    const own = cache[2 * output_count ..];
+    @memcpy(before, after);
+    switch (node.op) {
+        .chase => |*op| {
+            const target = node_values(program.nodes, slab, op.target);
+            assert(target.len == output_count);
+            const velocities = own[0..output_count];
+            const law: motion.Law = .{ .spring = op.law };
+            for (after, velocities, target) |*position, *velocity, goal| {
+                const now: motion.Kinematics = .{ .position = position.*, .velocity = velocity.* };
+                const next = motion.advance(law, now, goal, simulation.step_seconds);
+                position.* = next.position;
+                velocity.* = next.velocity;
+            }
+        },
+        .delay => |op| if (op.input) |input| {
+            const values = node_values(program.nodes, slab, input);
+            assert(values.len == output_count);
+            @memcpy(after, values);
+        },
+        .follow => |*op| {
+            const state = follower_unpack(after[0], own);
+            const next = simulation.follower_step(op, program.regions, state);
+            follower_pack(next, after, own);
+        },
+        .shift => |*op| {
+            const bucket: u64 = @intFromFloat(own[0]);
+            const next = simulation.shift_step(op, own[1..], bucket, index);
+            own[0] = @floatFromInt(next.bucket);
+            @memset(after, next.value);
+        },
+        .constant, .add, .multiply, .map_range, .wave, .tween, .noise, .motion => unreachable,
+    }
+    for (after) |value| assert(std.math.isFinite(value));
+}
+
+/// Puts a node's simulated state at the start, step 0, as section 9 explains. Other nodes keep
+/// nothing to reset.
+fn reset_node(program: *const Program, slab: []f64, node: *const Node) void {
+    if (!node.op.simulated()) return;
+    const output_count = node.extent.count();
+    const cache_count: u32 = @intCast(node.op.cache_count(output_count));
+    const cache = slab[node.offset + output_count ..][0..cache_count];
+    const before = cache[0..output_count];
+    const after = cache[output_count..][0..output_count];
+    const own = cache[2 * output_count ..];
+    switch (node.op) {
+        .chase => |op| {
+            @memset(after, op.from);
+            @memset(own, 0);
+        },
+        .delay => |op| @memset(after, op.initial),
+        .follow => |*op| follower_pack(simulation.follower_start(op, program.regions), after, own),
+        .shift => |*op| {
+            simulation.shift_fill(op, own[1..]);
+            own[0] = 0;
+            const position = simulation.shift_position(op, 0);
+            @memset(after, simulation.shift_value(op, own[1..], position));
+        },
+        .constant, .add, .multiply, .map_range, .wave, .tween, .noise, .motion => unreachable,
+    }
+    @memcpy(before, after);
+}
+
+/// A follower's state from its slab: its position is its value after the step.
+fn follower_unpack(position: f64, own: []const f64) simulation.FollowerState {
+    assert(own.len == follower_slots);
+    return .{
+        .kinematics = .{ .position = position, .velocity = own[0] },
+        .goal = own[1],
+        .drawn = @intFromFloat(own[2]),
+        .pause_left = @intFromFloat(own[3]),
+    };
+}
+
+fn follower_pack(state: simulation.FollowerState, after: []f64, own: []f64) void {
+    assert(own.len == follower_slots);
+    // Counters below 2^53, which section 6 of `simulation.zig` promises, are exact in an f64.
+    assert(state.drawn < 1 << 53);
+    @memset(after, state.kinematics.position);
+    own[0] = state.kinematics.velocity;
+    own[1] = state.goal;
+    own[2] = @floatFromInt(state.drawn);
+    own[3] = @floatFromInt(state.pause_left);
 }
 
 fn add_into(out: []f64, left: []const f64, right: []const f64) void {
@@ -701,12 +1244,20 @@ test "moving the memory changes nothing" {
         .nodes = &nodes_moved,
         .cues = &Cues.empty,
         .goals = &.{},
+        .regions = &.{},
+        .start = .{ .index = 0 },
+        .simulated = false,
         .slab_count = program.slab_count,
     };
     var state_checkpoint: State = .{
         .program = program_moved,
         .slab = &slab_moved,
         .evaluated = true,
+        .checkpoints = &.{},
+        .checkpoints_filled = 0,
+        .step = null,
+        .generation = 0,
+        .steps_run = 0,
     };
     try testing.expectEqual(expected, state_checkpoint.value(output));
 
@@ -1229,6 +1780,9 @@ test "a motion's cursor never changes a value" {
         .nodes = &nodes,
         .cues = &track.cues,
         .goals = track.goals.table(),
+        .regions = &.{},
+        .start = .{ .index = 0 },
+        .simulated = false,
         .slab_count = 2 * (1 + motion.cursor_count),
     };
     const rate = Rate.from_hz(240).?;
@@ -1273,6 +1827,9 @@ test "springs ignore the frame rate" {
         .nodes = &nodes,
         .cues = &track.cues,
         .goals = track.goals.table(),
+        .regions = &.{},
+        .start = .{ .index = 0 },
+        .simulated = false,
         .slab_count = 2 * (1 + motion.cursor_count),
     };
     const rates_hz = [_]u32{ 24, 60, 240, 960 };
@@ -1302,6 +1859,9 @@ test "moving a cue reaches a motion's cursor" {
         .nodes = &nodes,
         .cues = &track.cues,
         .goals = track.goals.table(),
+        .regions = &.{},
+        .start = .{ .index = 0 },
+        .simulated = false,
         .slab_count = 2 * (1 + motion.cursor_count),
     };
     var slab: [10]f64 = undefined;
@@ -1416,4 +1976,548 @@ test "the builder refuses a motion it cannot evaluate" {
     _ = try builder.newtonian(newtonian);
     spring.overshoot = 0.999;
     _ = try builder.spring(spring);
+}
+
+const flicks_per_second = @import("time.zig").flicks_per_second;
+
+/// A start cue half a step after 0.5 s, so a reader at a rate that divides 480 Hz lands halfway
+/// between steps or on one, and a cue at 2 s. Two regions, and a graph of every simulated node: a
+/// chase of a tween that rises at the second cue, a follower, a shift register, and a chase of
+/// 1 - 0.8 times its own delay.
+const Scene = struct {
+    times: [2]Time,
+    cues: Cues,
+    region_entries: [2]simulation.Region,
+    regions: simulation.Regions,
+    nodes: [10]Node,
+    outputs: [4]Id,
+    program: Program,
+
+    const slab_count = 35;
+
+    fn init(scene: *Scene) !void {
+        scene.cues = Cues.init(&scene.times);
+        const start = try scene.cues.add(.{
+            .flicks = flicks_per_second / 2 + simulation.step.flicks / 2,
+        });
+        const rise = try scene.cues.add(.{ .flicks = 2 * flicks_per_second });
+        scene.regions = simulation.Regions.init(&scene.region_entries);
+        const span = try scene.regions.add(&.{
+            .{ .low = -1, .high = -0.5 },
+            .{ .low = 0.5, .high = 1 },
+        });
+        var builder = Builder.init(&scene.nodes, .{
+            .slab_count_max = slab_count,
+            .cues = &scene.cues,
+            .regions = scene.regions.table(),
+            .start = start,
+            .seed = 21,
+        });
+        const target = try builder.tween(tween_of(0, 1, rise, .in_out));
+        scene.outputs[0] = try builder.chase(.{
+            .target = target,
+            .from = 0.5,
+            .time = .{ .flicks = flicks_per_second * 2 / 5 },
+            .overshoot = 0.1,
+        });
+        scene.outputs[1] = try builder.follow(.{
+            .from = 0,
+            .regions = span,
+            .pick = .random,
+            .mover = .{ .spring = .{
+                .time = .{ .flicks = flicks_per_second / 4 },
+                .overshoot = 0,
+            } },
+            .tolerance = 0.01,
+            .pause_min = .{ .flicks = flicks_per_second / 10 },
+            .pause_max = .{ .flicks = flicks_per_second * 3 / 10 },
+            .seed = 3,
+        });
+        scene.outputs[2] = try builder.shift(.{
+            .buckets = 8,
+            .period = .{ .flicks = 2 * flicks_per_second },
+            .low = -1,
+            .high = 1,
+            .odds = 0.5,
+            .shape = .smooth,
+            .seed = 4,
+        });
+        scene.outputs[3] = try build_feedback(&builder);
+        scene.program = builder.finish();
+        assert(scene.program.slab_count == slab_count);
+    }
+
+    /// Moves both cues by `shift`, the one ahead first, so neither passes the other.
+    fn shift_cues(scene: *Scene, shift: i64) !void {
+        const order = if (shift > 0) [2]u32{ 1, 0 } else [2]u32{ 0, 1 };
+        for (order) |index| {
+            const cue: Cue = .{ .index = index };
+            try scene.cues.move(cue, .{ .flicks = scene.cues.at(cue).flicks + shift });
+        }
+    }
+
+    fn read(scene: *const Scene, state: *State, time: Time) [4]f64 {
+        assert(state.program.nodes.ptr == scene.program.nodes.ptr);
+        state.eval(time);
+        var result: [4]f64 = undefined;
+        for (&result, scene.outputs) |*value, id| value.* = state.value(id);
+        return result;
+    }
+};
+
+/// A chase of 1 - 0.8 times its own delay, which settles where x = 1 - 0.8 x, at 1 / 1.8.
+fn build_feedback(builder: *Builder) Builder.Error!Id {
+    const echo = try builder.delay(0);
+    const gain = try builder.constant(-0.8);
+    const scaled = try builder.multiply(echo, gain);
+    const one = try builder.constant(1);
+    const target = try builder.add(one, scaled);
+    const result = try builder.chase(.{
+        .target = target,
+        .from = 0,
+        .time = .{ .flicks = flicks_per_second / 2 },
+        .overshoot = 0.2,
+    });
+    try builder.close(echo, result);
+    return result;
+}
+
+// Locks the page's first check: 10 s of every simulated node at 60 Hz, read forwards, backwards,
+// in a scattered order with and without checkpoints, and from fresh readers, give the same bits.
+// The feedback chase settles on 1 / 1.8 within 1e-9 by 10 s.
+test "forward play and any seek give the same values" {
+    var scene: Scene = undefined;
+    try scene.init();
+    const rate = Rate.from_hz(60).?;
+    const frames_count = 600;
+    var slab: [Scene.slab_count]f64 = undefined;
+    var checkpoints: [12 * Scene.slab_count]f64 = undefined;
+    var state = State.init_with_checkpoints(scene.program, &slab, &checkpoints);
+    var forward: [frames_count][4]f64 = undefined;
+    for (&forward, 0..) |*values, frame| {
+        values.* = scene.read(&state, Time.from_ticks(@intCast(frame), rate).?);
+    }
+    try testing.expectEqual(@as(u32, 9), state.checkpoints_filled);
+
+    var frame: usize = frames_count;
+    while (frame > 0) {
+        frame -= 1;
+        const values = scene.read(&state, Time.from_ticks(@intCast(frame), rate).?);
+        try testing.expectEqual(forward[frame], values);
+    }
+    var slab_plain: [Scene.slab_count]f64 = undefined;
+    var plain = State.init(scene.program, &slab_plain);
+    var hop: usize = 0;
+    for (0..frames_count) |index| {
+        hop = (hop + 389) % frames_count;
+        const time = Time.from_ticks(@intCast(hop), rate).?;
+        try testing.expectEqual(forward[hop], scene.read(&state, time));
+        if (index % 5 != 0) continue;
+        try testing.expectEqual(forward[hop], scene.read(&plain, time));
+        var slab_fresh: [Scene.slab_count]f64 = undefined;
+        var fresh = State.init(scene.program, &slab_fresh);
+        try testing.expectEqual(forward[hop], scene.read(&fresh, time));
+    }
+    try testing.expectApproxEqAbs(@as(f64, 1.0 / 1.8), forward[frames_count - 1][3], 1e-9);
+}
+
+// Locks the page's second check: readers at 24, 60, 240, and 960 Hz through 5 s give the same
+// bits at every instant they share, every 1/12 s, each halfway between two steps. Readers at 25,
+// 144, and 44,100 Hz, which 480 does not divide, give the same bits at each whole second.
+test "simulated signals ignore the reader's rate" {
+    var scene: Scene = undefined;
+    try scene.init();
+    const rates_hz = [_]u32{ 24, 60, 240, 960 };
+    var shared: [rates_hz.len][61][4]f64 = undefined;
+    for (rates_hz, &shared) |hz, *values| read_shared(&scene, hz, 12, values);
+    for (shared[1..]) |values| try testing.expectEqual(shared[0], values);
+
+    const rates_odd_hz = [_]u32{ 25, 144, 44_100, 960 };
+    var seconds: [rates_odd_hz.len][6][4]f64 = undefined;
+    for (rates_odd_hz, &seconds) |hz, *values| read_shared(&scene, hz, 1, values);
+    for (seconds[1..]) |values| try testing.expectEqual(seconds[0], values);
+}
+
+/// Plays `scene` from time zero at `hz`, keeping the values at each of `values.len` instants
+/// `shared_hz` apart.
+fn read_shared(scene: *const Scene, hz: u32, shared_hz: u32, values: [][4]f64) void {
+    assert(hz % shared_hz == 0);
+    var slab: [Scene.slab_count]f64 = undefined;
+    var state = State.init(scene.program, &slab);
+    const per_shared = hz / shared_hz;
+    for (0..values.len * per_shared - per_shared + 1) |frame| {
+        const read = scene.read(&state, Time.from_ticks(@intCast(frame), Rate.from_hz(hz).?).?);
+        if (frame % per_shared == 0) values[frame / per_shared] = read;
+    }
+}
+
+// Locks the bound of section 11 for the page's third check. Without checkpoints, a read at 10 s
+// runs all 4,800 steps, and a read back at 9.99 s runs them again. With room for ten, one read at
+// 10.5 s fills them all, and from then on no read anywhere in 10.5 s runs more than 479 steps.
+test "after a pre-roll no seek runs more than one interval of steps" {
+    var scene: Scene = undefined;
+    try scene.init();
+    const start = scene.cues.at(scene.program.start).flicks;
+    var slab_plain: [Scene.slab_count]f64 = undefined;
+    var plain = State.init(scene.program, &slab_plain);
+    _ = scene.read(&plain, .{ .flicks = start + 10 * flicks_per_second - 1 });
+    try testing.expectEqual(@as(u64, 4800), plain.steps_run);
+    _ = scene.read(&plain, .{ .flicks = start + 999 * flicks_per_second / 100 });
+    try testing.expectEqual(@as(u64, 4800 + 4796), plain.steps_run);
+
+    var slab: [Scene.slab_count]f64 = undefined;
+    var checkpoints: [10 * Scene.slab_count]f64 = undefined;
+    var state = State.init_with_checkpoints(scene.program, &slab, &checkpoints);
+    try testing.expectEqual(@as(u32, 10), state.checkpoints_count());
+    _ = scene.read(&state, .{ .flicks = start + 21 * flicks_per_second / 2 });
+    try testing.expectEqual(@as(u32, 10), state.checkpoints_filled);
+    var steps_max: u64 = 0;
+    var hop: i64 = 0;
+    for (0..2000) |_| {
+        hop = @mod(hop + 3_708_281_731, 21 * flicks_per_second / 2);
+        const steps_before = state.steps_run;
+        _ = scene.read(&state, .{ .flicks = start + hop });
+        steps_max = @max(steps_max, state.steps_run - steps_before);
+    }
+    try testing.expectEqual(simulation.checkpoint_interval - 1, steps_max);
+}
+
+// Locks section 10 on the smallest cycle: a delay fed by itself plus one counts steps. It is 0
+// before the start, 480 at 1 s, 1.5 halfway through the second step, and the sum is one more.
+test "a delay closes a cycle and gives the step before" {
+    var times: [1]Time = undefined;
+    var cues = Cues.init(&times);
+    _ = try cues.add(.{ .flicks = 0 });
+    var nodes: [3]Node = undefined;
+    var builder = Builder.init(&nodes, .{ .slab_count_max = 5, .cues = &cues });
+    const count = try builder.delay(0);
+    const one = try builder.constant(1);
+    const sum = try builder.add(count, one);
+    try builder.close(count, sum);
+    var slab: [5]f64 = undefined;
+    var state = State.init(builder.finish(), &slab);
+    const rows = [_]struct { flicks: i64, count: f64 }{
+        .{ .flicks = -1, .count = 0 },
+        .{ .flicks = 0, .count = 0 },
+        .{ .flicks = 3 * simulation.step.flicks / 2, .count = 1.5 },
+        .{ .flicks = flicks_per_second, .count = 480 },
+        .{ .flicks = 3 * simulation.step.flicks, .count = 3 },
+    };
+    for (rows) |row| {
+        state.eval(.{ .flicks = row.flicks });
+        try testing.expectEqual(row.count, state.value(count));
+        try testing.expectEqual(row.count + 1, state.value(sum));
+    }
+}
+
+/// A program of one chase from 0 of the tween `target_source`.
+fn chase_alone(
+    nodes: []Node,
+    cues: *const Cues,
+    law_time: Time,
+    overshoot: f64,
+    target_source: Tween,
+) !struct { program: Program, chase: Id } {
+    var builder = Builder.init(nodes, .{ .slab_count_max = 5, .cues = cues });
+    const target = try builder.tween(target_source);
+    const chase = try builder.chase(.{
+        .target = target,
+        .from = 0,
+        .time = law_time,
+        .overshoot = overshoot,
+    });
+    return .{ .program = builder.finish(), .chase = chase };
+}
+
+// Locks step 5's deferred spring with a moving target on two worked cases. Chasing a constant 1
+// (a tween that is already there) from 0, it is step 5's spring folded at every step: within
+// 1e-12 at every step of 2 s, for omega 8 critical and for overshoot 0.163. Chasing a ramp of
+// 1 per second, a critical spring of period 0.5 s lags 2 / omega + step / 2 = 0.160197 s at 10 s.
+test "a chase follows a moving target" {
+    var times: [1]Time = undefined;
+    var cues = Cues.init(&times);
+    const cue = try cues.add(.{ .flicks = 0 });
+    var nodes: [2]Node = undefined;
+    var slab: [5]f64 = undefined;
+    const omega_8: Time = .{ .flicks = 554_176_944 };
+    for ([_]f64{ 0, 0.163 }) |overshoot| {
+        var constant_source = tween_of(1, 1, cue, .linear);
+        constant_source.duration = .{ .flicks = 1 };
+        const built = try chase_alone(&nodes, &cues, omega_8, overshoot, constant_source);
+        var state = State.init(built.program, &slab);
+        const law: motion.Law = .{ .spring = motion.SpringLaw.of(omega_8, overshoot) };
+        for (0..961) |index| {
+            state.eval(.{ .flicks = @as(i64, @intCast(index)) * simulation.step.flicks });
+            const seconds = @as(f64, @floatFromInt(index)) / 480;
+            const whole = motion.advance(law, .{ .position = 0, .velocity = 0 }, 1, seconds);
+            try testing.expectApproxEqAbs(whole.position, state.value(built.chase), 1e-12);
+        }
+    }
+    var ramp = tween_of(0, 100, cue, .linear);
+    ramp.duration = .{ .flicks = 100 * flicks_per_second };
+    const half_second: Time = .{ .flicks = flicks_per_second / 2 };
+    const built = try chase_alone(&nodes, &cues, half_second, 0, ramp);
+    var state = State.init(built.program, &slab);
+    state.eval(.{ .flicks = 10 * flicks_per_second });
+    const lag_expected: f64 = 2.0 / (std.math.tau / 0.5) + simulation.step_seconds / 2.0;
+    try testing.expectApproxEqAbs(lag_expected, 10 - state.value(built.chase), 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 0.160197), lag_expected, 5e-7);
+}
+
+// Locks a follower's timeline with a Newtonian mover (speed 4, accel 2, decel 4), regions fixed
+// at 2 and 5 in turn, and a pause of exactly 0.5 s. From 0 to 2 takes sqrt 3 s, so it lands at
+// step 832, the first step after 831.38; holds 2 for 240 steps; leaves at step 1073; takes
+// 2.1213 s to 5, landing at step 2091; and holds 5 until step 2331.
+test "a follower lands, pauses, and moves on" {
+    var times: [1]Time = undefined;
+    var cues = Cues.init(&times);
+    _ = try cues.add(.{ .flicks = 0 });
+    var region_entries: [2]simulation.Region = undefined;
+    var regions = simulation.Regions.init(&region_entries);
+    const span = try regions.add(&.{ .{ .low = 2, .high = 2 }, .{ .low = 5, .high = 5 } });
+    var nodes: [1]Node = undefined;
+    var builder = Builder.init(&nodes, .{
+        .slab_count_max = 7,
+        .cues = &cues,
+        .regions = regions.table(),
+    });
+    const half_second: Time = .{ .flicks = flicks_per_second / 2 };
+    const follower = try builder.follow(.{
+        .from = 0,
+        .regions = span,
+        .pick = .cycle,
+        .mover = .{ .newtonian = .{ .speed = 4, .accel = 2, .decel = 4 } },
+        .tolerance = 0,
+        .pause_min = half_second,
+        .pause_max = half_second,
+        .seed = 0,
+    });
+    var slab: [7]f64 = undefined;
+    var state = State.init(builder.finish(), &slab);
+    const rows = [_]struct { step: i64, low: f64, high: f64 }{
+        .{ .step = 1, .low = 0, .high = 0.001 },
+        .{ .step = 831, .low = 1.999, .high = 2 - 1e-9 },
+        .{ .step = 832, .low = 2, .high = 2 },
+        .{ .step = 1072, .low = 2, .high = 2 },
+        .{ .step = 1073, .low = 2 + 1e-9, .high = 2.001 },
+        .{ .step = 2090, .low = 4.999, .high = 5 - 1e-9 },
+        .{ .step = 2091, .low = 5, .high = 5 },
+        .{ .step = 2331, .low = 5, .high = 5 },
+        .{ .step = 2332, .low = 4.999, .high = 5 - 1e-9 },
+    };
+    for (rows) |row| {
+        state.eval(.{ .flicks = row.step * simulation.step.flicks });
+        const value = state.value(follower);
+        try testing.expect(value >= row.low);
+        try testing.expect(value <= row.high);
+    }
+}
+
+// Locks that a cue move reaches a simulated reader: after moving the chase's target cue, a reader
+// that has played past it gives what a fresh reader gives, which differs for the chase and not
+// for the follower. Moving both cues by any amount, a flick or a day, shifts every simulated
+// node by exactly that time.
+test "moving a cue reaches a simulation" {
+    var scene: Scene = undefined;
+    try scene.init();
+    var slab: [Scene.slab_count]f64 = undefined;
+    var checkpoints: [4 * Scene.slab_count]f64 = undefined;
+    var state = State.init_with_checkpoints(scene.program, &slab, &checkpoints);
+    const time: Time = .{ .flicks = 3 * flicks_per_second };
+    const before = scene.read(&state, time);
+    try scene.cues.move(.{ .index = 1 }, .{ .flicks = 2 * flicks_per_second + 12_345_678 });
+    const after = scene.read(&state, time);
+    var slab_fresh: [Scene.slab_count]f64 = undefined;
+    var fresh = State.init(scene.program, &slab_fresh);
+    try testing.expectEqual(scene.read(&fresh, time), after);
+    try testing.expect(before[0] != after[0]);
+    try testing.expectEqual(before[1], after[1]);
+
+    var expected: [64][4]f64 = undefined;
+    for (&expected, 0..) |*values, index| {
+        values.* = scene.read(&state, .{ .flicks = @as(i64, @intCast(index)) * 23_456_789 });
+    }
+    for ([_]i64{ 1, -7_777_777, 86_400 * flicks_per_second }) |shift| {
+        try scene.shift_cues(shift);
+        for (expected, 0..) |values, index| {
+            const flicks = @as(i64, @intCast(index)) * 23_456_789 + shift;
+            try testing.expectEqual(values, scene.read(&state, .{ .flicks = flicks }));
+        }
+        try scene.shift_cues(-shift);
+    }
+}
+
+// Locks the layout of section 9 over 3 lanes: after a constant at 0, a chase at 3 keeps 3 lanes
+// of before, after, and velocity, so a delay after it starts at 15, and the delay's 3 lanes of
+// before and after end the slab at 24. Each chase lane follows its own lane of the target, and
+// the delay holds its initial value in all three at the start.
+test "a simulated node keeps its state after its output" {
+    var times: [1]Time = undefined;
+    var cues = Cues.init(&times);
+    _ = try cues.add(.{ .flicks = 0 });
+    var nodes: [3]Node = undefined;
+    var builder = Builder.init(&nodes, .{ .slab_count_max = 30, .cues = &cues });
+    builder.extent = .{ .lanes = 3, .components = 1 };
+    const two = try builder.constant(2);
+    const chase = try builder.chase(.{
+        .target = two,
+        .from = 0,
+        .time = .{ .flicks = flicks_per_second },
+        .overshoot = 0,
+    });
+    const echo = try builder.delay(-1);
+    try builder.close(echo, chase);
+    const program = builder.finish();
+    try testing.expect(program.simulated);
+    try testing.expectEqual(@as(u32, 15), program.nodes[echo.index].offset);
+    try testing.expectEqual(@as(u32, 24), program.slab_count);
+    var slab: [24]f64 = undefined;
+    var state = State.init(program, &slab);
+    state.eval(.{ .flicks = flicks_per_second });
+    const value = state.values(chase)[0];
+    try testing.expect(value > 1.9);
+    try testing.expectEqualSlices(f64, &@as([3]f64, @splat(value)), state.values(chase));
+    state.eval(.{ .flicks = 0 });
+    try testing.expectEqualSlices(f64, &@as([3]f64, @splat(-1)), state.values(echo));
+
+    var nodes_pure: [1]Node = undefined;
+    var builder_pure = Builder.init(&nodes_pure, .{ .slab_count_max = 1 });
+    _ = try builder_pure.constant(1);
+    try testing.expect(!builder_pure.finish().simulated);
+}
+
+/// One cue at 0 and one region, [0, 1], for the refusals of the simulated ops.
+const Fixture = struct {
+    times: [1]Time,
+    cues: Cues,
+    region_entries: [1]simulation.Region,
+    regions: simulation.Regions,
+    span: simulation.Span,
+
+    fn init(fixture: *Fixture) !void {
+        fixture.cues = Cues.init(&fixture.times);
+        _ = try fixture.cues.add(.{ .flicks = 0 });
+        fixture.regions = simulation.Regions.init(&fixture.region_entries);
+        fixture.span = try fixture.regions.add(&.{.{ .low = 0, .high = 1 }});
+    }
+
+    fn builder(fixture: *const Fixture, nodes: []Node) Builder {
+        return Builder.init(nodes, .{
+            .slab_count_max = 64,
+            .cues = &fixture.cues,
+            .regions = fixture.regions.table(),
+        });
+    }
+};
+
+// Locks each refusal of `chase`, `delay`, and `close` by name, that nothing refused was built,
+// and that a delay can be closed on itself. A simulated node needs a start cue to exist.
+test "the builder refuses a chase or a delay it cannot evaluate" {
+    var nodes: [4]Node = undefined;
+    var empty = Builder.init(&nodes, .{ .slab_count_max = 64 });
+    try testing.expectError(error.UnknownCue, empty.delay(0));
+
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    var builder = fixture.builder(&nodes);
+    const second: Time = .{ .flicks = flicks_per_second };
+    const nan = std.math.nan(f64);
+    var chase: Chase = .{ .target = .{ .index = 0 }, .from = 0, .time = second, .overshoot = 0 };
+    try testing.expectError(error.UnknownNode, builder.chase(chase));
+    const target = try builder.constant(1);
+    chase.target = target;
+    chase.from = nan;
+    try testing.expectError(error.NotFinite, builder.chase(chase));
+    chase.from = 0;
+    chase.time = .{ .flicks = 0 };
+    try testing.expectError(error.InvalidDuration, builder.chase(chase));
+    chase.time = second;
+    chase.overshoot = 1;
+    try testing.expectError(error.InvalidOvershoot, builder.chase(chase));
+    try testing.expectError(error.NotFinite, builder.delay(nan));
+    try testing.expectEqual(@as(u32, 1), builder.node_count);
+
+    const echo = try builder.delay(0);
+    try testing.expectError(error.NotADelay, builder.close(target, echo));
+    try testing.expectError(error.UnknownNode, builder.close(echo, .{ .index = 2 }));
+    try builder.close(echo, echo);
+    try testing.expectError(error.DelayClosed, builder.close(echo, target));
+    _ = builder.finish();
+}
+
+// Locks each refusal of `follow` and `shift` by name, that nothing refused was built, and the
+// edges that are accepted: the longest pause, and a period of one step per bucket.
+test "the builder refuses a follower or a shift register it cannot evaluate" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    var nodes: [2]Node = undefined;
+    var builder = fixture.builder(&nodes);
+    const second: Time = .{ .flicks = flicks_per_second };
+    const nan = std.math.nan(f64);
+    var follow: Follow = .{
+        .from = 0,
+        .regions = fixture.span,
+        .pick = .cycle,
+        .mover = .{ .newtonian = .{ .speed = 1, .accel = 1, .decel = 0 } },
+        .tolerance = 0,
+        .pause_min = second,
+        .pause_max = second,
+        .seed = 0,
+    };
+    try testing.expectError(error.InvalidLimit, builder.follow(follow));
+    follow.mover = .{ .spring = .{ .time = second, .overshoot = 0 } };
+    const unknowns = [_]simulation.Span{
+        .{ .first = 0, .count = 0 },
+        .{ .first = 0, .count = 2 },
+        .{ .first = 2, .count = 1 },
+    };
+    for (unknowns) |unknown| {
+        follow.regions = unknown;
+        try testing.expectError(error.UnknownRegions, builder.follow(follow));
+    }
+    follow.regions = fixture.span;
+    follow.tolerance = -0.1;
+    try testing.expectError(error.InvalidTolerance, builder.follow(follow));
+    follow.tolerance = nan;
+    try testing.expectError(error.NotFinite, builder.follow(follow));
+    follow.tolerance = 0;
+    const pause_steps_beyond: i64 = simulation.pause_steps_max + 1;
+    const pauses = [_][2]i64{ .{ -1, 0 }, .{ 2, 1 }, .{ 0, pause_steps_beyond * step_flicks } };
+    for (pauses) |pause| {
+        follow.pause_min = .{ .flicks = pause[0] };
+        follow.pause_max = .{ .flicks = pause[1] };
+        try testing.expectError(error.InvalidPause, builder.follow(follow));
+    }
+
+    var shift: Shift = .{
+        .buckets = 0,
+        .period = second,
+        .low = 0,
+        .high = 1,
+        .odds = 0.5,
+        .shape = .steps,
+        .seed = 0,
+    };
+    try testing.expectError(error.InvalidBuckets, builder.shift(shift));
+    shift.buckets = simulation.buckets_max + 1;
+    try testing.expectError(error.InvalidBuckets, builder.shift(shift));
+    shift.buckets = 4;
+    shift.odds = nan;
+    try testing.expectError(error.NotFinite, builder.shift(shift));
+    for ([_]f64{ -0.1, 1.1 }) |odds| {
+        shift.odds = odds;
+        try testing.expectError(error.InvalidOdds, builder.shift(shift));
+    }
+    shift.odds = 1;
+    for ([_]i64{ 0, 4 * step_flicks - 1, (1 << 53) + 1 }) |period| {
+        shift.period = .{ .flicks = period };
+        try testing.expectError(error.InvalidDuration, builder.shift(shift));
+    }
+    try testing.expectEqual(@as(u32, 0), builder.node_count);
+
+    shift.period = .{ .flicks = 4 * step_flicks };
+    _ = try builder.shift(shift);
+    follow.pause_min = .{ .flicks = 0 };
+    follow.pause_max = .{ .flicks = simulation.pause_steps_max * step_flicks };
+    _ = try builder.follow(follow);
 }

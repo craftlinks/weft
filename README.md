@@ -2,12 +2,13 @@
 
 A Zig library for composable motion: motion as an object of its own, separate from whatever it
 moves. It has no dependencies and knows nothing about pixels. So far it has a clock, four waves,
-seeded noise, easing, tweens on named cues, springs and Newtonian moves toward goals at cues, and a
-graph that composes them.
+seeded noise, easing, tweens on named cues, springs and Newtonian moves toward goals at cues,
+simulated signals on a fixed step, and a graph that composes them, with cycles through a delay.
 
 Every frame is a function of t. A reader supplies the time and gets a value, and it can ask for any
 time in any order. Nothing on that path allocates, locks, or runs unbounded, and a sampled signal
-has the same bits on native and wasm.
+has the same bits on native and wasm. A simulated signal's work is bounded by the checkpoints its
+reader keeps, as Simulated Signals explains.
 
 ## Requirements
 
@@ -39,6 +40,7 @@ src/
     graph.zig         Program, Builder, and State: a flat node array and one slab per reader
     motion.zig        Goals, springs, and Newtonian moves, solved exactly between goal changes
     noise.zig         Noise: smooth and stepped, pure functions of a seed and time
+    simulation.zig    the fixed step, seeded draws, the goal follower, and the shift register
     time.zig          Time and Rate: an integer count of flicks
     wave.zig          Wave: sine, triangle, saw, and square, pure functions of time
 test/
@@ -91,16 +93,18 @@ state.eval(time);                              // allocates nothing, locks nothi
 const value = state.value(output);
 ```
 
-The ops are `constant`, `add`, `multiply`, `map_range`, `wave`, `noise`, `tween`, `spring`, and
-`newtonian`. The builder refuses by name what does not fit or cannot be evaluated:
-`error.NodeCapacityExceeded`, `error.SlabCapacityExceeded`, `error.UnknownNode`,
-`error.NotFinite`, `error.InvalidRange`, `error.UnknownCue`, `error.InvalidDuration`,
-`error.InvalidEase`, `error.InvalidRate`, `error.UnknownGoals`, `error.InvalidOvershoot`, and
-`error.InvalidLimit`.
+The ops are `constant`, `add`, `multiply`, `map_range`, `wave`, `noise`, `tween`, `spring`,
+`newtonian`, `chase`, `follow`, `shift`, and `delay`. The builder refuses by name what does not fit
+or cannot be evaluated: `error.NodeCapacityExceeded`, `error.SlabCapacityExceeded`,
+`error.UnknownNode`, `error.NotFinite`, `error.InvalidRange`, `error.UnknownCue`,
+`error.InvalidDuration`, `error.InvalidEase`, `error.InvalidRate`, `error.UnknownGoals`,
+`error.InvalidOvershoot`, `error.InvalidLimit`, `error.UnknownRegions`, `error.InvalidTolerance`,
+`error.InvalidPause`, `error.InvalidOdds`, `error.InvalidBuckets`, `error.NotADelay`, and
+`error.DelayClosed`.
 
-A node can only refer to earlier nodes, so a cycle cannot be expressed. Neither the node array nor
-the slab holds a pointer: copied as bytes, the nodes are the same program and the slab is a
-checkpoint. Each reader holds its own state, so readers on different threads never disturb each
+A node can only refer to earlier nodes, so a cycle can only pass through a delay. Neither the node
+array nor the slab holds a pointer: copied as bytes, the nodes are the same program and the slab is
+a checkpoint. Each reader holds its own state, so readers on different threads never disturb each
 other. `graph.zig` explains the layout.
 
 ## Noise
@@ -189,12 +193,76 @@ ends. Each motion node keeps a cursor after its output in the slab, `weft.motion
 so forward play costs one closed form per frame; it is a cache that cannot change a value, and a
 cue move makes it stale. `motion.zig` explains the closed forms and the cursor.
 
+## Simulated Signals
+
+```zig
+var region_entries: [2]weft.Region = undefined;
+var regions = weft.Regions.init(&region_entries);
+const places = try regions.add(&.{ .{ .low = -1, .high = -0.5 }, .{ .low = 0.5, .high = 1 } });
+
+var builder = weft.Builder.init(&nodes, .{
+    .slab_count_max = 64,
+    .cues = &cues,
+    .regions = regions.table(),
+    .start = beat,                             // every simulated node starts at this cue
+    .seed = take,
+});
+const lagging = try builder.chase(.{           // a spring whose goal is any signal
+    .target = rise,
+    .from = 0,
+    .time = .{ .flicks = weft.time.flicks_per_second / 2 },
+    .overshoot = 0.1,
+});
+const wander = try builder.follow(.{           // goals drawn from regions, with seeded pauses
+    .from = 0,
+    .regions = places,
+    .pick = .random,                           // or .cycle
+    .mover = .{ .spring = .{ .time = quarter_second, .overshoot = 0 } },
+    .tolerance = 0.01,                         // arrived: this close, and at most this fast
+    .pause_min = tenth_second,
+    .pause_max = half_second,
+    .seed = 1,
+});
+const pattern = try builder.shift(.{           // buckets that change with seeded odds
+    .buckets = 8,
+    .period = two_seconds,
+    .low = -1,
+    .high = 1,
+    .odds = 0.25,
+    .shape = .smooth,                          // or .steps, .linear
+    .seed = 2,
+});
+const echo = try builder.delay(0);             // its input one step before
+const target = try builder.add(echo, push);
+const loop = try builder.chase(.{
+    .target = target,
+    .from = 0,
+    .time = half_second,
+    .overshoot = 0,
+});
+try builder.close(echo, loop);                 // the one way to close a cycle
+
+var checkpoints: [600 * 64]f64 = undefined;    // 600 copies of the slab: ten minutes
+var state = weft.State.init_with_checkpoints(program, &slab, &checkpoints);
+```
+
+These have no closed form, so they run on one fixed step, `weft.simulation.step`, 1/480 s, the
+same for every graph and every reader, from the start cue. A read between two steps interpolates
+them linearly, so a reader at any rate gets the same value at the same time. Every random choice
+is a hash of a seed, as noise is. Their state sits in the slab after their output, so a checkpoint
+is a copy of the slab, and a reader keeps one a second, filled as it plays past them, in memory it
+gives `State.init_with_checkpoints`. A read restores the nearest checkpoint before it and steps
+forward, at most 479 steps once the checkpoints are filled; evaluating the latest time once, while
+loading, fills them all. The checkpoints only change what a read costs, never its value, and a cue
+move drops them. `program.simulated` says whether a program has such nodes. `simulation.zig` and
+`graph.zig`, sections 9 and 10, explain the step, the draws, and why a cycle needs a delay.
+
 ## Regress
 
 `zig build regress` renders `test/catalog.zig` on native and on wasm and compares both with
 `test/golden/signals.txt`, byte for byte. It samples each wave, each noise, and a few whole graphs,
-among them a spring and a Newtonian move. There is one sample per line, as a hex float, so any
-changed bit fails and the report names the sample:
+among them a spring, a Newtonian move, and each simulated node. There is one sample per line, as a
+hex float, so any changed bit fails and the report names the sample:
 
 ```txt
 regress: native differs from golden at line 700
