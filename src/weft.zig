@@ -6,7 +6,9 @@
 //! Every frame is a function of t: a reader supplies a `Time` and gets a value, and it cannot tell
 //! how the value was computed. A `Wave` is the simplest case, and a graph of them is a `Program`
 //! that each reader evaluates into a `State` of its own. Signals with no closed form run on a
-//! fixed step that no reader's rate can reach, so they keep the contract too.
+//! fixed step that no reader's rate can reach, so they keep the contract too. A reader can also
+//! ask what happened in a range of time: events, each at an exact flick, the same however the
+//! reader splits its timeline.
 //!
 //! ## 2. Rules That Hold From the First File
 //! - Weft imports nothing but `std`, and links nothing. A client glues it to a destination.
@@ -16,6 +18,7 @@
 pub const cue = @import("core/cue.zig");
 pub const ease = @import("core/ease.zig");
 pub const elementary = @import("core/elementary.zig");
+pub const event = @import("core/event.zig");
 pub const graph = @import("core/graph.zig");
 pub const motion = @import("core/motion.zig");
 pub const noise = @import("core/noise.zig");
@@ -27,7 +30,12 @@ pub const Cue = cue.Cue;
 pub const Cues = cue.Cues;
 pub const Ease = ease.Ease;
 pub const Builder = graph.Builder;
+pub const Bounce = graph.Bounce;
 pub const Chase = graph.Chase;
+pub const Crossing = graph.Crossing;
+pub const CueSpan = graph.CueSpan;
+pub const Event = event.Event;
+pub const Events = event.Events;
 pub const Extent = graph.Extent;
 pub const Follow = graph.Follow;
 pub const Id = graph.Id;
@@ -54,6 +62,7 @@ test {
     _ = cue;
     _ = ease;
     _ = elementary;
+    _ = event;
     _ = graph;
     _ = motion;
     _ = noise;

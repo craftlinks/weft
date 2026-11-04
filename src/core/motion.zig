@@ -43,9 +43,18 @@
 //! stop for, first costs a braking phase. So a plan has at most four phases of constant
 //! acceleration, and at its end the move returns its goal itself, so it lands exactly.
 //!
-//! ## 6. TigerStyle Invariants
+//! ## 6. Goals Reached
+//! Reaching a goal is an event. Goal i is reached at the first flick from its cue at which the
+//! closed form from its cue returns the goal itself, at rest, which is when `sample` already
+//! returns it: a settled spring, or a Newtonian move at the end of its plan. If the next goal's cue
+//! comes first, goal i is never reached. Both laws only stay on a goal once they reach it, so the
+//! flick is found by a gallop from the cue, doubling from one simulation step, then a bisection on
+//! integer flicks: at most 64 closed forms each. For a range, the closed forms at its two ends
+//! first say whether the flick is in it, so the search runs once per goal for a reader.
+//!
+//! ## 7. TigerStyle Invariants
 //! - No allocation, no locks. A sample runs one closed form per goal change at most, and a closed
-//!   form has no loop longer than four phases.
+//!   form has no loop longer than four phases. Finding a goal reached runs at most 131.
 //! - The goal table is immutable once built, and a refused `add` leaves it as it was.
 
 const std = @import("std");
@@ -241,9 +250,141 @@ pub fn sample(
     return advance(motion.law, kinematics, path[index].value, seconds).position;
 }
 
+/// The position and velocity of `motion` at the cue of goal `index`, folding from `cursor` when it
+/// holds an earlier goal, and from the first goal otherwise. Section 3 explains why the result does
+/// not depend on which. The cursor is only read.
+pub fn kinematics_at_goal(
+    motion: *const Motion,
+    goals: []const Goal,
+    cues: *const Cues,
+    cursor: *const [cursor_count]f64,
+    index: u32,
+) Kinematics {
+    assert(motion.goals.count > 0);
+    assert(index < motion.goals.count);
+    const path = goals[motion.goals.first..][0..motion.goals.count];
+    var at: u32 = 0;
+    var kinematics: Kinematics = .{ .position = motion.from, .velocity = 0 };
+    const cursor_index_plus_one: u32 = @intFromFloat(cursor[0]);
+    assert(cursor_index_plus_one <= path.len);
+    const generation: f64 = @floatFromInt(cues.generation);
+    if (cursor_index_plus_one > 0 and cursor[1] == generation) {
+        if (cursor_index_plus_one - 1 <= index) {
+            at = cursor_index_plus_one - 1;
+            kinematics = .{ .position = cursor[2], .velocity = cursor[3] };
+        }
+    }
+    while (at < index) : (at += 1) {
+        const seconds = seconds_between(cues.at(path[at].cue), cues.at(path[at + 1].cue));
+        kinematics = advance(motion.law, kinematics, path[at].value, seconds);
+    }
+    assert(at == index);
+    return kinematics;
+}
+
+/// The first flick at or after the cue of goal `index` at which `motion`, at `kinematics` there,
+/// is on the goal at rest, exactly, or null if the next goal's cue comes first. Section 6 explains
+/// the search.
+pub fn reached(
+    motion: *const Motion,
+    goals: []const Goal,
+    cues: *const Cues,
+    index: u32,
+    kinematics: Kinematics,
+) ?Time {
+    assert(index < motion.goals.count);
+    const path = goals[motion.goals.first..][0..motion.goals.count];
+    const cue_time = cues.at(path[index].cue);
+    const offset_max = stretch_offset_max(path, cues, index) orelse return null;
+    const goal = path[index].value;
+    if (on_goal(motion.law, kinematics, goal, 0)) return cue_time;
+    var below: u64 = 0;
+    var above: u64 = 0;
+    var probe: u64 = @intCast(reach_probe_flicks);
+    for (0..64) |_| {
+        probe = @min(probe, offset_max);
+        if (on_goal(motion.law, kinematics, goal, probe)) {
+            above = probe;
+            break;
+        }
+        if (probe == offset_max) return null;
+        below = probe;
+        probe = if (probe > offset_max / 2) offset_max else probe * 2;
+    } else unreachable;
+    assert(above > below);
+    for (0..64) |_| {
+        if (above - below == 1) break;
+        const middle = below + (above - below) / 2;
+        if (on_goal(motion.law, kinematics, goal, middle)) above = middle else below = middle;
+    } else unreachable;
+    assert(above - below == 1);
+    return .{ .flicks = cue_time.flicks +% @as(i64, @bitCast(above)) };
+}
+
+/// `reached`, if it is in `[t0, t1)`, or null. A motion stays on its goal once it is there, so the
+/// closed forms at the two ends of the range decide, and the search runs only for the range that
+/// holds the flick: a reader's consecutive ranges cost two closed forms per goal, not 129.
+pub fn reached_between(
+    motion: *const Motion,
+    goals: []const Goal,
+    cues: *const Cues,
+    index: u32,
+    kinematics: Kinematics,
+    t0: Time,
+    t1: Time,
+) ?Time {
+    assert(index < motion.goals.count);
+    assert(t0.flicks < t1.flicks);
+    const path = goals[motion.goals.first..][0..motion.goals.count];
+    const cue_time = cues.at(path[index].cue);
+    const offset_max = stretch_offset_max(path, cues, index) orelse return null;
+    if (t1.flicks <= cue_time.flicks) return null;
+    // Wrapping, because the distance between two i64 only fits in a u64.
+    const last = @min(@as(u64, @bitCast(t1.flicks -% cue_time.flicks)) - 1, offset_max);
+    var first: u64 = 0;
+    if (t0.flicks > cue_time.flicks) {
+        first = @bitCast(t0.flicks -% cue_time.flicks);
+        if (first > offset_max) return null;
+    }
+    const goal = path[index].value;
+    if (!on_goal(motion.law, kinematics, goal, last)) return null;
+    if (first > 0) {
+        if (on_goal(motion.law, kinematics, goal, first - 1)) return null;
+    }
+    const result = reached(motion, goals, cues, index, kinematics).?;
+    assert(result.flicks >= t0.flicks);
+    assert(result.flicks < t1.flicks);
+    return result;
+}
+
+/// The last offset from the cue of goal `index` that belongs to it, before the next goal's cue,
+/// or null if the next cue is at the same time.
+fn stretch_offset_max(path: []const Goal, cues: *const Cues, index: u32) ?u64 {
+    assert(index < path.len);
+    const cue_time = cues.at(path[index].cue);
+    if (index + 1 == path.len) return @bitCast(std.math.maxInt(i64) -% cue_time.flicks);
+    const next_time = cues.at(path[index + 1].cue);
+    assert(next_time.flicks >= cue_time.flicks);
+    if (next_time.flicks == cue_time.flicks) return null;
+    return @as(u64, @bitCast(next_time.flicks -% cue_time.flicks)) - 1;
+}
+
+/// The first probe of a search for a goal reached: one simulation step. `simulation.zig` imports
+/// this file, so the value is repeated here and checked there.
+pub const reach_probe_flicks: i64 = 1_470_000;
+
+/// Whether a motion at `start` heading for `goal` is on it at rest, exactly, `offset` flicks later.
+fn on_goal(law: Law, start: Kinematics, goal: f64, offset: u64) bool {
+    const flicks_per_second: f64 = @floatFromInt(time_module.flicks_per_second);
+    const seconds = @as(f64, @floatFromInt(offset)) / flicks_per_second;
+    const result = advance(law, start, goal, seconds);
+    if (result.position != goal) return false;
+    return result.velocity == 0;
+}
+
 /// The seconds from `earlier` to `later`. Wrapping, because the distance between two i64 only
 /// fits in a u64.
-fn seconds_between(earlier: Time, later: Time) f64 {
+pub fn seconds_between(earlier: Time, later: Time) f64 {
     assert(later.flicks >= earlier.flicks);
     const flicks: u64 = @bitCast(later.flicks -% earlier.flicks);
     const flicks_per_second: f64 = @floatFromInt(time_module.flicks_per_second);

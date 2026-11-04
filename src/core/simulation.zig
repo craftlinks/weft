@@ -28,7 +28,8 @@
 //! is, so a new goal keeps the velocity. Once both its distance to the goal and its speed are
 //! within `tolerance`, it has arrived and draws a pause, a whole number of steps. When the pause
 //! runs out it draws its next goal, from the next region in turn or from a drawn one, at a drawn
-//! place inside it. It keeps settling during a pause, so its motion never freezes.
+//! place inside it. It keeps settling during a pause, so its motion never freezes. Arriving is an
+//! event, and `follower_step` says when it happens.
 //!
 //! ## 5. The Shift Register
 //! A shift register holds `buckets` values and visits them in turn, once per `period`. Bucket
@@ -36,7 +37,8 @@
 //! bucket, the bucket two behind, the one behind the bucket it left, is replaced by a drawn value
 //! when another draw is below `odds`. The buckets it reads around the present are never the one
 //! being replaced, so a smooth shape does not jump. Odds of 0 repeat every period, and odds of 1
-//! never repeat. A bucket lasts at least one step, so a step enters at most one bucket.
+//! never repeat. A bucket lasts at least one step, so a step enters at most one bucket. Entering a
+//! bucket is an event, at its boundary, `shift_boundary`, an exact integer of flicks.
 //!
 //! ## 6. TigerStyle Invariants
 //! - No allocation and no locks. A step of a follower is one motion step and at most two draws; a
@@ -73,6 +75,8 @@ const step_flicks: u64 = @intCast(step.flicks);
 
 comptime {
     assert(step.flicks * 480 == time_module.flicks_per_second);
+    // A search for a goal reached starts from one step.
+    assert(step.flicks == motion.reach_probe_flicks);
     assert(step_seconds * 480 == 1);
     // The bucket arithmetic of `shift_position` fits a u64.
     assert(period_flicks_max * buckets_max < std.math.maxInt(u64));
@@ -234,24 +238,34 @@ pub fn follower_start(follower: *const Follower, regions: []const Region) Follow
     return follower_retarget(follower, regions, state);
 }
 
+/// The result of one step of a follower: its state, and whether it arrived at this step, which is
+/// an event.
+pub const FollowerStep = struct {
+    state: FollowerState,
+    arrived: bool,
+};
+
 /// The state of a follower one step after `state`, as section 4 explains.
 pub fn follower_step(
     follower: *const Follower,
     regions: []const Region,
     state: FollowerState,
-) FollowerState {
+) FollowerStep {
     assert(state.drawn > 0);
     assert(state.pause_left <= pause_steps_max);
     var next = state;
     next.kinematics = motion.advance(follower.law, state.kinematics, state.goal, step_seconds);
     if (state.pause_left > 0) {
         next.pause_left = state.pause_left - 1;
-        if (next.pause_left == 0) return follower_retarget(follower, regions, next);
-    } else if (follower_arrived(follower, next.kinematics, state.goal)) {
-        next.pause_left = follower_pause(follower, state.drawn);
-        if (next.pause_left == 0) return follower_retarget(follower, regions, next);
+        if (next.pause_left == 0) next = follower_retarget(follower, regions, next);
+        return .{ .state = next, .arrived = false };
     }
-    return next;
+    if (!follower_arrived(follower, next.kinematics, state.goal)) {
+        return .{ .state = next, .arrived = false };
+    }
+    next.pause_left = follower_pause(follower, state.drawn);
+    if (next.pause_left == 0) next = follower_retarget(follower, regions, next);
+    return .{ .state = next, .arrived = true };
 }
 
 fn follower_arrived(follower: *const Follower, kinematics: motion.Kinematics, goal: f64) bool {
@@ -313,6 +327,20 @@ pub fn shift_position(shift: *const ShiftRegister, step_index: u64) Position {
     assert(within < count);
     assert(fraction < 1);
     return .{ .bucket = pass * count + within, .fraction = fraction };
+}
+
+/// The flicks from the start at which `shift` enters bucket `bucket`, counted as `shift_position`
+/// counts: the first flick whose position is in that bucket, an exact integer.
+pub fn shift_boundary(shift: *const ShiftRegister, bucket: u64) u64 {
+    assert(shift.buckets > 0);
+    assert(shift.period_flicks <= period_flicks_max);
+    const count: u64 = shift.buckets;
+    const pass = bucket / count;
+    const within = bucket % count;
+    const result = pass * shift.period_flicks +
+        (std.math.divCeil(u64, within * shift.period_flicks, count) catch unreachable);
+    if (within == 0) assert(result % shift.period_flicks == 0);
+    return result;
 }
 
 /// Fills `buckets` with the shift register's values at step 0.
@@ -481,6 +509,13 @@ test "shift register boundaries are exact" {
     try testing.expectEqual(Position{ .bucket = 1, .fraction = 0 }, shift_position(&shift, 160));
     try testing.expectEqual(Position{ .bucket = 3, .fraction = 0 }, shift_position(&shift, 480));
     try testing.expectEqual(@as(f64, 0.5), shift_position(&shift, 560).fraction);
+    // Bucket 1 begins at 1/3 s, which is 235,200,000 flicks exactly, and bucket 2 at 2/3 s.
+    try testing.expectEqual(@as(u64, 235_200_000), shift_boundary(&shift, 1));
+    try testing.expectEqual(@as(u64, 470_400_000), shift_boundary(&shift, 2));
+    try testing.expectEqual(@as(u64, 705_600_000), shift_boundary(&shift, 3));
+    shift.period_flicks = 1000;
+    // Bucket 1 of 3 over 1,000 flicks: position 333 is in bucket 0, 334 in bucket 1.
+    try testing.expectEqual(@as(u64, 334), shift_boundary(&shift, 1));
 }
 
 // Locks section 4 over a minute of steps of a random follower on a spring, with regions
@@ -500,8 +535,11 @@ test "a random follower draws goals in its regions and pauses within bounds" {
     };
     var state = follower_start(&follower, &regions);
     var drawn_per_region = [2]u32{ 0, 0 };
+    var arrivals: u32 = 0;
     for (0..60 * 480) |_| {
-        const next = follower_step(&follower, &regions, state);
+        const step_result = follower_step(&follower, &regions, state);
+        const next = step_result.state;
+        if (step_result.arrived) arrivals += 1;
         if (next.drawn != state.drawn) {
             const in_low = next.goal >= -1 and next.goal <= -0.5;
             const in_high = next.goal >= 0.5 and next.goal <= 1;
@@ -516,4 +554,8 @@ test "a random follower draws goals in its regions and pauses within bounds" {
     }
     try testing.expect(drawn_per_region[0] > 10);
     try testing.expect(drawn_per_region[1] > 10);
+    // Each goal drawn here followed an arrival, and the last arrival may still be in its pause.
+    const drawn_count = drawn_per_region[0] + drawn_per_region[1];
+    try testing.expect(arrivals >= drawn_count);
+    try testing.expect(arrivals <= drawn_count + 1);
 }

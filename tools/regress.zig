@@ -36,15 +36,19 @@ pub fn main(init: std.process.Init) !u8 {
     if (options.bless) {
         if (catalog.compare(native, wasm)) |mismatch| return report("wasm", "native", mismatch);
         try dir.writeFile(init.io, .{ .sub_path = options.golden_path, .data = native });
-        std.debug.print("regress: blessed {d} samples\n", .{catalog.sample_count});
+        std.debug.print("regress: blessed {d} samples and {d} events\n", .{
+            catalog.sample_count,
+            catalog.event_count,
+        });
         return exit_match;
     }
 
     const golden = try dir.readFile(init.io, options.golden_path, &buffer_golden);
     if (catalog.compare(golden, native)) |mismatch| return report("native", "golden", mismatch);
     if (catalog.compare(golden, wasm)) |mismatch| return report("wasm", "golden", mismatch);
-    std.debug.print("regress: {d} samples match the golden on native and wasm\n", .{
+    std.debug.print("regress: {d} samples and {d} events match the golden on native and wasm\n", .{
         catalog.sample_count,
+        catalog.event_count,
     });
     return exit_match;
 }

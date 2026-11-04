@@ -4,6 +4,7 @@ A Zig library for composable motion: motion as an object of its own, separate fr
 moves. It has no dependencies and knows nothing about pixels. So far it has a clock, four waves,
 seeded noise, easing, tweens on named cues, springs and Newtonian moves toward goals at cues,
 simulated signals on a fixed step, and a graph that composes them, with cycles through a delay.
+Besides values at a time, a graph gives the events in a range of time, each at an exact flick.
 
 Every frame is a function of t. A reader supplies the time and gets a value, and it can ask for any
 time in any order. Nothing on that path allocates, locks, or runs unbounded, and a sampled signal
@@ -37,6 +38,7 @@ src/
     cue.zig           Cues: a sorted, bounded table of times
     ease.zig          Ease: cubic Bezier curves, with a bounded solver
     elementary.zig    sine and cosine in turns, exp, and log, the same bits on every target
+    event.zig         Event, and the bounded, sorted buffer that collects them
     graph.zig         Program, Builder, and State: a flat node array and one slab per reader
     motion.zig        Goals, springs, and Newtonian moves, solved exactly between goal changes
     noise.zig         Noise: smooth and stepped, pure functions of a seed and time
@@ -94,7 +96,7 @@ const value = state.value(output);
 ```
 
 The ops are `constant`, `add`, `multiply`, `map_range`, `wave`, `noise`, `tween`, `spring`,
-`newtonian`, `chase`, `follow`, `shift`, and `delay`. The builder refuses by name what does not fit
+`newtonian`, `chase`, `follow`, `shift`, `delay`, `bounce`, `crossing`, and `cues`. The builder refuses by name what does not fit
 or cannot be evaluated: `error.NodeCapacityExceeded`, `error.SlabCapacityExceeded`,
 `error.UnknownNode`, `error.NotFinite`, `error.InvalidRange`, `error.UnknownCue`,
 `error.InvalidDuration`, `error.InvalidEase`, `error.InvalidRate`, `error.UnknownGoals`,
@@ -257,12 +259,54 @@ loading, fills them all. The checkpoints only change what a read costs, never it
 move drops them. `program.simulated` says whether a program has such nodes. `simulation.zig` and
 `graph.zig`, sections 9 and 10, explain the step, the draws, and why a cycle needs a delay.
 
+## Events
+
+```zig
+const ball = try builder.bounce(.{             // two nodes: position and velocity
+    .low = 0,
+    .high = 1,
+    .speed = 0.7,                              // units per second
+    .start = beat,                             // at `low`, at rest, until this cue
+});
+const loud = try builder.crossing(.{           // a gate: 1 at or above the level, else 0
+    .input = lagging,
+    .level = 0.8,
+    .direction = .rising,                      // or .falling, .both
+});
+const beats = try builder.cues(.{ .first = beat, .count = 4 }); // how many have passed
+
+var out: [64]weft.Event = undefined;           // the caller's buffer bounds the memory
+const result = state.events(t0, t1, &out);     // every event in [t0, t1), in order
+for (out[0..result.count]) |event| {           // event.time, .source, .instance, .value
+    _ = event;                                 // handle it
+}
+// result.dropped counts, exactly, the events after the earliest out.len.
+```
+
+`eval(t)` gives values at a moment; `events(t0, t1)` gives everything that happened in the
+half-open range, so however a reader splits its timeline, each event lands in exactly one range.
+Events come from a bounce hitting a wall, a crossing of a level, a spring or a Newtonian move
+reaching its goal, a follower arriving, a shift register entering a bucket, and cues. They are
+ordered by time, then by the index of the node, then by lane, and an event's time is the first
+flick at which it has happened, so `eval(event.time)` already shows it. A bounce, cues, motions,
+and shift registers solve their times exactly. A crossing compares its input at consecutive
+steps of 1/480 s and interpolates inside the step, so its gate, which is exact at any time, can
+differ from its events by up to a step near a crossing, and **an input that crosses and comes
+back within one step flips the gate with no event**.
+
+Events are not stored: a past range re-runs from a checkpoint and gives the same events, bit for
+bit. A range never brings a simulated state past the step `eval(t1)` needs, so consecutive ranges
+run each step once, and an `eval(t1)` after them costs nothing more. `events` leaves the slab's
+outputs at no particular time, so `value` asserts until the next `eval`. `graph.zig`, section 11,
+and `event.zig` explain the rules.
+
 ## Regress
 
 `zig build regress` renders `test/catalog.zig` on native and on wasm and compares both with
 `test/golden/signals.txt`, byte for byte. It samples each wave, each noise, and a few whole graphs,
-among them a spring, a Newtonian move, and each simulated node. There is one sample per line, as a
-hex float, so any changed bit fails and the report names the sample:
+among them a spring, a Newtonian move, and each simulated node, then lists the events of a few
+more. There is one sample or event per line, values as hex floats, so any changed bit or flick
+fails and the report names the line:
 
 ```txt
 regress: native differs from golden at line 700
