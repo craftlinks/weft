@@ -35,7 +35,17 @@
 //! are the lines of step 5. After the start their samples never land on a step, so each also
 //! locks the interpolation between steps, and the follower and the shift register lock the draws.
 //!
-//! ## 7. TigerStyle Invariants
+//! ## 7. Events
+//! Values alone cannot notice a change in when things happen, so the catalog also lists events.
+//! Each event graph runs on the same cues as the graphs, at each epoch, and reports the events of
+//! its first six seconds into a buffer of `events_per_run_max`, one line per event kept: graph,
+//! epoch, index, flicks after the epoch, source, and the value as a hex float. Every event graph
+//! starts at the first cue, so its times after the epoch and its values are the same at every
+//! epoch. They come last, so the lines before them are the lines of step 6. How many events each
+//! keeps and drops is a constant `render` asserts, so the text keeps a compile-time size, and the
+//! shift register overflows the buffer, which locks the overflow rule too.
+//!
+//! ## 8. TigerStyle Invariants
 //! - The text fits in `text_size_max` by construction, so `render` cannot fail.
 
 const std = @import("std");
@@ -111,6 +121,36 @@ const graphs_epoch_free = [_]Graph{
 
 const graphs = std.enums.values(Graph);
 
+/// The graphs whose events are listed, each built by `event_graph_build`.
+const EventGraph = enum {
+    bounce,
+    crossing,
+    follow,
+    shift,
+    cues,
+    glide,
+
+    /// The events each keeps in its buffer and drops, at every epoch.
+    fn expected(graph: EventGraph) weft.Events {
+        return switch (graph) {
+            .bounce => .{ .count = 4, .dropped = 0 },
+            .crossing => .{ .count = 2, .dropped = 0 },
+            .follow => .{ .count = 9, .dropped = 0 },
+            .shift => .{ .count = 16, .dropped = 5 },
+            .cues => .{ .count = 3, .dropped = 0 },
+            .glide => .{ .count = 2, .dropped = 0 },
+        };
+    }
+};
+
+const event_graphs = std.enums.values(EventGraph);
+
+/// The buffer each event run has, which the shift register overflows.
+const events_per_run_max = 16;
+
+/// The range each event run reports: the first six seconds after the epoch.
+const event_range_seconds = 6;
+
 const samples_per_run = 24;
 
 const wave_sample_count = shapes.len * signals.len * epochs.len * samples_per_run;
@@ -119,14 +159,27 @@ const graph_sample_count = graphs.len * epochs.len * samples_per_run;
 
 pub const sample_count = wave_sample_count + noise_sample_count + graph_sample_count;
 
+pub const event_count = count: {
+    var count: u32 = 0;
+    for (event_graphs) |graph| {
+        assert(graph.expected().count <= events_per_run_max);
+        count += graph.expected().count;
+    }
+    break :count count * epochs.len;
+};
+
+/// One line per sample and per event.
+pub const line_count = sample_count + event_count;
+
 const line_size_max = 64;
 
-pub const text_size_max = sample_count * line_size_max;
+pub const text_size_max = line_count * line_size_max;
 
 comptime {
     assert(wave_sample_count == 1536);
     assert(noise_sample_count == 768);
     assert(graph_sample_count == 960);
+    assert(event_count == 144);
     assert(Graph.slab_count_max >= Graph.nodes_count_max + 2 * weft.motion.cursor_count);
     assert(text_size_max < 1 << 20);
     for (signals) |signal| assert(weft.Rate.from_hz(signal.rate_hz) != null);
@@ -148,7 +201,10 @@ pub fn render(text: *[text_size_max]u8) []const u8 {
     for (graphs) |graph| {
         for (&epochs) |*epoch| render_graph_run(&writer, graph, epoch);
     }
-    assert(writer.buffered().len > sample_count);
+    for (event_graphs) |graph| {
+        for (&epochs) |*epoch| render_event_run(&writer, graph, epoch);
+    }
+    assert(writer.buffered().len > line_count);
     assert(writer.buffered()[writer.buffered().len - 1] == '\n');
     return writer.buffered();
 }
@@ -197,47 +253,64 @@ fn render_noise_run(
     }
 }
 
-fn render_graph_run(writer: *std.Io.Writer, graph: Graph, epoch: *const Epoch) void {
-    // Half a second into the epoch, then a second apart.
-    var cue_times: [Graph.cues_count]weft.Time = undefined;
-    var cues = weft.Cues.init(&cue_times);
-    var cue_ids: [Graph.cues_count]weft.Cue = undefined;
-    for (&cue_ids, 0..) |*cue, index| {
-        const half_seconds: i64 = 2 * @as(i64, @intCast(index)) + 1;
-        const flicks = (2 * epoch.seconds + half_seconds) * flicks_per_half_second;
-        cue.* = cues.add(.{ .flicks = flicks }) catch unreachable;
-    }
-    var goal_entries: [Graph.goals_count]weft.Goal = undefined;
-    var goals = weft.Goals.init(&goal_entries);
-    const spring_goals = goals.add(&.{
-        .{ .cue = cue_ids[0], .value = 1 },
-        .{ .cue = cue_ids[1], .value = -0.5 },
-        .{ .cue = cue_ids[2], .value = 0.25 },
-    }) catch unreachable;
-    const glide_goals = goals.add(&.{
-        .{ .cue = cue_ids[0], .value = 1 },
-        .{ .cue = cue_ids[1], .value = -1 },
-        .{ .cue = cue_ids[2], .value = 0.5 },
-    }) catch unreachable;
-    assert(std.meta.eql(spring_goals, Graph.spring_goals));
-    assert(std.meta.eql(glide_goals, Graph.glide_goals));
-    var region_entries: [Graph.regions_count]weft.Region = undefined;
-    var regions = weft.Regions.init(&region_entries);
-    _ = regions.add(&.{
-        .{ .low = -1, .high = -0.5 },
-        .{ .low = 0.25, .high = 1 },
-    }) catch unreachable;
+/// The tables every graph run reads at an epoch: cues half a second into it, then a second apart,
+/// the goals of the motion graphs at them, and the follower's regions.
+const Tables = struct {
+    cue_times: [Graph.cues_count]weft.Time,
+    cues: weft.Cues,
+    goal_entries: [Graph.goals_count]weft.Goal,
+    goals: weft.Goals,
+    region_entries: [Graph.regions_count]weft.Region,
+    regions: weft.Regions,
 
+    fn init(tables: *Tables, epoch: *const Epoch) void {
+        tables.cues = weft.Cues.init(&tables.cue_times);
+        var cue_ids: [Graph.cues_count]weft.Cue = undefined;
+        for (&cue_ids, 0..) |*cue, index| {
+            const half_seconds: i64 = 2 * @as(i64, @intCast(index)) + 1;
+            const flicks = (2 * epoch.seconds + half_seconds) * flicks_per_half_second;
+            cue.* = tables.cues.add(.{ .flicks = flicks }) catch unreachable;
+        }
+        tables.goals = weft.Goals.init(&tables.goal_entries);
+        const spring_goals = tables.goals.add(&.{
+            .{ .cue = cue_ids[0], .value = 1 },
+            .{ .cue = cue_ids[1], .value = -0.5 },
+            .{ .cue = cue_ids[2], .value = 0.25 },
+        }) catch unreachable;
+        const glide_goals = tables.goals.add(&.{
+            .{ .cue = cue_ids[0], .value = 1 },
+            .{ .cue = cue_ids[1], .value = -1 },
+            .{ .cue = cue_ids[2], .value = 0.5 },
+        }) catch unreachable;
+        assert(std.meta.eql(spring_goals, Graph.spring_goals));
+        assert(std.meta.eql(glide_goals, Graph.glide_goals));
+        tables.regions = weft.Regions.init(&tables.region_entries);
+        _ = tables.regions.add(&.{
+            .{ .low = -1, .high = -0.5 },
+            .{ .low = 0.25, .high = 1 },
+        }) catch unreachable;
+    }
+
+    /// A builder over these tables, with the first cue as the start.
+    fn builder(tables: *const Tables, nodes: []weft.Node, slab_count_max: u32) weft.Builder {
+        assert(tables.cues.count == Graph.cues_count);
+        return weft.Builder.init(nodes, .{
+            .slab_count_max = slab_count_max,
+            .cues = &tables.cues,
+            .goals = tables.goals.table(),
+            .regions = tables.regions.table(),
+            .start = .{ .index = 0 },
+            .seed = noise_seed,
+        });
+    }
+};
+
+fn render_graph_run(writer: *std.Io.Writer, graph: Graph, epoch: *const Epoch) void {
+    var tables: Tables = undefined;
+    tables.init(epoch);
     var nodes: [Graph.nodes_count_max]weft.Node = undefined;
     var slab: [Graph.slab_count_max]f64 = undefined;
-    var builder = weft.Builder.init(&nodes, .{
-        .slab_count_max = slab.len,
-        .cues = &cues,
-        .goals = goals.table(),
-        .regions = regions.table(),
-        .start = cue_ids[0],
-        .seed = noise_seed,
-    });
+    var builder = tables.builder(&nodes, slab.len);
     const output = graph_build(graph, &builder) catch unreachable;
     var state = weft.State.init(builder.finish(), &slab);
 
@@ -251,6 +324,60 @@ fn render_graph_run(writer: *std.Io.Writer, graph: Graph, epoch: *const Epoch) v
             graph, epoch.name, index, state.value(output),
         }) catch unreachable;
         assert(writer.buffered().len - size_before <= line_size_max);
+    }
+}
+
+/// Lists the events of the first `event_range_seconds` of `graph` at `epoch`, as section 7
+/// explains.
+fn render_event_run(writer: *std.Io.Writer, graph: EventGraph, epoch: *const Epoch) void {
+    var tables: Tables = undefined;
+    tables.init(epoch);
+    var nodes: [Graph.nodes_count_max]weft.Node = undefined;
+    var slab: [Graph.slab_count_max]f64 = undefined;
+    var builder = tables.builder(&nodes, slab.len);
+    event_graph_build(graph, &builder) catch unreachable;
+    var state = weft.State.init(builder.finish(), &slab);
+
+    const epoch_flicks = epoch.seconds * weft.time.flicks_per_second;
+    const end_flicks = epoch_flicks + event_range_seconds * weft.time.flicks_per_second;
+    var out: [events_per_run_max]weft.Event = undefined;
+    const result = state.events(.{ .flicks = epoch_flicks }, .{ .flicks = end_flicks }, &out);
+    assert(std.meta.eql(result, graph.expected()));
+    for (out[0..result.count], 0..) |event, index| {
+        assert(event.time.flicks >= epoch_flicks);
+        const size_before = writer.buffered().len;
+        writer.print("event {t} {s} {d} {d} {d} {x}\n", .{
+            graph,
+            epoch.name,
+            index,
+            event.time.flicks - epoch_flicks,
+            event.source.index,
+            event.value,
+        }) catch unreachable;
+        assert(writer.buffered().len - size_before <= line_size_max);
+    }
+}
+
+fn event_graph_build(graph: EventGraph, builder: *weft.Builder) weft.Builder.Error!void {
+    switch (graph) {
+        // Between -1 and 1 at 1.5 units a second: a hit every 4/3 s from the first cue.
+        .bounce => _ = try builder.bounce(.{
+            .low = -1,
+            .high = 1,
+            .speed = 1.5,
+            .start = .{ .index = 0 },
+        }),
+        // The sequence of tweens crossing 0.5 either way: rising in the first tween, at its middle,
+        // and falling in the last.
+        .crossing => {
+            const sequence = try build_sequence(builder);
+            _ = try builder.crossing(.{ .input = sequence, .level = 0.5, .direction = .both });
+        },
+        .follow => _ = try graph_build(.follow, builder),
+        .shift => _ = try graph_build(.shift, builder),
+        .cues => _ = try builder.cues(.{ .first = .{ .index = 0 }, .count = Graph.cues_count }),
+        // The first goal lands before the second cue; the second is cut short by the third.
+        .glide => _ = try graph_build(.glide, builder),
     }
 }
 
@@ -428,11 +555,12 @@ var text_a: [text_size_max]u8 = undefined;
 var text_b: [text_size_max]u8 = undefined;
 
 // Locks the size of the catalog and that rendering twice gives the same bytes.
-test "the catalog renders one line per sample, the same each time" {
+test "the catalog renders one line per sample and per event, the same each time" {
     const first = render(&text_a);
     const second = render(&text_b);
     try testing.expectEqualStrings(first, second);
-    try testing.expectEqual(@as(usize, sample_count), std.mem.count(u8, first, "\n"));
+    try testing.expectEqual(@as(usize, line_count), std.mem.count(u8, first, "\n"));
+    try testing.expectEqual(@as(usize, event_count), std.mem.count(u8, first, "\nevent "));
     try testing.expect(std.mem.startsWith(u8, first, "sine 1hz zero 0 0x0.0p0\n"));
 }
 
@@ -502,6 +630,29 @@ test "tweens, motions, and simulations have the same bits at every epoch" {
                 var buffer: [line_size_max]u8 = undefined;
                 const line = try std.fmt.bufPrint(&buffer, "graph {t} {s} {d} {s}\n", .{
                     graph, epoch.name, index, value,
+                });
+                try testing.expect(std.mem.indexOf(u8, text, line) != null);
+            }
+        }
+    }
+}
+
+// Locks the same for events: each event graph's lines at zero, with their index, time after the
+// epoch, source, and value, appear at every epoch, as section 7 promises.
+test "events have the same times and values at every epoch" {
+    const text = render(&text_a);
+    for (event_graphs) |graph| {
+        var buffer_start: [line_size_max]u8 = undefined;
+        const start = try std.fmt.bufPrint(&buffer_start, "event {t} zero 0 ", .{graph});
+        const zero_start = std.mem.indexOf(u8, text, start).?;
+        var zero_lines = std.mem.splitScalar(u8, text[zero_start..], '\n');
+        const prefix_size = "event ".len + @tagName(graph).len + " zero ".len;
+        for (0..graph.expected().count) |_| {
+            const rest = zero_lines.next().?[prefix_size..];
+            for (epochs) |epoch| {
+                var buffer: [line_size_max]u8 = undefined;
+                const line = try std.fmt.bufPrint(&buffer, "event {t} {s} {s}\n", .{
+                    graph, epoch.name, rest,
                 });
                 try testing.expect(std.mem.indexOf(u8, text, line) != null);
             }
