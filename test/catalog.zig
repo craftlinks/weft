@@ -45,7 +45,13 @@
 //! keeps and drops is a constant `render` asserts, so the text keeps a compile-time size, and the
 //! shift register overflows the buffer, which locks the overflow rule too.
 //!
-//! ## 8. TigerStyle Invariants
+//! ## 8. Recordings
+//! A recording played back is a pure signal, so one graph chases a `recorded` node over samples
+//! set relative to the epoch, which makes it the same at every epoch too. Its runs come after the
+//! events, so every line before them is a line of step 7, and they lock the playback rule: the
+//! last sample at or before the time, held forward.
+//!
+//! ## 9. TigerStyle Invariants
 //! - The text fits in `text_size_max` by construction, so `render` cannot fail.
 
 const std = @import("std");
@@ -96,6 +102,7 @@ const Graph = enum {
     follow,
     shift,
     feedback,
+    recorded,
 
     const nodes_count_max = 8;
     /// Room for the outputs of `nodes_count_max` nodes, and for the largest cache: two motions'
@@ -111,15 +118,25 @@ const Graph = enum {
     const goals_count = 6;
     const spring_goals: weft.Path = .{ .first = 0, .count = 3 };
     const glide_goals: weft.Path = .{ .first = 3, .count = 3 };
+
+    /// The samples of the recorded graph, as one clip: seconds after the epoch, and values.
+    const recorded_samples = [_][2]f64{
+        .{ 0.5, 0.25 }, .{ 1.125, -0.625 }, .{ 1.75, 0.875 }, .{ 2.625, -0.25 }, .{ 3.25, 0.5 },
+    };
+    const recorded_clip: weft.Clip = .{ .first = 0, .count = recorded_samples.len };
 };
 
 /// The graphs whose bits are the same at every epoch, because they read only differences of cue
 /// times and the time.
 const graphs_epoch_free = [_]Graph{
-    .sequence, .spring, .glide, .chase, .follow, .shift, .feedback,
+    .sequence, .spring, .glide, .chase, .follow, .shift, .feedback, .recorded,
 };
 
-const graphs = std.enums.values(Graph);
+/// The graphs rendered before the events, the graphs of step 6.
+const graphs = std.enums.values(Graph)[0 .. std.enums.values(Graph).len - graphs_after_events.len];
+
+/// The graphs rendered after the events, so the lines of step 7 stay where they were.
+const graphs_after_events = [_]Graph{.recorded};
 
 /// The graphs whose events are listed, each built by `event_graph_build`.
 const EventGraph = enum {
@@ -155,7 +172,7 @@ const samples_per_run = 24;
 
 const wave_sample_count = shapes.len * signals.len * epochs.len * samples_per_run;
 const noise_sample_count = noise_shapes.len * signals.len * epochs.len * samples_per_run;
-const graph_sample_count = graphs.len * epochs.len * samples_per_run;
+const graph_sample_count = (graphs.len + graphs_after_events.len) * epochs.len * samples_per_run;
 
 pub const sample_count = wave_sample_count + noise_sample_count + graph_sample_count;
 
@@ -178,7 +195,9 @@ pub const text_size_max = line_count * line_size_max;
 comptime {
     assert(wave_sample_count == 1536);
     assert(noise_sample_count == 768);
-    assert(graph_sample_count == 960);
+    assert(graph_sample_count == 1056);
+    const graphs_last = std.enums.values(Graph)[graphs.len..];
+    for (graphs_after_events, graphs_last) |late, last| assert(late == last);
     assert(event_count == 144);
     assert(Graph.slab_count_max >= Graph.nodes_count_max + 2 * weft.motion.cursor_count);
     assert(text_size_max < 1 << 20);
@@ -203,6 +222,9 @@ pub fn render(text: *[text_size_max]u8) []const u8 {
     }
     for (event_graphs) |graph| {
         for (&epochs) |*epoch| render_event_run(&writer, graph, epoch);
+    }
+    for (graphs_after_events) |graph| {
+        for (&epochs) |*epoch| render_graph_run(&writer, graph, epoch);
     }
     assert(writer.buffered().len > line_count);
     assert(writer.buffered()[writer.buffered().len - 1] == '\n');
@@ -262,6 +284,8 @@ const Tables = struct {
     goals: weft.Goals,
     region_entries: [Graph.regions_count]weft.Region,
     regions: weft.Regions,
+    sample_entries: [Graph.recorded_samples.len]weft.Sample,
+    samples: weft.Samples,
 
     fn init(tables: *Tables, epoch: *const Epoch) void {
         tables.cues = weft.Cues.init(&tables.cue_times);
@@ -289,6 +313,19 @@ const Tables = struct {
             .{ .low = -1, .high = -0.5 },
             .{ .low = 0.25, .high = 1 },
         }) catch unreachable;
+        tables.samples = weft.Samples.init(&tables.sample_entries);
+        var samples: [Graph.recorded_samples.len]weft.Sample = undefined;
+        for (&samples, Graph.recorded_samples) |*sample, row| {
+            // Each time is a whole number of eighths of a second, so its flicks are exact.
+            const second: f64 = @floatFromInt(weft.time.flicks_per_second);
+            const flicks: i64 = @intFromFloat(row[0] * second);
+            sample.* = .{
+                .time = .{ .flicks = epoch.seconds * weft.time.flicks_per_second + flicks },
+                .value = row[1],
+            };
+        }
+        const clip = tables.samples.add(&samples) catch unreachable;
+        assert(std.meta.eql(clip, Graph.recorded_clip));
     }
 
     /// A builder over these tables, with the first cue as the start.
@@ -299,6 +336,7 @@ const Tables = struct {
             .cues = &tables.cues,
             .goals = tables.goals.table(),
             .regions = tables.regions.table(),
+            .samples = tables.samples.table(),
             .start = .{ .index = 0 },
             .seed = noise_seed,
         });
@@ -483,6 +521,16 @@ fn graph_build(graph: Graph, builder: *weft.Builder) weft.Builder.Error!weft.Id 
             });
             try builder.close(echo, result);
             return result;
+        },
+        // A spring chasing a recording played back.
+        .recorded => {
+            const played = try builder.recorded(Graph.recorded_clip);
+            return builder.chase(.{
+                .target = played,
+                .from = 0,
+                .time = .{ .flicks = @divExact(weft.time.flicks_per_second * 2, 5) },
+                .overshoot = 0.15,
+            });
         },
     }
 }

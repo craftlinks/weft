@@ -8,7 +8,9 @@
 //! that each reader evaluates into a `State` of its own. Signals with no closed form run on a
 //! fixed step that no reader's rate can reach, so they keep the contract too. A reader can also
 //! ask what happened in a range of time: events, each at an exact flick, the same however the
-//! reader splits its timeline.
+//! reader splits its timeline. A client can prove things without sampling: every node has a range
+//! its values never leave, and the program says whether it can be reached at any time. Live input
+//! is the one exception to the contract, and the program names it.
 //!
 //! ## 2. Rules That Hold From the First File
 //! - Weft imports nothing but `std`, and links nothing. A client glues it to a destination.
@@ -22,6 +24,8 @@ pub const event = @import("core/event.zig");
 pub const graph = @import("core/graph.zig");
 pub const motion = @import("core/motion.zig");
 pub const noise = @import("core/noise.zig");
+pub const range = @import("core/range.zig");
+pub const recording = @import("core/recording.zig");
 pub const simulation = @import("core/simulation.zig");
 pub const time = @import("core/time.zig");
 pub const wave = @import("core/wave.zig");
@@ -32,6 +36,7 @@ pub const Ease = ease.Ease;
 pub const Builder = graph.Builder;
 pub const Bounce = graph.Bounce;
 pub const Chase = graph.Chase;
+pub const Class = range.Class;
 pub const Crossing = graph.Crossing;
 pub const CueSpan = graph.CueSpan;
 pub const Event = event.Event;
@@ -39,8 +44,11 @@ pub const Events = event.Events;
 pub const Extent = graph.Extent;
 pub const Follow = graph.Follow;
 pub const Id = graph.Id;
+pub const Input = graph.Input;
 pub const Node = graph.Node;
 pub const Program = graph.Program;
+pub const Range = range.Range;
+pub const Report = range.Report;
 pub const Shift = graph.Shift;
 pub const State = graph.State;
 pub const Tween = graph.Tween;
@@ -50,6 +58,10 @@ pub const Newtonian = motion.Newtonian;
 pub const Path = motion.Path;
 pub const Spring = motion.Spring;
 pub const Noise = noise.Noise;
+pub const Clip = recording.Clip;
+pub const Recording = recording.Recording;
+pub const Sample = recording.Sample;
+pub const Samples = recording.Samples;
 pub const Region = simulation.Region;
 pub const Regions = simulation.Regions;
 pub const Span = simulation.Span;
@@ -66,6 +78,8 @@ test {
     _ = graph;
     _ = motion;
     _ = noise;
+    _ = range;
+    _ = recording;
     _ = simulation;
     _ = time;
     _ = wave;

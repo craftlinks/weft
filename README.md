@@ -4,7 +4,9 @@ A Zig library for composable motion: motion as an object of its own, separate fr
 moves. It has no dependencies and knows nothing about pixels. So far it has a clock, four waves,
 seeded noise, easing, tweens on named cues, springs and Newtonian moves toward goals at cues,
 simulated signals on a fixed step, and a graph that composes them, with cycles through a delay.
-Besides values at a time, a graph gives the events in a range of time, each at an exact flick.
+Besides values at a time, a graph gives the events in a range of time, each at an exact flick,
+a range for every node that its values never leave, and whether it can be reached at any time.
+Live input is a node of its own, and a recording of it plays back as a seekable signal.
 
 Every frame is a function of t. A reader supplies the time and gets a value, and it can ask for any
 time in any order. Nothing on that path allocates, locks, or runs unbounded, and a sampled signal
@@ -42,6 +44,8 @@ src/
     graph.zig         Program, Builder, and State: a flat node array and one slab per reader
     motion.zig        Goals, springs, and Newtonian moves, solved exactly between goal changes
     noise.zig         Noise: smooth and stepped, pure functions of a seed and time
+    range.zig         Range and Class: conservative bounds, and how a reader reaches a time
+    recording.zig     Samples and Recording: live input written down and played back
     simulation.zig    the fixed step, seeded draws, the goal follower, and the shift register
     time.zig          Time and Rate: an integer count of flicks
     wave.zig          Wave: sine, triangle, saw, and square, pure functions of time
@@ -96,13 +100,14 @@ const value = state.value(output);
 ```
 
 The ops are `constant`, `add`, `multiply`, `map_range`, `wave`, `noise`, `tween`, `spring`,
-`newtonian`, `chase`, `follow`, `shift`, `delay`, `bounce`, `crossing`, and `cues`. The builder refuses by name what does not fit
-or cannot be evaluated: `error.NodeCapacityExceeded`, `error.SlabCapacityExceeded`,
-`error.UnknownNode`, `error.NotFinite`, `error.InvalidRange`, `error.UnknownCue`,
-`error.InvalidDuration`, `error.InvalidEase`, `error.InvalidRate`, `error.UnknownGoals`,
-`error.InvalidOvershoot`, `error.InvalidLimit`, `error.UnknownRegions`, `error.InvalidTolerance`,
-`error.InvalidPause`, `error.InvalidOdds`, `error.InvalidBuckets`, `error.NotADelay`, and
-`error.DelayClosed`.
+`newtonian`, `chase`, `follow`, `shift`, `delay`, `bounce`, `crossing`, `cues`, `input`, and
+`recorded`. The builder refuses by name what does not fit or cannot be evaluated:
+`error.NodeCapacityExceeded`, `error.SlabCapacityExceeded`, `error.UnknownNode`,
+`error.NotFinite`, `error.InvalidRange`, `error.UnknownCue`, `error.InvalidDuration`,
+`error.InvalidEase`, `error.InvalidRate`, `error.UnknownGoals`, `error.InvalidOvershoot`,
+`error.InvalidLimit`, `error.UnknownRegions`, `error.InvalidTolerance`, `error.InvalidPause`,
+`error.InvalidOdds`, `error.InvalidBuckets`, `error.NotADelay`, `error.DelayClosed`, and
+`error.UnknownSamples`.
 
 A node can only refer to earlier nodes, so a cycle can only pass through a delay. Neither the node
 array nor the slab holds a pointer: copied as bytes, the nodes are the same program and the slab is
@@ -300,13 +305,48 @@ run each step once, and an `eval(t1)` after them costs nothing more. `events` le
 outputs at no particular time, so `value` asserts until the next `eval`. `graph.zig`, section 11,
 and `event.zig` explain the rules.
 
+## Ranges and Seekability
+
+```zig
+var ranges: [node_count]weft.Range = undefined;
+program.ranges(&ranges);                       // a range per node its values never leave
+var classes: [node_count]weft.Class = undefined;
+program.classes(&classes);                     // .pure, .exact, .simulated, or .live
+const report = program.report();               // .seekable, and .live names the node why not
+
+const level = try builder.input(.{ .low = 0, .high = 1 }); // a live value, set each read
+state.set_input(level, microphone_level);      // clamped into [low, high]
+
+var entries: [4096]weft.Sample = undefined;
+var recording = weft.Recording.init(&entries);
+state.record(level, &recording);               // what each pass reads, written down
+// Later: Samples.add(recording.table()) gives a clip, and builder.recorded(clip) plays it back.
+```
+
+A range is conservative: a stated bound is never wrong, though it can be wider than the truth.
+Sums, products, waves, and noise are exact; an interpolation, a map, a tween, or a motion is
+widened by a margin relative to its scale. A spring's range includes its overshoot: one move from
+rest overshoots by its peak overshoot, 16.3% at a damping ratio of 0.5, and a spring with more
+goals, a chase, or a spring follower stays within (1 + os) / (1 - os) of the half-width of its
+inputs around their centre. A Newtonian move stays within its stopping distance,
+speed^2 / (2 decel), of its inputs. A loop through a delay is solved as a fixed point, and one
+that never settles has infinite ends. Interval arithmetic treats inputs as independent, so
+**`x * x` over [-1, 1] is reported as [-1, 1]**.
+
+An input is the fourth signal class, live: it has no past, so a program with one is not
+seekable, and the report names it. A backward read still works, reading the value set last. A
+state records what its passes read of an input, only forwards, and a `recorded` node plays it back
+held forward from each sample, so the recorded program read at the same times gives the same
+values, bit for bit, and can be read at any time. `range.zig` and `recording.zig` explain the
+rules.
+
 ## Regress
 
 `zig build regress` renders `test/catalog.zig` on native and on wasm and compares both with
 `test/golden/signals.txt`, byte for byte. It samples each wave, each noise, and a few whole graphs,
 among them a spring, a Newtonian move, and each simulated node, then lists the events of a few
-more. There is one sample or event per line, values as hex floats, so any changed bit or flick
-fails and the report names the line:
+more, then samples a recording played back. There is one sample or event per line, values as hex
+floats, so any changed bit or flick fails and the report names the line:
 
 ```txt
 regress: native differs from golden at line 700

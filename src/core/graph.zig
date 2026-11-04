@@ -116,7 +116,20 @@
 //! consecutive ranges run each step once and never restore a checkpoint, and an `eval(t1)` after
 //! them runs at most the one step a t1 on a step leaves.
 //!
-//! ## 12. TigerStyle Invariants
+//! ## 12. Ranges, Classes, and Live Input
+//! `Program.ranges` gives each node a range its values never leave, and `Program.classes` the
+//! class of each, as `range.zig` explains: both are worked out from the ops in a forward pass, with
+//! a delay's loop solved as a fixed point, so a node pays nothing for them until a client asks.
+//! `Program.report` says whether the program can be reached at any time, and which node is why.
+//!
+//! An input is the one live op. Its value lives in the slab as its output, set by `set_input`,
+//! clamped into its declared range, and a pass leaves it as it is. It has no past, so a checkpoint
+//! restore keeps it, and a backward read reads the value set last. A state can record what its
+//! passes read of an input, as `recording.zig` explains, and a `recorded` node plays that back as a
+//! pure signal. Only committed passes record: `eval`'s, and the passes of the steps. The read-only
+//! look of section 11 does not, since a later commit at the same time can read a newer value.
+//!
+//! ## 13. TigerStyle Invariants
 //! - Capacities come from the caller, and the builder refuses what does not fit, by name.
 //! - `eval` allocates nothing, takes no lock, and is one bounded pass over the node array. A motion
 //!   node folds over at most its own goals. A simulated program first runs at most
@@ -126,6 +139,9 @@
 //!   the steps the range spans, one more pass, and for each event at most `out.len` moves of the
 //!   events kept. A source that sorts after a full buffer only counts, by arithmetic for a bounce
 //!   and cues, and a motion runs at most 131 closed forms per goal in the range.
+//! - `ranges` and `classes` allocate nothing and are bounded: at most `delay_rounds_max` plus
+//!   `widen_rounds_max` plus one forward passes, and `3 * node_count + 1` passes.
+//! - A recording appends at most one sample per committed pass, and never past its table.
 //! - Offsets are consecutive from 0, so the slab has no gaps and no node overlaps another.
 
 const std = @import("std");
@@ -141,6 +157,13 @@ const motion = @import("motion.zig");
 const Goal = motion.Goal;
 const Motion = motion.Motion;
 const Noise = @import("noise.zig").Noise;
+const range_module = @import("range.zig");
+pub const Class = range_module.Class;
+pub const Range = range_module.Range;
+pub const Report = range_module.Report;
+const recording_module = @import("recording.zig");
+const Recording = recording_module.Recording;
+const Sample = recording_module.Sample;
 const noise_hash = @import("noise.zig").hash;
 const simulation = @import("simulation.zig");
 const time_module = @import("time.zig");
@@ -389,6 +412,22 @@ pub const CueSpan = struct {
     count: u32,
 };
 
+/// A live value, set by `State.set_input` each read and clamped into `[low, high]`, as section 12
+/// explains. Either end can be infinite, which is the default.
+pub const Input = struct {
+    low: f64 = -std.math.inf(f64),
+    high: f64 = std.math.inf(f64),
+    /// The value before the first `set_input`, in `[low, high]`.
+    initial: f64 = 0,
+};
+
+/// A recording played back, as a node holds it: its clip, and the hull of its values.
+pub const Recorded = struct {
+    clip: recording_module.Clip,
+    low: f64,
+    high: f64,
+};
+
 pub const Op = union(enum) {
     constant: f64,
     add: Binary,
@@ -405,6 +444,8 @@ pub const Op = union(enum) {
     bounce: BounceNode,
     crossing: Crossing,
     cues: CueSpan,
+    input: Input,
+    recorded: Recorded,
 
     /// The f64 a node of this op keeps in the slab after an output of `output_count` f64, for a
     /// cache or a simulation's state. Section 9 explains the layout of a simulated node.
@@ -419,6 +460,7 @@ pub const Op = union(enum) {
             // The input at the last step, then whether there is one.
             .crossing => output_count + 1,
             .constant, .add, .multiply, .map_range, .wave, .tween, .noise, .bounce, .cues => 0,
+            .input, .recorded => 0,
         };
     }
 
@@ -427,7 +469,32 @@ pub const Op = union(enum) {
         return switch (op.*) {
             .chase, .follow, .shift, .delay, .crossing => true,
             .constant, .add, .multiply, .map_range, .wave, .tween, .noise, .motion => false,
-            .bounce, .cues => false,
+            .bounce, .cues, .input, .recorded => false,
+        };
+    }
+
+    /// The class of this op alone, before its inputs', as section 12 explains.
+    fn class(op: *const Op) Class {
+        return switch (op.*) {
+            .constant, .add, .multiply, .map_range, .wave, .tween, .noise => .pure,
+            .bounce, .cues, .recorded => .pure,
+            .motion => .exact,
+            .chase, .follow, .shift, .delay, .crossing => .simulated,
+            .input => .live,
+        };
+    }
+
+    /// The nodes this op reads, at most two, null where there are fewer.
+    fn inputs(op: *const Op) [2]?Id {
+        return switch (op.*) {
+            .add, .multiply => |binary| .{ binary.left, binary.right },
+            .map_range => |map| .{ map.input, null },
+            .tween => |tween| .{ tween.previous, null },
+            .chase => |chase| .{ chase.target, null },
+            .delay => |delay| .{ delay.input, null },
+            .crossing => |crossing| .{ crossing.input, null },
+            .constant, .wave, .noise, .motion, .follow, .shift, .bounce, .cues => .{ null, null },
+            .input, .recorded => .{ null, null },
         };
     }
 };
@@ -459,6 +526,8 @@ pub const Program = struct {
     cues: *const Cues,
     goals: []const Goal,
     regions: []const simulation.Region,
+    /// The recordings that `recorded` nodes play back.
+    samples: []const Sample,
     /// The cue simulated nodes start at, read only when `simulated`.
     start: Cue,
     /// Whether any node runs on the fixed step, so a read may cost steps.
@@ -505,11 +574,199 @@ pub const Program = struct {
                     assert(op.count > 0);
                     assert(@as(u64, op.first.index) + op.count <= program.cues.count);
                 },
+                .input => |op| {
+                    assert(op.low <= op.high);
+                    assert(op.initial >= op.low and op.initial <= op.high);
+                },
+                .recorded => |op| {
+                    assert(op.clip.count > 0);
+                    assert(@as(u64, op.clip.first) + op.clip.count <= program.samples.len);
+                    assert(op.low <= op.high);
+                },
             }
         }
         assert(offset == program.slab_count);
         assert(program.simulated == (simulated_count > 0));
         if (program.simulated) assert(program.start.index < program.cues.count);
+    }
+
+    /// Fills `out[i]` with a range that node i's values never leave, at any time, for any cue
+    /// placement and read order, as `range.zig` explains. `out.len` must be at least the node
+    /// count. A delay's loop is solved as a fixed point: up to `delay_rounds_max` passes widening
+    /// each delay to the hull of its initial value and its input, then up to `widen_rounds_max`
+    /// passes trying ever wider ranges for the delays, accepting the first that the loop maps into
+    /// itself, which is then a bound by induction over the steps. A loop that never settles has
+    /// infinite ends. Not for the realtime path, though bounded and allocating nothing.
+    pub fn ranges(program: *const Program, out: []Range) void {
+        assert(out.len >= program.nodes.len);
+        const result = out[0..program.nodes.len];
+        for (program.nodes, result) |*node, *range| switch (node.op) {
+            .delay => |op| range.* = Range.point(op.initial),
+            else => range.* = Range.unbounded,
+        };
+        for (0..delay_rounds_max) |_| {
+            program.ranges_pass(result);
+            if (program.delays_settle(result)) return;
+        }
+        for (0..widen_rounds_max) |round| {
+            for (program.nodes, result) |*node, *range| {
+                if (node.op == .delay) range.* = widen_round(range.*, round);
+            }
+            program.ranges_pass(result);
+            if (program.delays_cover(result)) return;
+        }
+        for (program.nodes, result) |*node, *range| {
+            if (node.op == .delay) range.* = Range.unbounded;
+        }
+        program.ranges_pass(result);
+        assert(program.delays_cover(result));
+    }
+
+    /// Fills `out[i]` with node i's class: the highest of its own op's and its inputs', as
+    /// `range.zig` explains. A delay's input can come after it, so this repeats to a fixed point;
+    /// a class only rises, at most three times a node, which bounds the passes.
+    pub fn classes(program: *const Program, out: []Class) void {
+        assert(out.len >= program.nodes.len);
+        const result = out[0..program.nodes.len];
+        for (program.nodes, result) |*node, *class| class.* = node.op.class();
+        const rounds_max = 3 * program.nodes.len + 1;
+        for (0..rounds_max) |_| {
+            var changed = false;
+            for (program.nodes, result) |*node, *class| {
+                var highest = class.*;
+                for (node.op.inputs()) |input| {
+                    if (input) |id| highest = highest.max(result[id.index]);
+                }
+                if (highest != class.*) {
+                    class.* = highest;
+                    changed = true;
+                }
+            }
+            if (!changed) return;
+        } else unreachable;
+    }
+
+    /// Whether the program can be reached at any time, and the first node that keeps it from
+    /// being, or that makes a read cost steps.
+    pub fn report(program: *const Program) Report {
+        var result: Report = .{
+            .seekable = true,
+            .live = null,
+            .stepped = false,
+            .first_simulated = null,
+        };
+        for (program.nodes, 0..) |*node, index| {
+            const id: Id = .{ .index = @intCast(index) };
+            switch (node.op.class()) {
+                .live => if (result.live == null) {
+                    result.live = id;
+                    result.seekable = false;
+                },
+                .simulated => if (result.first_simulated == null) {
+                    result.first_simulated = id;
+                    result.stepped = true;
+                },
+                .pure, .exact => {},
+            }
+        }
+        assert(result.stepped == program.simulated);
+        return result;
+    }
+
+    /// One forward pass of `ranges`: every node but a delay, from the ranges before it and the
+    /// delays' ranges as they stand.
+    fn ranges_pass(program: *const Program, result: []Range) void {
+        for (program.nodes, result) |*node, *range| {
+            if (node.op != .delay) range.* = program.node_range(node, result);
+            range.assert_valid();
+        }
+    }
+
+    /// The range each delay needs for its input as `result` stands: the hull of its initial value
+    /// and its input's range, and the margin of the interpolation between steps.
+    fn delay_needs(program: *const Program, op: Delay, result: []const Range) Range {
+        _ = program;
+        const needed = Range.point(op.initial).hull(result[op.input.?.index]);
+        return needed.widen(needed.scale(), range_module.margin_rounding);
+    }
+
+    /// Widens each delay to what it needs, and returns whether none had to.
+    fn delays_settle(program: *const Program, result: []Range) bool {
+        var settled = true;
+        for (program.nodes, result) |*node, *range| switch (node.op) {
+            .delay => |op| {
+                const needed = program.delay_needs(op, result);
+                if (!range.covers(needed)) {
+                    range.* = range.hull(needed);
+                    settled = false;
+                }
+            },
+            else => {},
+        };
+        return settled;
+    }
+
+    /// Whether every delay's range holds what it needs.
+    fn delays_cover(program: *const Program, result: []const Range) bool {
+        for (program.nodes, result) |*node, range| switch (node.op) {
+            .delay => |op| if (!range.covers(program.delay_needs(op, result))) return false,
+            else => {},
+        };
+        return true;
+    }
+
+    /// The range of one node from the ranges of its inputs, by the rules of `range.zig`.
+    fn node_range(program: *const Program, node: *const Node, result: []const Range) Range {
+        return switch (node.op) {
+            .constant => |constant| Range.point(constant),
+            .add => |op| range_module.add(result[op.left.index], result[op.right.index]),
+            .multiply => |op| range_module.multiply(result[op.left.index], result[op.right.index]),
+            .map_range => |*op| map_range_range(op, result[op.input.index]),
+            .wave, .noise => .{ .low = -1, .high = 1 },
+            .tween => |*op| tween_range(op, if (op.previous) |id| result[id.index] else null),
+            .motion => |*op| program.motion_range(op),
+            .chase => |op| range_module.spring(
+                Range.point(op.from).hull(result[op.target.index]),
+                op.law.zeta,
+            ),
+            .follow => |*op| program.follow_range(op),
+            .shift => |op| hull_widened(op.low, op.high),
+            .delay => unreachable,
+            .bounce => |op| switch (op.output) {
+                .position => hull_widened(op.low, op.high),
+                .velocity => .{ .low = -op.speed, .high = op.speed },
+            },
+            .crossing => .{ .low = 0, .high = 1 },
+            .cues => |span| .{ .low = 0, .high = @floatFromInt(span.count) },
+            .input => |op| .{ .low = op.low, .high = op.high },
+            .recorded => |op| .{ .low = op.low, .high = op.high },
+        };
+    }
+
+    /// A spring's or a Newtonian move's range, from its start and its goals.
+    fn motion_range(program: *const Program, op: *const Motion) Range {
+        const path = program.goals[op.goals.first..][0..op.goals.count];
+        var inputs = Range.point(op.from);
+        for (path) |goal| inputs = inputs.hull(Range.point(goal.value));
+        return switch (op.law) {
+            .spring => |law| if (path.len == 1)
+                range_module.spring_one(op.from, path[0].value, law.zeta)
+            else
+                range_module.spring(inputs, law.zeta),
+            .newtonian => |limits| range_module.newtonian(inputs, limits.speed, limits.decel),
+        };
+    }
+
+    /// A follower's range, from its start and its regions, widened by what its mover overshoots.
+    fn follow_range(program: *const Program, op: *const simulation.Follower) Range {
+        var inputs = Range.point(op.from);
+        for (program.regions[op.regions.first..][0..op.regions.count]) |region| {
+            inputs = inputs.hull(Range.of(region.low, region.high));
+        }
+        return switch (op.law) {
+            .spring => |law| range_module.spring(inputs, law.zeta),
+            .newtonian => |limits| range_module.newtonian(inputs, limits.speed, limits.decel),
+        };
     }
 };
 
@@ -523,6 +780,7 @@ pub const Builder = struct {
     cue_table: *const Cues,
     goals: []const Goal,
     regions: []const simulation.Region,
+    samples: []const Sample,
     start: Cue,
     seed: u64,
     /// The extent of every node built, 1 by 1 until a later step gives each node its own.
@@ -540,10 +798,11 @@ pub const Builder = struct {
         SlabCapacityExceeded,
         /// An id that no node built so far has, which also refuses a forward reference.
         UnknownNode,
-        /// A constant or a parameter that is infinite or NaN.
+        /// A constant or a parameter that is infinite or NaN, or an input end that is NaN.
         NotFinite,
-        /// A map whose input range has no width, or one too wide for a double, or a bounce whose
-        /// low is not below its high.
+        /// A map whose input range has no width, or one too wide for a double, a bounce whose low
+        /// is not below its high, or an input whose low is above its high or whose initial value
+        /// is outside them.
         InvalidRange,
         /// A cue that the table given in `Options` does not have, including the start cue of a
         /// simulated node, and a cue span that is empty or runs past the table.
@@ -578,6 +837,8 @@ pub const Builder = struct {
         NotADelay,
         /// A `close` of a delay that already has its input.
         DelayClosed,
+        /// A clip that the sample table given in `Options` does not hold.
+        UnknownSamples,
     };
 
     pub const Options = struct {
@@ -589,6 +850,8 @@ pub const Builder = struct {
         goals: []const Goal = &.{},
         /// The regions that followers draw goals from, from `Regions.table`.
         regions: []const simulation.Region = &.{},
+        /// The recordings that `recorded` nodes play back, from `Samples.table`.
+        samples: []const Sample = &.{},
         /// The cue every simulated node starts at, as section 9 explains.
         start: Cue = .{ .index = 0 },
         /// Hashed into the seed of every noise, follower, and shift register, as section 7
@@ -606,6 +869,7 @@ pub const Builder = struct {
             .cue_table = options.cues,
             .goals = options.goals,
             .regions = options.regions,
+            .samples = options.samples,
             .start = options.start,
             .seed = options.seed,
             .extent = .{ .lanes = 1, .components = 1 },
@@ -769,16 +1033,16 @@ pub const Builder = struct {
 
     /// Gives the delay `delay_id` its input, which can be any node built so far, before or after
     /// the delay, itself included.
-    pub fn close(builder: *Builder, delay_id: Id, input: Id) Error!void {
+    pub fn close(builder: *Builder, delay_id: Id, input_id: Id) Error!void {
         assert(!builder.finished);
         try builder.check_known(delay_id);
-        try builder.check_known(input);
+        try builder.check_known(input_id);
         const node = &builder.nodes[delay_id.index];
         switch (node.op) {
             .delay => |*op| {
                 if (op.input != null) return error.DelayClosed;
                 assert(builder.delays_open > 0);
-                op.input = input;
+                op.input = input_id;
                 builder.delays_open -= 1;
             },
             else => return error.NotADelay,
@@ -836,6 +1100,29 @@ pub const Builder = struct {
         return builder.push(.{ .cues = span });
     }
 
+    /// A live value, set by `State.set_input` each read, as section 12 explains. A program with
+    /// one is not seekable.
+    pub fn input(builder: *Builder, source: Input) Error!Id {
+        if (std.math.isNan(source.low) or std.math.isNan(source.high)) return error.NotFinite;
+        if (!std.math.isFinite(source.initial)) return error.NotFinite;
+        if (source.low > source.high) return error.InvalidRange;
+        if (source.initial < source.low or source.initial > source.high) return error.InvalidRange;
+        return builder.push(.{ .input = source });
+    }
+
+    /// The clip `clip` of the sample table played back, a pure signal, as `recording.zig`
+    /// explains.
+    pub fn recorded(builder: *Builder, clip: recording_module.Clip) Error!Id {
+        if (clip.count == 0) return error.UnknownSamples;
+        if (clip.first > builder.samples.len) return error.UnknownSamples;
+        if (clip.count > builder.samples.len - clip.first) return error.UnknownSamples;
+        var hull = Range.point(builder.samples[clip.first].value);
+        for (builder.samples[clip.first..][0..clip.count]) |sample| {
+            hull = hull.hull(Range.point(sample.value));
+        }
+        return builder.push(.{ .recorded = .{ .clip = clip, .low = hull.low, .high = hull.high } });
+    }
+
     fn check_goals(builder: *const Builder, path: motion.Path, from: f64) Error!void {
         if (!std.math.isFinite(from)) return error.NotFinite;
         if (path.count == 0) return error.UnknownGoals;
@@ -862,6 +1149,7 @@ pub const Builder = struct {
             .cues = builder.cue_table,
             .goals = builder.goals,
             .regions = builder.regions,
+            .samples = builder.samples,
             .start = builder.start,
             .simulated = builder.simulated,
             .slab_count = builder.slab_count,
@@ -915,6 +1203,61 @@ fn newtonian_limits(speed: f64, accel: f64, decel: f64) Builder.Error!motion.Lim
     return .{ .speed = speed, .accel = accel, .decel = decel };
 }
 
+/// Passes of `Program.ranges` that widen each delay to what it needs, before it tries wider ranges.
+const delay_rounds_max = 16;
+
+/// Passes of `Program.ranges` that try wider ranges for the delays: from 2^-40 of an end's
+/// magnitude, doubling, which passes the largest f64 well within this many.
+const widen_rounds_max = 1100;
+
+/// A delay's range for widening round `round`: each finite end moved out by 2^(round - 40) of its
+/// magnitude, or of 1 if it is smaller.
+fn widen_round(range: Range, round: usize) Range {
+    assert(round < widen_rounds_max);
+    const factor = std.math.ldexp(@as(f64, 1), @as(i32, @intCast(round)) - 40);
+    return .{
+        .low = range.low - @max(@abs(range.low), 1) * factor,
+        .high = range.high + @max(@abs(range.high), 1) * factor,
+    };
+}
+
+/// The hull of two ends, with the margin of an interpolation between them.
+fn hull_widened(a: f64, b: f64) Range {
+    const hull = Range.of(a, b);
+    return hull.widen(hull.scale(), range_module.margin_rounding);
+}
+
+/// The range of a map: its input's ends mapped, in order, with the margin of its form, relative to
+/// the larger output end and to how far past the input range the ends reach.
+fn map_range_range(map: *const MapRange, input: Range) Range {
+    const width = map.input_high - map.input_low;
+    const low = (input.low - map.input_low) / width;
+    const high = (input.high - map.input_low) / width;
+    const result = Range.of(
+        map.output_low * (1 - low) + map.output_high * low,
+        map.output_low * (1 - high) + map.output_high * high,
+    );
+    const outputs = @max(@abs(map.output_low), @abs(map.output_high));
+    const reach = @max(1, @max(@abs(low), @abs(high)));
+    return result.widen(@max(result.scale(), outputs * reach), range_module.margin_rounding);
+}
+
+/// The range of a tween: `from`, `to`, and the form at the eased progress's extremes, which the
+/// cubic Bezier keeps within the hull of 0, its two y controls, and 1, then `previous` before it.
+fn tween_range(tween: *const Tween, previous: ?Range) Range {
+    const eased_low = @min(0, @min(tween.ease.y1, tween.ease.y2));
+    const eased_high = @max(1, @max(tween.ease.y1, tween.ease.y2));
+    const ends = Range.of(tween.from, tween.to);
+    const result = ends.hull(Range.of(
+        tween.from * (1 - eased_low) + tween.to * eased_low,
+        tween.from * (1 - eased_high) + tween.to * eased_high,
+    ));
+    const reach = @max(@abs(eased_low), eased_high);
+    const magnitude = @max(result.scale(), ends.scale() * reach);
+    const widened = result.widen(magnitude, range_module.margin_rounding);
+    return if (previous) |range| widened.hull(range) else widened;
+}
+
 /// The whole steps that `duration`, at least zero, lasts, rounded up.
 fn steps_rounded_up(duration: Time) u64 {
     assert(duration.flicks >= 0);
@@ -937,6 +1280,17 @@ pub const State = struct {
     generation: u64,
     /// Steps run since `init`, for measuring what reads cost.
     steps_run: u64,
+    /// The recordings `record` attached, each of one input, as section 12 explains.
+    recordings: [recordings_max]Attached,
+    recordings_count: u32,
+
+    /// The most recordings a state writes at once.
+    pub const recordings_max = 8;
+
+    const Attached = struct {
+        input: Id,
+        recording: *Recording,
+    };
 
     /// `slab` needs at least `program.slab_count` values, and only those are used. A simulated
     /// program has no checkpoints this way, so each read before the slab's own step runs every
@@ -952,6 +1306,10 @@ pub const State = struct {
         program.assert_valid();
         const slab_used = slab[0..program.slab_count];
         @memset(slab_used, 0);
+        for (program.nodes) |*node| switch (node.op) {
+            .input => |op| @memset(slab_used[node.offset..][0..node.extent.count()], op.initial),
+            else => {},
+        };
         var room: usize = 0;
         if (program.simulated) {
             room = @min(checkpoints.len / program.slab_count, std.math.maxInt(u32));
@@ -965,7 +1323,39 @@ pub const State = struct {
             .step = null,
             .generation = program.cues.generation,
             .steps_run = 0,
+            .recordings = undefined,
+            .recordings_count = 0,
         };
+    }
+
+    /// Sets every lane of the input `id` to `value`, clamped into its declared range, until set
+    /// again, as section 12 explains.
+    pub fn set_input(state: *State, id: Id, to: f64) void {
+        assert(id.index < state.program.nodes.len);
+        assert(!std.math.isNan(to));
+        const node = &state.program.nodes[id.index];
+        const op = node.op.input;
+        const clamped = std.math.clamp(to, op.low, op.high);
+        assert(std.math.isFinite(clamped));
+        @memset(state.slab[node.offset..][0..node.extent.count()], clamped);
+    }
+
+    /// From now on, each committed pass that reads the input `id` notes its time and value in
+    /// `recording`, as `recording.zig` explains.
+    pub fn record(state: *State, id: Id, recording: *Recording) void {
+        assert(id.index < state.program.nodes.len);
+        assert(state.program.nodes[id.index].op == .input);
+        assert(state.recordings_count < recordings_max);
+        state.recordings[state.recordings_count] = .{ .input = id, .recording = recording };
+        state.recordings_count += 1;
+    }
+
+    /// Notes what a committed pass at `time` read of each recorded input.
+    fn record_pass(state: *State, time: Time) void {
+        for (state.recordings[0..state.recordings_count]) |attached| {
+            const node = &state.program.nodes[attached.input.index];
+            attached.recording.add(time, state.slab[node.offset]);
+        }
     }
 
     /// Fills the slab with every node's value at `time`. A reader can ask for any time in any
@@ -975,6 +1365,7 @@ pub const State = struct {
         var weight: f64 = 0;
         if (state.program.simulated) weight = state.simulate_to(time);
         pass(&state.program, state.slab, time, .{ .between = weight });
+        state.record_pass(time);
         state.evaluated = true;
     }
 
@@ -1003,7 +1394,7 @@ pub const State = struct {
         var collector = Collector.init(out);
         state.evaluated = false;
         if (t0.flicks == t1.flicks) return collector.result();
-        var report: Report = .{ .collector = &collector, .t0 = t0, .t1 = t1 };
+        var report: Found = .{ .collector = &collector, .t0 = t0, .t1 = t1 };
         for (state.program.nodes, 0..) |*node, index| {
             const id: Id = .{ .index = @intCast(index) };
             switch (node.op) {
@@ -1073,12 +1464,13 @@ pub const State = struct {
 
     /// Runs the steps from the slab's own step to `target`, storing each checkpoint it passes,
     /// and giving the events found at each step it leaves to `report`.
-    fn advance_to(state: *State, target: u64, start: Time, report: ?*Report) void {
+    fn advance_to(state: *State, target: u64, start: Time, report: ?*Found) void {
         const interval = simulation.checkpoint_interval;
         var live = state.step.?;
         assert(live <= target);
         while (live < target) {
             step_once(&state.program, state.slab, start, live, report);
+            state.record_pass(step_time(start, live));
             live += 1;
             state.steps_run += 1;
             if (live % interval == 0) state.store(live / interval);
@@ -1090,7 +1482,7 @@ pub const State = struct {
     /// The events of the simulated nodes in the range of `report`, as section 11 explains: a seek
     /// to the first step whose events can be in the range, the steps of the range, each giving
     /// its events, then a read-only look at the last step, which commits nothing.
-    fn events_simulated(state: *State, report: *Report) void {
+    fn events_simulated(state: *State, report: *Found) void {
         const start = state.simulation_start();
         const first = step_ceiling(start, report.t0);
         const last = step_ceiling(start, report.t1);
@@ -1115,15 +1507,21 @@ pub const State = struct {
         state.checkpoints_filled += 1;
     }
 
-    /// Puts the slab at checkpoint `index`, where checkpoint 0 is the start, rebuilt.
+    /// Puts the slab at checkpoint `index`, where checkpoint 0 is the start, rebuilt. An input
+    /// keeps the value set last, since it has no past, as section 12 explains.
     fn restore(state: *State, index: u64) void {
         assert(index <= state.checkpoints_filled);
         if (index == 0) {
             for (state.program.nodes) |*node| reset_node(&state.program, state.slab, node);
         } else {
             const size = state.slab.len;
-            const first: usize = @intCast((index - 1) * size);
-            @memcpy(state.slab, state.checkpoints[first..][0..size]);
+            const checkpoint = state.checkpoints[@intCast((index - 1) * size)..][0..size];
+            for (state.program.nodes) |*node| {
+                if (node.op == .input) continue;
+                const count = node.extent.count() + node.op.cache_count(node.extent.count());
+                const region = state.slab[node.offset..][0..@intCast(count)];
+                @memcpy(region, checkpoint[node.offset..][0..@intCast(count)]);
+            }
         }
         state.step = index * simulation.checkpoint_interval;
     }
@@ -1140,13 +1538,13 @@ comptime {
 }
 
 /// Where an events query puts what it finds: the collector, and the range it keeps.
-const Report = struct {
+const Found = struct {
     collector: *Collector,
     t0: Time,
     t1: Time,
 
     /// Keeps an event if its time is in the range.
-    fn add(report: *Report, time: Time, source: Id, instance: u32, value: f64) void {
+    fn add(report: *Found, time: Time, source: Id, instance: u32, value: f64) void {
         assert(report.t0.flicks < report.t1.flicks);
         if (time.flicks < report.t0.flicks) return;
         if (time.flicks >= report.t1.flicks) return;
@@ -1161,7 +1559,7 @@ const Report = struct {
 
 /// The hits of a bounce's position in the range: at each wall, the velocity just before it,
 /// `+speed` at `high` and `-speed` at `low`. Once the buffer is full, it counts the rest.
-fn events_bounce(program: *const Program, op: *const BounceNode, id: Id, report: *Report) void {
+fn events_bounce(program: *const Program, op: *const BounceNode, id: Id, report: *Found) void {
     assert(op.output == .position);
     const start_time = program.cues.at(op.start);
     const first = op.hits_before(report.t0, start_time) + 1;
@@ -1186,7 +1584,7 @@ fn events_bounce(program: *const Program, op: *const BounceNode, id: Id, report:
 }
 
 /// The cues of a span in the range, each at its time with its index as the value, in cue order.
-fn events_cues(program: *const Program, span: CueSpan, id: Id, report: *Report) void {
+fn events_cues(program: *const Program, span: CueSpan, id: Id, report: *Found) void {
     const times = program.cues.times[span.first.index..][0..span.count];
     const first = times_before(times, report.t0, .exclusive);
     const last = times_before(times, report.t1, .exclusive);
@@ -1215,7 +1613,7 @@ fn events_motion(
     node: *const Node,
     op: *const Motion,
     id: Id,
-    report: *Report,
+    report: *Found,
 ) void {
     const path = program.goals[op.goals.first..][0..op.goals.count];
     const cues = program.cues;
@@ -1254,7 +1652,7 @@ fn report_step(
     slab: []const f64,
     start: Time,
     index: u64,
-    report: *Report,
+    report: *Found,
 ) void {
     for (program.nodes, 0..) |*node, node_index| {
         const id: Id = .{ .index = @intCast(node_index) };
@@ -1288,7 +1686,7 @@ fn report_crossing(
     inputs: []const f64,
     time: Time,
     id: Id,
-    report: *Report,
+    report: *Found,
 ) void {
     assert(cache.len == inputs.len + 1);
     // Nothing to compare at step 0, before the first update has kept an input.
@@ -1316,7 +1714,7 @@ fn report_shift(
     start: Time,
     index: u64,
     id: Id,
-    report: *Report,
+    report: *Found,
 ) void {
     assert(own.len == 1 + op.buckets);
     if (index == 0) return;
@@ -1403,6 +1801,12 @@ fn eval_node(
             const times = program.cues.times[span.first.index..][0..span.count];
             @memset(out, @floatFromInt(times_before(times, time, .inclusive)));
         },
+        // Set by `State.set_input`, which a pass leaves as it is.
+        .input => {},
+        .recorded => |op| {
+            const clip = program.samples[op.clip.first..][0..op.clip.count];
+            @memset(out, recording_module.play(clip, time));
+        },
     }
 }
 
@@ -1464,7 +1868,7 @@ fn step_ceiling(start: Time, time: Time) u64 {
 /// Runs the step from step `index` to the next: a pass at its time, then an update of every
 /// simulated node from that pass, as section 9 explains. Between the two, the events found at
 /// step `index` go to `report`, as section 11 explains.
-fn step_once(program: *const Program, slab: []f64, start: Time, index: u64, report: ?*Report) void {
+fn step_once(program: *const Program, slab: []f64, start: Time, index: u64, report: ?*Found) void {
     pass(program, slab, step_time(start, index), .at_step);
     if (report) |into| report_step(program, slab, start, index, into);
     for (program.nodes) |*node| {
@@ -1523,7 +1927,7 @@ fn update_node(program: *const Program, slab: []f64, node: *const Node, index: u
             @memset(after, next.value);
         },
         .constant, .add, .multiply, .map_range, .wave, .tween, .noise, .motion => unreachable,
-        .bounce, .cues, .crossing => unreachable,
+        .bounce, .cues, .crossing, .input, .recorded => unreachable,
     }
     for (after) |value| assert(std.math.isFinite(value));
 }
@@ -1561,7 +1965,7 @@ fn reset_node(program: *const Program, slab: []f64, node: *const Node) void {
             @memset(after, simulation.shift_value(op, own[1..], position));
         },
         .constant, .add, .multiply, .map_range, .wave, .tween, .noise, .motion => unreachable,
-        .bounce, .cues, .crossing => unreachable,
+        .bounce, .cues, .crossing, .input, .recorded => unreachable,
     }
     @memcpy(before, after);
 }
@@ -1812,6 +2216,7 @@ test "moving the memory changes nothing" {
         .cues = &Cues.empty,
         .goals = &.{},
         .regions = &.{},
+        .samples = &.{},
         .start = .{ .index = 0 },
         .simulated = false,
         .slab_count = program.slab_count,
@@ -1825,6 +2230,8 @@ test "moving the memory changes nothing" {
         .step = null,
         .generation = 0,
         .steps_run = 0,
+        .recordings = undefined,
+        .recordings_count = 0,
     };
     try testing.expectEqual(expected, state_checkpoint.value(output));
 
@@ -2348,6 +2755,7 @@ test "a motion's cursor never changes a value" {
         .cues = &track.cues,
         .goals = track.goals.table(),
         .regions = &.{},
+        .samples = &.{},
         .start = .{ .index = 0 },
         .simulated = false,
         .slab_count = 2 * (1 + motion.cursor_count),
@@ -2395,6 +2803,7 @@ test "springs ignore the frame rate" {
         .cues = &track.cues,
         .goals = track.goals.table(),
         .regions = &.{},
+        .samples = &.{},
         .start = .{ .index = 0 },
         .simulated = false,
         .slab_count = 2 * (1 + motion.cursor_count),
@@ -2427,6 +2836,7 @@ test "moving a cue reaches a motion's cursor" {
         .cues = &track.cues,
         .goals = track.goals.table(),
         .regions = &.{},
+        .samples = &.{},
         .start = .{ .index = 0 },
         .simulated = false,
         .slab_count = 2 * (1 + motion.cursor_count),
@@ -3124,6 +3534,7 @@ test "a bounce hits its walls at exact flicks" {
         .cues = &cues,
         .goals = &.{},
         .regions = &.{},
+        .samples = &.{},
         .start = .{ .index = 0 },
         .simulated = false,
         .slab_count = 2,
@@ -3484,6 +3895,7 @@ test "overflow keeps the earliest events and counts the rest exactly" {
         .cues = &cues,
         .goals = &.{},
         .regions = &.{},
+        .samples = &.{},
         .start = .{ .index = 0 },
         .simulated = false,
         .slab_count = 2,
@@ -3554,6 +3966,7 @@ test "a crossing fires where its input crosses, in the step" {
             .cues = &cues,
             .goals = &.{},
             .regions = &.{},
+            .samples = &.{},
             .start = .{ .index = 0 },
             .simulated = true,
             .slab_count = 4,
@@ -3970,4 +4383,650 @@ test "the builder refuses an event source it cannot evaluate" {
     var room = Builder.init(&nodes, .{ .slab_count_max = 2, .cues = &fixture.cues });
     const ids = try room.bounce(bounce);
     try testing.expectEqual(@as(u32, 1), ids.velocity.index);
+}
+
+/// The ranges of a finished program, for the tests of section 12.
+fn ranges_of(program: *const Program, out: []Range) []const Range {
+    program.ranges(out);
+    return out[0..program.nodes.len];
+}
+
+// Locks the worked ranges: exact for a wave, a sum of two, and `x * x`, which interval arithmetic
+// gives as [-1, 1]; a one-goal spring at 16.3% overshoot reaches 1.163 and not below its start; a
+// critical spring with three goals is the hull of its goals; a Newtonian move is its hull widened
+// by its stopping distance, speed^2 / (2 decel) = 2.
+test "worked ranges are exact or within their margin" {
+    var cue_times: [3]Time = undefined;
+    var cues = Cues.init(&cue_times);
+    for (0..3) |index| {
+        _ = try cues.add(.{ .flicks = @as(i64, @intCast(index)) * flicks_per_second });
+    }
+    var goal_entries: [5]Goal = undefined;
+    var goals = motion.Goals.init(&goal_entries);
+    const one = try goals.add(&.{.{ .cue = .{ .index = 0 }, .value = 1 }});
+    const three = try goals.add(&.{
+        .{ .cue = .{ .index = 0 }, .value = 1 },
+        .{ .cue = .{ .index = 1 }, .value = -0.5 },
+        .{ .cue = .{ .index = 2 }, .value = 0.25 },
+    });
+    const glide = try goals.add(&.{.{ .cue = .{ .index = 0 }, .value = 2 }});
+    var nodes: [8]Node = undefined;
+    var builder = Builder.init(&nodes, .{
+        .slab_count_max = 64,
+        .cues = &cues,
+        .goals = goals.table(),
+    });
+    const wave = try builder.wave(carrier);
+    const sum = try builder.add(wave, wave);
+    const square = try builder.multiply(wave, wave);
+    const os = range_module.overshoot(0.5);
+    // The overshoot that gives a damping ratio of 0.5 exactly.
+    const second: Time = .{ .flicks = flicks_per_second };
+    const bouncy = try builder.spring(.{
+        .from = 0,
+        .goals = one,
+        .time = second,
+        .overshoot = os,
+    });
+    const critical = try builder.spring(.{
+        .from = 0,
+        .goals = three,
+        .time = second,
+        .overshoot = 0,
+    });
+    const newtonian = try builder.newtonian(.{
+        .from = 0,
+        .goals = glide,
+        .speed = 4,
+        .accel = 2,
+        .decel = 4,
+    });
+    const program = builder.finish();
+    var out: [8]Range = undefined;
+    const result = ranges_of(&program, &out);
+    try testing.expectEqual(Range{ .low = -1, .high = 1 }, result[wave.index]);
+    try testing.expectEqual(Range{ .low = -2, .high = 2 }, result[sum.index]);
+    try testing.expectEqual(Range{ .low = -1, .high = 1 }, result[square.index]);
+    try testing.expectApproxEqAbs(@as(f64, 0.163), os, 0.0005);
+    try testing.expect(result[bouncy.index].high >= 1 + os);
+    try testing.expectApproxEqAbs(1 + os, result[bouncy.index].high, 1e-10);
+    try testing.expect(result[bouncy.index].low <= 0);
+    try testing.expectApproxEqAbs(@as(f64, 0), result[bouncy.index].low, 1e-10);
+    try testing.expectApproxEqAbs(@as(f64, -0.5), result[critical.index].low, 1e-10);
+    try testing.expectApproxEqAbs(@as(f64, 1), result[critical.index].high, 1e-10);
+    try testing.expectApproxEqAbs(@as(f64, -2), result[newtonian.index].low, 1e-10);
+    try testing.expectApproxEqAbs(@as(f64, 4), result[newtonian.index].high, 1e-10);
+}
+
+/// A critical chase of `1 + gain * delay(chase)`, from 0, returning the chase.
+fn build_loop(builder: *Builder, gain: f64, overshoot: f64) Builder.Error!Id {
+    const echo = try builder.delay(0);
+    const scaled = try builder.multiply(echo, try builder.constant(gain));
+    const target = try builder.add(try builder.constant(1), scaled);
+    const result = try builder.chase(.{
+        .target = target,
+        .from = 0,
+        .time = .{ .flicks = flicks_per_second / 2 },
+        .overshoot = overshoot,
+    });
+    try builder.close(echo, result);
+    return result;
+}
+
+// Locks the fixed point of a delay's loop: a critical chase of 1 - 0.8 times its own delay has a
+// finite range that holds [0, 1], and one of 1 + 1.25 times its delay, which grows without end,
+// has an infinite one.
+test "a loop through a delay has a finite range only when it settles" {
+    var times: [1]Time = undefined;
+    const cues = try cue_table_at_zero(&times);
+    var nodes: [6]Node = undefined;
+    var builder = Builder.init(&nodes, .{ .slab_count_max = 32, .cues = &cues });
+    const settling = try build_loop(&builder, -0.8, 0);
+    const program = builder.finish();
+    var out: [6]Range = undefined;
+    const result = ranges_of(&program, &out);
+    try testing.expect(std.math.isFinite(result[settling.index].low));
+    try testing.expect(std.math.isFinite(result[settling.index].high));
+    try testing.expect(result[settling.index].covers(.{ .low = 0, .high = 1 }));
+    try testing.expect(result[settling.index].high < 1 + 1e-9);
+
+    var nodes_growing: [6]Node = undefined;
+    var growing_builder = Builder.init(&nodes_growing, .{ .slab_count_max = 32, .cues = &cues });
+    const growing = try build_loop(&growing_builder, 1.25, 0);
+    const growing_program = growing_builder.finish();
+    const growing_result = ranges_of(&growing_program, &out);
+    try testing.expectEqual(std.math.inf(f64), growing_result[growing.index].high);
+}
+
+// Locks that classes rise through inputs, a delay's included: a wave plus a spring is exact, a
+// chase plus an input is live, and a delay closed onto a live node is live, as is what reads it.
+// The report names the first live node and the first simulated one.
+test "classes rise through inputs, and the report names the live node" {
+    var times: [1]Time = undefined;
+    const cues = try cue_table_at_zero(&times);
+    var goal_entries: [1]Goal = undefined;
+    var goals = motion.Goals.init(&goal_entries);
+    const path = try goals.add(&.{.{ .cue = .{ .index = 0 }, .value = 1 }});
+    var nodes: [10]Node = undefined;
+    var builder = Builder.init(&nodes, .{
+        .slab_count_max = 64,
+        .cues = &cues,
+        .goals = goals.table(),
+    });
+    const wave = try builder.wave(carrier);
+    const second: Time = .{ .flicks = flicks_per_second };
+    const spring = try builder.spring(.{
+        .from = 0,
+        .goals = path,
+        .time = second,
+        .overshoot = 0,
+    });
+    const exact = try builder.add(wave, spring);
+    const echo = try builder.delay(0);
+    const after_echo = try builder.add(echo, wave);
+    const chased = try builder.chase(.{
+        .target = wave,
+        .from = 0,
+        .time = second,
+        .overshoot = 0,
+    });
+    const live = try builder.input(.{ .low = -1, .high = 1 });
+    const mixed = try builder.add(chased, live);
+    try builder.close(echo, mixed);
+    const program = builder.finish();
+    var classes: [10]Class = undefined;
+    program.classes(&classes);
+    try testing.expectEqual(Class.pure, classes[wave.index]);
+    try testing.expectEqual(Class.exact, classes[spring.index]);
+    try testing.expectEqual(Class.exact, classes[exact.index]);
+    try testing.expectEqual(Class.simulated, classes[chased.index]);
+    try testing.expectEqual(Class.live, classes[mixed.index]);
+    try testing.expectEqual(Class.live, classes[echo.index]);
+    try testing.expectEqual(Class.live, classes[after_echo.index]);
+    const report = program.report();
+    try testing.expect(!report.seekable);
+    try testing.expectEqual(live, report.live.?);
+    try testing.expect(report.stepped);
+    try testing.expectEqual(echo, report.first_simulated.?);
+
+    var pure_nodes: [4]Node = undefined;
+    var pure_builder = Builder.init(&pure_nodes, .{ .slab_count_max = 8 });
+    _ = try build_tremolo(&pure_builder);
+    const pure_report = pure_builder.finish().report();
+    try testing.expect(pure_report.seekable);
+    try testing.expect(!pure_report.stepped);
+    try testing.expectEqual(@as(?Id, null), pure_report.live);
+}
+
+// Locks the input's contract: a value outside its range reads as the nearest end, it keeps the
+// value set last through a checkpoint restore, since it has no past, and a backward read while
+// recording counts a drop and keeps the table in order.
+test "an input is clamped, keeps its value, and records forward only" {
+    var times: [1]Time = undefined;
+    const cues = try cue_table_at_zero(&times);
+    var nodes: [2]Node = undefined;
+    var builder = Builder.init(&nodes, .{ .slab_count_max = 8, .cues = &cues });
+    const live = try builder.input(.{ .low = 0, .high = 1, .initial = 0.5 });
+    const chased = try builder.chase(.{
+        .target = live,
+        .from = 0,
+        .time = .{ .flicks = flicks_per_second },
+        .overshoot = 0,
+    });
+    const program = builder.finish();
+    var out: [2]Range = undefined;
+    try testing.expectEqual(Range{ .low = 0, .high = 1 }, ranges_of(&program, &out)[live.index]);
+    var slab: [8]f64 = undefined;
+    var checkpoints: [4 * 8]f64 = undefined;
+    var state = State.init_with_checkpoints(program, &slab, &checkpoints);
+    var entries: [8]Sample = undefined;
+    var recording = Recording.init(&entries);
+    state.record(live, &recording);
+    state.eval(.{ .flicks = 0 });
+    try testing.expectEqual(@as(f64, 0.5), state.value(live));
+    state.set_input(live, 2);
+    state.eval(.{ .flicks = 3 * flicks_per_second });
+    try testing.expectEqual(@as(f64, 1), state.value(live));
+    try testing.expect(recording.complete());
+    state.set_input(live, -3);
+    state.eval(.{ .flicks = flicks_per_second + flicks_per_second / 3 });
+    try testing.expectEqual(@as(f64, 0), state.value(live));
+    try testing.expect(state.value(chased) > 0);
+    try testing.expect(!recording.complete());
+    const table = recording.table();
+    for (table[1..], table[0 .. table.len - 1]) |later, earlier| {
+        try testing.expect(later.time.flicks >= earlier.time.flicks);
+    }
+}
+
+/// The value a recorded run sets for read `index`, a seeded draw in [-1.5, 1.5], so some are
+/// clamped.
+fn live_value(index: u64) f64 {
+    const bits = noise_hash(0x11fe, index);
+    return @as(f64, @floatFromInt(bits >> 11)) * 0x1p-53 * 3 - 1.5;
+}
+
+/// An input, or a recording of one, feeding a chase and a crossing, starting at a cue half a step
+/// after 0.25 s. Returns the source, the chase, and the crossing.
+fn build_listener(builder: *Builder, clip: ?recording_module.Clip) Builder.Error![3]Id {
+    const source = if (clip) |played|
+        try builder.recorded(played)
+    else
+        try builder.input(.{ .low = -1, .high = 1 });
+    const chased = try builder.chase(.{
+        .target = source,
+        .from = 0,
+        .time = .{ .flicks = flicks_per_second / 3 },
+        .overshoot = 0.1,
+    });
+    const gate = try builder.crossing(.{ .input = chased, .level = 0.2, .direction = .both });
+    return .{ source, chased, gate };
+}
+
+// Locks the page's third check: a live input set each read at 60 Hz for 10 s, recorded, then
+// played back by a `recorded` node in its place and read at the same times, gives every value
+// bit for bit. The recording is seekable: read in a drawn order it gives the same values, and its
+// events are the same however the range is split.
+test "a recorded run equals the live run, value for value" {
+    var times: [1]Time = undefined;
+    var cues = Cues.init(&times);
+    _ = try cues.add(.{ .flicks = flicks_per_second / 4 + simulation.step.flicks / 2 });
+    const reads = 600;
+    var live_nodes: [3]Node = undefined;
+    var live_builder = Builder.init(&live_nodes, .{ .slab_count_max = 16, .cues = &cues });
+    const live_ids = try build_listener(&live_builder, null);
+    const live_program = live_builder.finish();
+    var slab: [16]f64 = undefined;
+    var checkpoints: [12 * 16]f64 = undefined;
+    var state = State.init_with_checkpoints(live_program, &slab, &checkpoints);
+    var entries: [2 * reads]Sample = undefined;
+    var recording = Recording.init(&entries);
+    state.record(live_ids[0], &recording);
+    var values: [reads][3]f64 = undefined;
+    const rate = Rate.from_hz(60).?;
+    for (&values, 0..) |*row, index| {
+        state.set_input(live_ids[0], live_value(index));
+        state.eval(Time.from_ticks(@intCast(index), rate).?);
+        for (row, live_ids) |*value, id| value.* = state.value(id);
+    }
+    try testing.expect(recording.complete());
+
+    var sample_entries: [2 * reads]Sample = undefined;
+    var samples = recording_module.Samples.init(&sample_entries);
+    const clip = try samples.add(recording.table());
+    var nodes: [3]Node = undefined;
+    var builder = Builder.init(&nodes, .{
+        .slab_count_max = 16,
+        .cues = &cues,
+        .samples = samples.table(),
+    });
+    const ids = try build_listener(&builder, clip);
+    const program = builder.finish();
+    try testing.expect(program.report().seekable);
+    var replay_slab: [16]f64 = undefined;
+    var replay_checkpoints: [12 * 16]f64 = undefined;
+    var replay = State.init_with_checkpoints(program, &replay_slab, &replay_checkpoints);
+    for (values, 0..) |row, index| {
+        replay.eval(Time.from_ticks(@intCast(index), rate).?);
+        for (row, ids) |value, id| try testing.expectEqual(value, replay.value(id));
+    }
+    var prng = std.Random.DefaultPrng.init(8);
+    var seek = State.init(program, &replay_slab);
+    for (0..200) |_| {
+        const index = prng.random().uintLessThan(usize, reads);
+        seek.eval(Time.from_ticks(@intCast(index), rate).?);
+        for (values[index], ids) |value, id| try testing.expectEqual(value, seek.value(id));
+    }
+    const end: Time = .{ .flicks = 10 * flicks_per_second };
+    const whole = try events_at_once(program, end, &events_whole);
+    try testing.expect(whole.len > 0);
+    const joined = try events_split(program, end, .{ .drawn = 5 }, 6, &events_joined);
+    try testing.expectEqualSlices(Event, whole, joined);
+}
+
+// Locks the refusals of an input and a recorded node by name, and that nothing is built.
+test "the builder refuses an input or a recording it cannot evaluate" {
+    var sample_entries: [1]Sample = .{.{ .time = .{ .flicks = 0 }, .value = 1 }};
+    var nodes: [1]Node = undefined;
+    var builder = Builder.init(&nodes, .{ .slab_count_max = 4, .samples = &sample_entries });
+    const nan = std.math.nan(f64);
+    const inf = std.math.inf(f64);
+    try testing.expectError(error.NotFinite, builder.input(.{ .low = nan }));
+    try testing.expectError(error.NotFinite, builder.input(.{ .high = nan }));
+    try testing.expectError(error.NotFinite, builder.input(.{ .initial = inf }));
+    const reversed: Input = .{ .low = 1, .high = 0, .initial = 0.5 };
+    try testing.expectError(error.InvalidRange, builder.input(reversed));
+    try testing.expectError(error.InvalidRange, builder.input(.{ .low = 1, .high = 2 }));
+    try testing.expectError(error.UnknownSamples, builder.recorded(.{ .first = 0, .count = 0 }));
+    try testing.expectError(error.UnknownSamples, builder.recorded(.{ .first = 0, .count = 2 }));
+    try testing.expectError(error.UnknownSamples, builder.recorded(.{ .first = 2, .count = 1 }));
+    try testing.expectEqual(@as(u32, 0), builder.node_count);
+    const played = try builder.recorded(.{ .first = 0, .count = 1 });
+    const program = builder.finish();
+    var out: [1]Range = undefined;
+    try testing.expectEqual(Range.point(1), ranges_of(&program, &out)[played.index]);
+}
+
+/// One graph drawn for the randomized range test: its tables, nodes, and the inputs to set.
+const Drawn = struct {
+    cue_times: [3]Time,
+    cues: Cues,
+    goal_entries: [24]Goal,
+    goals: motion.Goals,
+    region_entries: [16]simulation.Region,
+    regions: simulation.Regions,
+    sample_entries: [32]Sample,
+    samples: recording_module.Samples,
+    nodes: [nodes_max]Node,
+    program: Program,
+
+    const nodes_max = 12;
+    const slab_count_max = 256;
+
+    fn init(drawn: *Drawn, random: std.Random) !void {
+        drawn.cues = Cues.init(&drawn.cue_times);
+        inline for (.{ 1, 3, 6 }) |half_seconds| {
+            _ = try drawn.cues.add(.{ .flicks = @divExact(half_seconds * flicks_per_second, 2) });
+        }
+        drawn.goals = motion.Goals.init(&drawn.goal_entries);
+        drawn.regions = simulation.Regions.init(&drawn.region_entries);
+        drawn.samples = recording_module.Samples.init(&drawn.sample_entries);
+        // Tables first, since the builder holds them as slices.
+        var paths: [8]motion.Path = undefined;
+        for (&paths) |*path| {
+            const count = random.intRangeAtMost(u32, 1, 3);
+            var goals: [3]Goal = undefined;
+            for (goals[0..count], 0..) |*goal, index| {
+                goal.* = .{ .cue = .{ .index = @intCast(index) }, .value = between(random, -2, 2) };
+            }
+            path.* = try drawn.goals.add(goals[0..count]);
+        }
+        var spans: [8]simulation.Span = undefined;
+        for (&spans) |*span| {
+            const count = random.intRangeAtMost(u32, 1, 2);
+            var regions: [2]simulation.Region = undefined;
+            for (regions[0..count]) |*region| {
+                region.* = .{ .low = between(random, -2, 2), .high = between(random, -2, 2) };
+            }
+            span.* = try drawn.regions.add(regions[0..count]);
+        }
+        var clips: [8]recording_module.Clip = undefined;
+        for (&clips) |*clip| {
+            const count = random.intRangeAtMost(u32, 1, 4);
+            var samples: [4]Sample = undefined;
+            var flicks: i64 = 0;
+            for (samples[0..count]) |*sample| {
+                flicks += random.intRangeLessThan(i64, 0, flicks_per_second);
+                sample.* = .{ .time = .{ .flicks = flicks }, .value = between(random, -2, 2) };
+            }
+            clip.* = try drawn.samples.add(samples[0..count]);
+        }
+        var builder = Builder.init(&drawn.nodes, .{
+            .slab_count_max = slab_count_max,
+            .cues = &drawn.cues,
+            .goals = drawn.goals.table(),
+            .regions = drawn.regions.table(),
+            .samples = drawn.samples.table(),
+            .seed = random.int(u64),
+        });
+        const count = random.intRangeAtMost(u32, 2, nodes_max - 1);
+        while (builder.node_count < count) {
+            try draw_node(&builder, random, &paths, &spans, &clips);
+        }
+        drawn.program = builder.finish();
+    }
+
+    /// Adds one drawn node, or two for a bounce. A delay is closed at once onto a node before it,
+    /// or onto itself, so the randomized graphs have no loop that can grow without end; the loop
+    /// test below covers loops.
+    fn draw_node(
+        builder: *Builder,
+        random: std.Random,
+        paths: []const motion.Path,
+        spans: []const simulation.Span,
+        clips: []const recording_module.Clip,
+    ) !void {
+        const any: Id = .{ .index = random.uintLessThan(u32, @max(builder.node_count, 1)) };
+        const cue: Cue = .{ .index = random.uintLessThan(u32, 3) };
+        const seconds = struct {
+            fn of(r: std.Random, low: f64, high: f64) Time {
+                const flicks = between(r, low, high) * flicks_per_second_float;
+                return .{ .flicks = @intFromFloat(flicks) };
+            }
+        }.of;
+        const other: Id = .{ .index = random.uintLessThan(u32, @max(builder.node_count, 1)) };
+        const choice = if (builder.node_count == 0) 0 else random.uintLessThan(u32, 19);
+        _ = switch (choice) {
+            0 => try builder.constant(between(random, -2, 2)),
+            1 => try builder.add(any, other),
+            2 => try builder.multiply(any, other),
+            3 => try builder.map_range(.{
+                .input = any,
+                .input_low = between(random, -1, 1),
+                .input_high = between(random, 1.5, 3),
+                .output_low = between(random, -3, 3),
+                .output_high = between(random, -3, 3),
+            }),
+            4 => try builder.wave(.{
+                .shape = random.enumValue(@import("wave.zig").Shape),
+                .hz = between(random, 0.1, 5),
+            }),
+            5 => try builder.noise(.{
+                .shape = random.enumValue(@import("noise.zig").Shape),
+                .hz = between(random, 0.1, 5),
+                .seed = random.int(u64),
+            }),
+            6 => try builder.tween(.{
+                .from = between(random, -2, 2),
+                .to = between(random, -2, 2),
+                .duration = seconds(random, 0.1, 2),
+                .ease = .{
+                    .x1 = between(random, 0, 1),
+                    .y1 = between(random, -0.5, 1.5),
+                    .x2 = between(random, 0, 1),
+                    .y2 = between(random, -0.5, 1.5),
+                },
+                .start = cue,
+                .previous = if (random.boolean()) any else null,
+            }),
+            7 => try builder.spring(.{
+                .from = between(random, -2, 2),
+                .goals = paths[random.uintLessThan(usize, paths.len)],
+                .time = seconds(random, 0.1, 1),
+                .overshoot = between(random, 0, 0.6),
+            }),
+            8 => try builder.newtonian(.{
+                .from = between(random, -2, 2),
+                .goals = paths[random.uintLessThan(usize, paths.len)],
+                .speed = between(random, 0.5, 4),
+                .accel = between(random, 0.5, 8),
+                .decel = between(random, 0.5, 8),
+            }),
+            9 => try builder.chase(.{
+                .target = any,
+                .from = between(random, -2, 2),
+                .time = seconds(random, 0.1, 1),
+                .overshoot = between(random, 0, 0.6),
+            }),
+            10 => try builder.follow(.{
+                .from = between(random, -2, 2),
+                .regions = spans[random.uintLessThan(usize, spans.len)],
+                .pick = random.enumValue(simulation.Pick),
+                .mover = if (random.boolean())
+                    .{ .spring = .{
+                        .time = seconds(random, 0.1, 1),
+                        .overshoot = between(random, 0, 0.6),
+                    } }
+                else
+                    .{ .newtonian = .{
+                        .speed = between(random, 0.5, 4),
+                        .accel = between(random, 0.5, 8),
+                        .decel = between(random, 0.5, 8),
+                    } },
+                .tolerance = between(random, 0.01, 0.1),
+                .pause_min = .{ .flicks = 0 },
+                .pause_max = seconds(random, 0, 0.3),
+                .seed = random.int(u64),
+            }),
+            11 => blk: {
+                const buckets = random.intRangeAtMost(u32, 1, 8);
+                const steps = buckets * random.intRangeAtMost(i64, 1, 200);
+                break :blk try builder.shift(.{
+                    .buckets = buckets,
+                    .period = .{ .flicks = steps * simulation.step.flicks },
+                    .low = between(random, -2, 2),
+                    .high = between(random, -2, 2),
+                    .odds = between(random, 0, 1),
+                    .shape = random.enumValue(simulation.ShiftShape),
+                    .seed = random.int(u64),
+                });
+            },
+            12 => blk: {
+                const echo = try builder.delay(between(random, -2, 2));
+                const before: Id = if (echo.index == 0)
+                    echo
+                else
+                    .{ .index = random.uintLessThan(u32, echo.index) };
+                try builder.close(echo, before);
+                break :blk echo;
+            },
+            13 => blk: {
+                if (builder.nodes.len - builder.node_count < 2) break :blk try builder.constant(0);
+                const low = between(random, -2, 1);
+                const ids = try builder.bounce(.{
+                    .low = low,
+                    .high = low + between(random, 0.1, 2),
+                    .speed = between(random, 0.2, 3),
+                    .start = cue,
+                });
+                break :blk ids.position;
+            },
+            14 => try builder.crossing(.{
+                .input = any,
+                .level = between(random, -1, 1),
+                .direction = random.enumValue(Crossing.Direction),
+            }),
+            15 => try builder.cues(.{
+                .first = .{ .index = 0 },
+                .count = random.intRangeAtMost(u32, 1, 3),
+            }),
+            16 => blk: {
+                if (random.boolean()) break :blk try builder.input(.{});
+                const low = between(random, -2, 0);
+                const high = low + between(random, 0, 3);
+                break :blk try builder.input(.{ .low = low, .high = high, .initial = low });
+            },
+            17 => try builder.recorded(clips[random.uintLessThan(usize, clips.len)]),
+            else => try builder.add(any, any),
+        };
+    }
+
+    /// Sets every input of `state` to a drawn value, past its range now and then.
+    fn set_inputs(drawn: *const Drawn, state: *State, random: std.Random) void {
+        for (drawn.program.nodes, 0..) |*node, index| switch (node.op) {
+            .input => |op| {
+                const low = if (std.math.isFinite(op.low)) op.low else -5;
+                const high = if (std.math.isFinite(op.high)) op.high else 5;
+                state.set_input(.{ .index = @intCast(index) }, between(random, low - 1, high + 1));
+            },
+            else => {},
+        };
+    }
+};
+
+fn between(random: std.Random, low: f64, high: f64) f64 {
+    const weight = random.float(f64);
+    return low * (1 - weight) + high * weight;
+}
+
+/// Checks that every value of every node of `state`'s last eval is in its range.
+fn expect_in_ranges(state: *const State, ranges: []const Range, graph: usize, time: Time) !void {
+    for (state.program.nodes, ranges, 0..) |*node, range, index| {
+        for (state.values(.{ .index = @intCast(index) })) |value| {
+            if (range.contains(value)) continue;
+            std.debug.print("graph {d}, node {d} ({t}) at {d} flicks: {e} outside [{e}, {e}]\n", .{
+                graph, index, node.op, time.flicks, value, range.low, range.high,
+            });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+// Locks the page's first check: in 2,000 drawn graphs over every op, each read forwards at 60 Hz,
+// then backwards and at drawn times, with its inputs set to drawn values, some past their range,
+// no value ever leaves its node's range.
+test "no sampled value leaves its range" {
+    var prng = std.Random.DefaultPrng.init(0x7a6e);
+    const random = prng.random();
+    var drawn: Drawn = undefined;
+    var slab: [Drawn.slab_count_max]f64 = undefined;
+    var checkpoints: [4 * Drawn.slab_count_max]f64 = undefined;
+    var out: [Drawn.nodes_max]Range = undefined;
+    const rate = Rate.from_hz(60).?;
+    for (0..2000) |graph| {
+        try drawn.init(random);
+        const ranges = ranges_of(&drawn.program, &out);
+        const used = drawn.program.slab_count;
+        var state = State.init_with_checkpoints(
+            drawn.program,
+            slab[0..used],
+            checkpoints[0 .. 4 * @as(usize, used)],
+        );
+        // Forwards over 4 s from just before zero, then backwards, then at drawn times.
+        var tick: i64 = -6;
+        while (tick < 240) : (tick += 7) {
+            drawn.set_inputs(&state, random);
+            const time = Time.from_ticks(tick, rate).?;
+            state.eval(time);
+            try expect_in_ranges(&state, ranges, graph, time);
+        }
+        for (0..12) |_| {
+            drawn.set_inputs(&state, random);
+            const flicks = random.intRangeLessThan(i64, -flicks_per_second, 4 * flicks_per_second);
+            const time: Time = .{ .flicks = flicks };
+            state.eval(time);
+            try expect_in_ranges(&state, ranges, graph, time);
+        }
+    }
+}
+
+// Locks the loop half of the first check: 300 drawn loops, a chase of c + g times its own delay
+// with |g| below 1 and any overshoot, read for 6 s, never leave their ranges, and when the chase
+// is critical the range is finite.
+test "a loop through a delay never leaves its range" {
+    var prng = std.Random.DefaultPrng.init(0x100b);
+    const random = prng.random();
+    var times: [1]Time = undefined;
+    const cues = try cue_table_at_zero(&times);
+    var out: [6]Range = undefined;
+    for (0..300) |graph| {
+        var nodes: [6]Node = undefined;
+        var builder = Builder.init(&nodes, .{ .slab_count_max = 32, .cues = &cues });
+        const overshoot = if (random.boolean()) 0 else between(random, 0, 0.5);
+        const echo = try builder.delay(between(random, -1, 1));
+        const gain = try builder.constant(between(random, -0.95, 0.95));
+        const scaled = try builder.multiply(echo, gain);
+        const target = try builder.add(try builder.constant(between(random, -1, 1)), scaled);
+        const chased = try builder.chase(.{
+            .target = target,
+            .from = between(random, -1, 1),
+            .time = .{ .flicks = @intFromFloat(between(random, 0.1, 1) * flicks_per_second_float) },
+            .overshoot = overshoot,
+        });
+        try builder.close(echo, chased);
+        const program = builder.finish();
+        const ranges = ranges_of(&program, &out);
+        if (overshoot == 0) {
+            try testing.expect(std.math.isFinite(ranges[chased.index].low));
+            try testing.expect(std.math.isFinite(ranges[chased.index].high));
+        }
+        var slab: [32]f64 = undefined;
+        var state = State.init(program, &slab);
+        var tick: i64 = 0;
+        while (tick < 360) : (tick += 1) {
+            const time = Time.from_ticks(tick, Rate.from_hz(60).?).?;
+            state.eval(time);
+            try expect_in_ranges(&state, ranges, graph, time);
+        }
+    }
 }
