@@ -1,17 +1,113 @@
 # Weft
 
 A Zig library for composable motion: motion as an object of its own, separate from whatever it
-moves. It has no dependencies and knows nothing about pixels. So far it has a clock, four waves,
-seeded noise, easing, tweens on named cues, springs and Newtonian moves toward goals at cues,
-simulated signals on a fixed step, and a graph that composes them, with cycles through a delay.
-Besides values at a time, a graph gives the events in a range of time, each at an exact flick,
-a range for every node that its values never leave, and whether it can be reached at any time.
-Live input is a node of its own, and a recording of it plays back as a seekable signal.
+moves. It has no dependencies and knows nothing about pixels.
 
-Every frame is a function of t. A reader supplies the time and gets a value, and it can ask for any
-time in any order. Nothing on that path allocates, locks, or runs unbounded, and a sampled signal
-has the same bits on native and wasm. A simulated signal's work is bounded by the checkpoints its
-reader keeps, as Simulated Signals explains.
+## What Weft Is
+
+A button sliding in, a volume knob wobbling, a ball bouncing between two walls, and a value that
+chases the mouse with a springy lag are all just numbers that change over time. Weft computes those
+numbers. It does not know about pixels, sound, or windows: your code reads a number out and applies
+it to whatever you like.
+
+## The Core Idea: A Frame Is a Function of Time
+
+Most animation code works from history:
+
+> Last frame the value was 0.4. A frame passed. Add a bit. Now it is 0.43.
+
+The value then depends on every frame before it. If frames arrive late the result changes, you
+cannot jump to minute 5 without replaying minutes 0 to 5, and two machines can disagree.
+
+Weft asks a different question:
+
+> What is the value at time `t`?
+
+You give it a time and get a value, and you can ask for any time in any order. Most of the design
+follows from this one contract, and it gives you:
+
+- **Scrubbing and rewinding** for free, because jumping to any time is just another question.
+- **Frame-rate independence.** A 60 Hz reader and a 240 Hz reader see the same value at the same
+  moment.
+- **Several readers at once.** A UI thread and an audio thread can read the same motion without
+  coordinating.
+
+## Building Blocks
+
+Everything is a **signal**: a value defined at every time.
+
+| Kind | What it gives you |
+|---|---|
+| Wave | Sine, triangle, saw, or square at a given frequency. |
+| Noise | Smooth or stepped randomness, worked out from a seed and a time. There is no random generator. |
+| Tween | A move from A to B over a duration with an easing curve, starting at a named cue. |
+| Spring, Newtonian move | Head toward a goal, springily or by speeding up and braking. A new goal takes over from wherever the motion is. |
+| Simulated signal | Things with no formula: a value chasing another signal, a wanderer that picks goals and pauses, a shift register. |
+| Live input | A value fed in from outside, such as a microphone level. A recording of it plays back later as an ordinary signal. |
+
+A **cue** is a named moment on the timeline. Tweens and springs start at cues rather than at fixed
+times, so moving one cue moves everything attached to it, with no rebuild.
+
+## The Graph: Signals Wired Together
+
+You combine signals into a **graph**: a list of nodes, each one an operation (a wave, an add, a
+multiply, a tween, and so on) that refers to earlier nodes by index. For example, a fast wave whose
+loudness is shaped by a slow one:
+
+```txt
+fast wave ───────────┐
+                     ├─ multiply ─> output
+slow wave ─> rescale ┘
+```
+
+A graph goes through three phases:
+
+1. **Build.** A `Builder` assembles the nodes into arrays whose sizes you provide, and refuses by
+   name (`error.NodeCapacityExceeded`, `error.UnknownCue`, ...) what does not fit.
+2. **Freeze.** `builder.finish()` returns an immutable `Program`.
+3. **Read.** Each reader makes a `State`, a block of memory of its own holding every node's current
+   value, then calls `eval(time)` and reads the values it wants.
+
+The program is shared and read-only, and each reader owns its state, so readers never disturb each
+other.
+
+## Principles
+
+1. **Indices, not pointers.** Nodes refer to each other by number. A copy of the node array, as raw
+   bytes, is the same program, and a copy of a reader's memory is a saved snapshot, a
+   *checkpoint*, that it can resume from.
+2. **Order means no loops.** A node may only refer to nodes built before it, so reading is one pass
+   from top to bottom. The one exception is a **delay**, which reads its input from one step ago.
+   Every feedback loop must pass through a delay, so a loop without one cannot be written.
+3. **Safe on a deadline.** Reading never allocates memory, takes a lock, or runs an unbounded loop,
+   which is what audio code needs. The caller supplies every buffer size.
+4. **Exact time.** Time is a whole number of *flicks*, 1/705,600,000 of a second, which divides
+   evenly into common frame and audio rates. Integers do not drift, so a motion far from zero stays
+   precise.
+5. **Same bits everywhere.** The same input gives bit-identical output on native and WebAssembly,
+   even for `sin` and `exp`, which Weft computes itself. `zig build regress` checks this.
+6. **Caches never change answers.** Simulated signals have no formula, so they advance on a fixed
+   step of 1/480 s, the same for every graph and reader, and a read between steps interpolates.
+   Replaying from the start would be slow, so each reader keeps a checkpoint a second. Checkpoints
+   change what a read costs, never what it returns.
+7. **Questions beyond "what is the value".**
+   - `events(t0, t1)` lists everything that happened in a range of time, each at an exact flick. The
+     ranges do not overlap, so however a reader splits its timeline, each event is reported once.
+   - `ranges` gives, for every node, a bound its values never leave. It is never wrong, though it can
+     be wider than the truth.
+   - `report` says whether a program can be read at any time. Live input has no past, so it cannot
+     be, and the report names the node responsible.
+
+A useful picture is a **spreadsheet whose only input is a clock**. Each cell is a formula over
+earlier cells, and each reader asks what the sheet shows at time `t`. The few cells that cannot be
+written as a formula are simulated on a fixed step, with snapshots so any time is quick to reach and
+always gives the same answer.
+
+## Where to Read Next
+
+Every source file opens with a guide for reviewers. Start with `src/weft.zig`, then the guide at
+the top of `src/core/graph.zig`, which holds the graph's layout and most of the rules above. The
+sections below show each part in use.
 
 ## Requirements
 
