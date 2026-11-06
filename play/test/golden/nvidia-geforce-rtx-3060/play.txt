@@ -2,8 +2,13 @@
 # adapter: NVIDIA GeForce RTX 3060
 # driver: 615.78.08
 # size: 1280x720 @120
-scenario    hash
-play        ef43fb94465349fc
-scrub       cc438f2d507404bf
-scrub_back  cc438f2d507404bf
-still       dfba1e5ee5026af0
+scenario     hash
+knob         26bf8bcdd318a89d
+knob_600     b913de8535f3cc40
+play         b0ffcd7987a9a069
+repoint      c1adba5e85cf20d9
+scrub        cb62e942cdb2a112
+scrub_back   cb62e942cdb2a112
+shapes       9f5cab2869b32bb0
+shapes_play  27b0847ca2f7c1c0
+still        ef0d569e3cd163b3

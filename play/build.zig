@@ -26,4 +26,5 @@ pub fn build(b: *std.Build) void {
     b.step("serve-play", "Serve on localhost").dependOn(steps.serve);
     b.step("regress", "Render the scenarios against test/golden").dependOn(steps.regress);
     b.step("test", "Run the app's tests").dependOn(steps.tests);
+    b.step("bench", "Time a scenario's frames (use -Doptimize=ReleaseFast)").dependOn(steps.bench);
 }
