@@ -29,6 +29,22 @@ pub const Shape = enum {
     saw,
     /// 1 for the first half of the cycle and -1 for the second.
     square,
+
+    /// The shape's value at `turns` into its cycle, in [0, 1), which is in [-1, 1]. An oscillator
+    /// reads it at a phase it keeps; a wave at the phase of its time.
+    pub fn at(shape: Shape, turns: f64) f64 {
+        assert(turns >= 0);
+        assert(turns < 1);
+        const result = switch (shape) {
+            .sine => elementary.sine(turns),
+            .triangle => triangle_at(turns),
+            .saw => saw_at(turns),
+            .square => square_at(turns),
+        };
+        assert(result >= -1);
+        assert(result <= 1);
+        return result;
+    }
 };
 
 pub const Wave = struct {
@@ -39,12 +55,7 @@ pub const Wave = struct {
     pub fn sample(wave: Wave, time: Time) f64 {
         assert(std.math.isFinite(wave.hz));
         const turns = time.turns(wave.hz);
-        const result = switch (wave.shape) {
-            .sine => elementary.sine(turns),
-            .triangle => triangle_at(turns),
-            .saw => saw_at(turns),
-            .square => square_at(turns),
-        };
+        const result = wave.shape.at(turns);
         assert(result >= -1);
         assert(result <= 1);
         return result;

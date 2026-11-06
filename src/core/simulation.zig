@@ -160,13 +160,20 @@ pub const ShiftShape = enum {
     smooth,
 };
 
+/// A parameter that is constant, in `Follower.params`.
+pub const no_param = std.math.maxInt(u32);
+
 /// A goal follower as a graph node holds it.
 pub const Follower = struct {
     from: f64,
     /// Within this of the goal, and at most this fast, is arrived. At least 0.
     tolerance: f64,
     seed: u64,
+    /// The law of its constant parameters, which the graph overrides from `params`.
     law: motion.Law,
+    /// The node indices its law's parameters come from, or `no_param`: a spring's time and
+    /// overshoot, or a Newtonian move's speed, accel, and decel (`graph.zig`, section 14).
+    params: [3]u32 = @splat(no_param),
     regions: Span,
     pause_min_steps: u32,
     pause_max_steps: u32,
@@ -245,16 +252,18 @@ pub const FollowerStep = struct {
     arrived: bool,
 };
 
-/// The state of a follower one step after `state`, as section 4 explains.
+/// The state of a follower one step after `state`, moving by `law`, as section 4 explains. The law
+/// is the follower's own, or one from its parameters' nodes at this step.
 pub fn follower_step(
     follower: *const Follower,
     regions: []const Region,
+    law: motion.Law,
     state: FollowerState,
 ) FollowerStep {
     assert(state.drawn > 0);
     assert(state.pause_left <= pause_steps_max);
     var next = state;
-    next.kinematics = motion.advance(follower.law, state.kinematics, state.goal, step_seconds);
+    next.kinematics = motion.advance(law, state.kinematics, state.goal, step_seconds);
     if (state.pause_left > 0) {
         next.pause_left = state.pause_left - 1;
         if (next.pause_left == 0) next = follower_retarget(follower, regions, next);
@@ -537,7 +546,7 @@ test "a random follower draws goals in its regions and pauses within bounds" {
     var drawn_per_region = [2]u32{ 0, 0 };
     var arrivals: u32 = 0;
     for (0..60 * 480) |_| {
-        const step_result = follower_step(&follower, &regions, state);
+        const step_result = follower_step(&follower, &regions, follower.law, state);
         const next = step_result.state;
         if (step_result.arrived) arrivals += 1;
         if (next.drawn != state.drawn) {

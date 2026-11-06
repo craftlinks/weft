@@ -11,7 +11,11 @@
 //! play     four chases on a wave plus noise, forwards at 60 Hz per frame, over 60 s
 //! cold     that graph from a fresh state, the first eval        at 60 s, and at 600 s
 //! events   a bounce and cues, events per 128-frame block        48 kHz blocks over 10 s
+//! write    the chase page with its springs' time from a track,  per frame, at 600 s
+//!          a write of the track at the playhead, then the eval
 //! ```
+//! `write` is what a knob costs when it applies from now on (step 9.5), beside `cold`, which is
+//! what it cost as a rebuild.
 //!
 //! ## 2. Why No Thresholds
 //! The numbers depend on the machine, so nothing here passes or fails, and it is not part of
@@ -47,6 +51,9 @@ var cue_times: [32]weft.Time = undefined;
 var start_times: [1]weft.Time = undefined;
 var start_cues: weft.Cues = undefined;
 var events_out: [64]weft.Event = undefined;
+var track_entries: [1]weft.Track = undefined;
+var track_samples: [4096]weft.Sample = undefined;
+var tracks: weft.Tracks = undefined;
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
@@ -55,6 +62,7 @@ pub fn main(init: std.process.Init) !void {
     play(io);
     cold(io);
     events(io);
+    write(io);
 }
 
 fn now(io: std.Io) i96 {
@@ -158,7 +166,8 @@ fn cold(io: std.Io) void {
 fn events(io: std.Io) void {
     var cues = weft.Cues.init(&cue_times);
     for (0..21) |index| {
-        _ = cues.add(.{ .flicks = @as(i64, @intCast(index)) * @divExact(flicks_per_second, 2) }) catch
+        const half_seconds: i64 = @intCast(index);
+        _ = cues.add(.{ .flicks = half_seconds * @divExact(flicks_per_second, 2) }) catch
             unreachable;
     }
     var builder = weft.Builder.init(&nodes, .{ .slab_count_max = slab_max, .cues = &cues });
@@ -184,6 +193,56 @@ fn events(io: std.Io) void {
         best = @min(best, now(io) - start);
     }
     report("events  bounce and cues, per block", best, blocks, total);
+}
+
+/// Case 5: the chase page with its springs' time from a track, played at 60 Hz to 600 s, then for
+/// 10 s a write of the track at the playhead every frame, and the frame's eval, per frame.
+fn write(io: std.Io) void {
+    start_cues = weft.Cues.init(&start_times);
+    _ = start_cues.add(.{ .flicks = 0 }) catch |err| fail(err);
+    var best: i96 = std.math.maxInt(i96);
+    var total: f64 = 0;
+    const rate = weft.Rate.from_hz(60).?;
+    const frames = 600;
+    for (0..repeats) |_| {
+        tracks = weft.Tracks.init(&track_entries);
+        const id = tracks.add(&track_samples, 0.1, 1, 0.4) catch |err| fail(err);
+        var builder = weft.Builder.init(&nodes, .{
+            .slab_count_max = slab_max,
+            .cues = &start_cues,
+            .tracks = &tracks,
+        });
+        const wave = builder.wave(.{ .shape = .sine, .hz = 0.5 }) catch |err| fail(err);
+        const smooth: weft.Noise = .{ .shape = .smooth, .hz = 1, .seed = 1 };
+        const noise = builder.noise(smooth) catch |err| fail(err);
+        const target = builder.add(wave, noise) catch |err| fail(err);
+        const time = builder.track(id) catch |err| fail(err);
+        var outputs: [4]weft.Id = undefined;
+        for (&outputs, 0..) |*output, index| {
+            output.* = builder.chase(.{
+                .target = target,
+                .from = 0,
+                .time = .{ .flicks = @divExact(flicks_per_second, 2) },
+                .overshoot = 0.05 * @as(f64, @floatFromInt(index)),
+                .time_from = time,
+            }) catch |err| fail(err);
+        }
+        const program = builder.finish();
+        var state = weft.State.init_with_checkpoints(program, &slab, &checkpoints);
+        var frame: i64 = 0;
+        while (frame <= 600 * 60) : (frame += 1) state.eval(weft.Time.from_ticks(frame, rate).?);
+        const start = now(io);
+        for (0..frames) |index| {
+            const at = weft.Time.from_ticks(frame, rate).?;
+            const value = 0.2 + 0.1 * @as(f64, @floatFromInt(index % 5));
+            tracks.write(id, at, value) catch |err| fail(err);
+            state.eval(at);
+            for (outputs) |output| total += state.value(output);
+            frame += 1;
+        }
+        best = @min(best, now(io) - start);
+    }
+    report("write   a track write at 600 s, per frame", best, frames, total);
 }
 
 /// A builder refusal here is a mistake in the case, named in every build mode.

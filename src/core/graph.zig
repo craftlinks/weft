@@ -129,6 +129,31 @@
 //! pure signal. Only committed passes record: `eval`'s, and the passes of the steps. The read-only
 //! look of section 11 does not, since a later commit at the same time can read a newer value.
 //!
+//! ## 14. Live Parameters
+//! A knob that applies from now on is a track (`track.zig`): a table of timed values the client
+//! writes between reads, which a program reads as the cue table, so a `track` node is pure and a
+//! program that reads tracks stays seekable. A write changes the track only at and after its time,
+//! so a state drops only what read the changed values: checkpoint k holds the passes of steps 0 to
+//! `k * checkpoint_interval - 1` and survives while the last of them is before the earliest time
+//! written since the state last looked, and the slab's own step likewise. Played forwards with a
+//! write at each frame's time, a reader drops nothing it has run; a write at a time it has passed
+//! costs at most one interval of steps.
+//!
+//! The parameters of a simulated node can come from nodes, read at each step: a chase's time and
+//! overshoot, a follower's spring time and overshoot, or its Newtonian speed, accel, and decel. A
+//! parameter's node is one of the node's inputs, built before it. Each value is clamped into its
+//! domain (a time of at least a flick, an overshoot in [0, 0.99], a limit of at least 2^-20). A
+//! spring's law needs a log, so it is cached in the node's slab with the values it came from and
+//! worked out again only when they change. An oscillator is the wave whose rate is a node: its
+//! phase is the rate summed over the steps, so it is simulated. A spring toward goals at cues and
+//! a wave keep constant parameters, since a varying one would make them simulated too.
+//!
+//! Ranges stay sound. A Newtonian follower is bounded by the largest speed and the smallest decel
+//! its parameter nodes' ranges allow. A spring follower whose overshoot alone comes from a node
+//! keeps its omega, and `range.follower_damping` bounds it. A chase with a parameter from a node,
+//! or a follower whose spring time does, has no bound, since a spring whose stiffness changes as it
+//! moves can be pumped, so its range is unbounded.
+//!
 //! ## 13. TigerStyle Invariants
 //! - Capacities come from the caller, and the builder refuses what does not fit, by name.
 //! - `eval` allocates nothing, takes no lock, and is one bounded pass over the node array. A motion
@@ -168,7 +193,11 @@ const noise_hash = @import("noise.zig").hash;
 const simulation = @import("simulation.zig");
 const time_module = @import("time.zig");
 const Time = time_module.Time;
-const Wave = @import("wave.zig").Wave;
+const track_module = @import("track.zig");
+const Tracks = track_module.Tracks;
+const TrackId = track_module.TrackId;
+const wave_module = @import("wave.zig");
+const Wave = wave_module.Wave;
 
 /// A node, as its index in the program.
 pub const Id = struct {
@@ -238,6 +267,10 @@ pub const Chase = struct {
     time: Time,
     /// The peak overshoot of a move from rest, in [0, 1), as `motion.Spring.overshoot`.
     overshoot: f64,
+    /// A node whose value, in seconds, is the time at each step instead (section 14).
+    time_from: ?Id = null,
+    /// A node whose value is the overshoot at each step instead (section 14).
+    overshoot_from: ?Id = null,
 };
 
 /// A chase as a graph node holds it.
@@ -245,6 +278,28 @@ pub const ChaseNode = struct {
     target: Id,
     from: f64,
     law: motion.SpringLaw,
+    /// The nodes of its time and overshoot, or `simulation.no_param` (section 14).
+    params: [3]u32 = @splat(simulation.no_param),
+};
+
+/// The nodes a follower's law takes its parameters from, which must suit its mover: a spring's
+/// time (in seconds) and overshoot, or a Newtonian move's speed, accel, and decel (section 14).
+pub const MoverFrom = struct {
+    time: ?Id = null,
+    overshoot: ?Id = null,
+    speed: ?Id = null,
+    accel: ?Id = null,
+    decel: ?Id = null,
+};
+
+/// A wave whose rate is a signal, as a client describes it: simulated, since its phase is the
+/// rate summed over the steps (section 14).
+pub const Oscillator = struct {
+    shape: wave_module.Shape,
+    /// A node whose value is the rate in cycles per second, read at each step. It may be negative.
+    rate: Id,
+    /// The phase at the start, in turns, in [0, 1).
+    phase: f64 = 0,
 };
 
 /// A goal follower, as a client describes it. `simulation.zig`, section 4, explains it.
@@ -263,6 +318,8 @@ pub const Follow = struct {
     pause_max: Time,
     /// Hashed with the graph's seed, as a noise's seed is.
     seed: u64,
+    /// Nodes its mover's parameters come from instead of the constants (section 14).
+    mover_from: MoverFrom = .{},
 };
 
 /// A shift register, as a client describes it. `simulation.zig`, section 5, explains it.
@@ -446,6 +503,8 @@ pub const Op = union(enum) {
     cues: CueSpan,
     input: Input,
     recorded: Recorded,
+    oscillator: Oscillator,
+    track: TrackId,
 
     /// The f64 a node of this op keeps in the slab after an output of `output_count` f64, for a
     /// cache or a simulation's state. Section 9 explains the layout of a simulated node.
@@ -453,23 +512,26 @@ pub const Op = union(enum) {
         assert(output_count > 0);
         return switch (op.*) {
             .motion => motion.cursor_count,
-            .chase => 3 * output_count,
+            .chase => |chase| 3 * output_count + law_cache_count(chase.params, true),
             .delay => 2 * output_count,
-            .follow => 2 * output_count + follower_slots,
+            .follow => |follow| 2 * output_count + follower_slots +
+                law_cache_count(follow.params, follow.law == .spring),
+            // Its values at the steps before and after, then its phase.
+            .oscillator => 3 * output_count,
             .shift => |shift| 2 * output_count + 1 + shift.buckets,
             // The input at the last step, then whether there is one.
             .crossing => output_count + 1,
             .constant, .add, .multiply, .map_range, .wave, .tween, .noise, .bounce, .cues => 0,
-            .input, .recorded => 0,
+            .input, .recorded, .track => 0,
         };
     }
 
     /// Whether a node of this op runs on the fixed step, as section 9 explains.
     fn simulated(op: *const Op) bool {
         return switch (op.*) {
-            .chase, .follow, .shift, .delay, .crossing => true,
+            .chase, .follow, .shift, .delay, .crossing, .oscillator => true,
             .constant, .add, .multiply, .map_range, .wave, .tween, .noise, .motion => false,
-            .bounce, .cues, .input, .recorded => false,
+            .bounce, .cues, .input, .recorded, .track => false,
         };
     }
 
@@ -477,24 +539,37 @@ pub const Op = union(enum) {
     fn class(op: *const Op) Class {
         return switch (op.*) {
             .constant, .add, .multiply, .map_range, .wave, .tween, .noise => .pure,
-            .bounce, .cues, .recorded => .pure,
+            .bounce, .cues, .recorded, .track => .pure,
             .motion => .exact,
-            .chase, .follow, .shift, .delay, .crossing => .simulated,
+            .chase, .follow, .shift, .delay, .crossing, .oscillator => .simulated,
             .input => .live,
         };
     }
 
-    /// The nodes this op reads, at most two, null where there are fewer.
-    fn inputs(op: *const Op) [2]?Id {
+    /// The nodes this op reads, at most four, null where there are fewer. A parameter's node is
+    /// an input too (section 14).
+    fn inputs(op: *const Op) [4]?Id {
         return switch (op.*) {
-            .add, .multiply => |binary| .{ binary.left, binary.right },
-            .map_range => |map| .{ map.input, null },
-            .tween => |tween| .{ tween.previous, null },
-            .chase => |chase| .{ chase.target, null },
-            .delay => |delay| .{ delay.input, null },
-            .crossing => |crossing| .{ crossing.input, null },
-            .constant, .wave, .noise, .motion, .follow, .shift, .bounce, .cues => .{ null, null },
-            .input, .recorded => .{ null, null },
+            .add, .multiply => |binary| .{ binary.left, binary.right, null, null },
+            .map_range => |map| .{ map.input, null, null, null },
+            .tween => |tween| .{ tween.previous, null, null, null },
+            .chase => |chase| .{
+                chase.target,
+                param(chase.params, 0),
+                param(chase.params, 1),
+                null,
+            },
+            .follow => |follow| .{
+                param(follow.params, 0),
+                param(follow.params, 1),
+                param(follow.params, 2),
+                null,
+            },
+            .delay => |delay| .{ delay.input, null, null, null },
+            .crossing => |crossing| .{ crossing.input, null, null, null },
+            .oscillator => |oscillator| .{ oscillator.rate, null, null, null },
+            .constant, .wave, .noise, .motion, .shift, .bounce, .cues => @splat(null),
+            .input, .recorded, .track => @splat(null),
         };
     }
 };
@@ -505,6 +580,93 @@ const follower_slots = 6;
 const follower_slot_arrived = 4;
 const follower_slot_arrived_goal = 5;
 
+/// The f64 a spring with a parameter from a node keeps after its own state: the time and the
+/// overshoot its law was last worked out from, then that law's omega, zeta, and damped hz.
+const spring_cache_count = 5;
+
+/// The least a Newtonian limit from a node can be; a smaller value is clamped up (section 14).
+const limit_min: f64 = 0x1p-20;
+
+/// The largest overshoot from a node; a larger value is clamped down (section 14).
+const overshoot_max: f64 = 0.99;
+
+/// The node of parameter `slot`, or null when it is constant.
+fn param(params: [3]u32, slot: u32) ?Id {
+    if (params[slot] == simulation.no_param) return null;
+    return .{ .index = params[slot] };
+}
+
+fn any_param(params: [3]u32) bool {
+    for (params) |id| if (id != simulation.no_param) return true;
+    return false;
+}
+
+/// The f64 of a law cache after a node's own state: a spring with a parameter from a node keeps
+/// one, and nothing else does.
+fn law_cache_count(params: [3]u32, spring: bool) u64 {
+    return if (spring and any_param(params)) spring_cache_count else 0;
+}
+
+/// The value of parameter node `id` at this pass: its first lane.
+fn param_value(program: *const Program, slab: []const f64, id: Id) f64 {
+    const value = node_values(program.nodes, slab, id)[0];
+    assert(std.math.isFinite(value));
+    return value;
+}
+
+/// The law of a spring at this step: `fixed`, with its omega from a time node and its damping from
+/// an overshoot node where it has them, each clamped into its domain. Cached in `cache` with the
+/// values it came from, so a parameter that holds costs two compares a step (section 14).
+fn spring_law_at(
+    program: *const Program,
+    slab: []const f64,
+    params: [3]u32,
+    fixed: motion.SpringLaw,
+    cache: []f64,
+) motion.SpringLaw {
+    assert(cache.len == spring_cache_count);
+    const seconds_min = 1 / flicks_per_second_float;
+    const seconds = if (param(params, 0)) |id|
+        @max(param_value(program, slab, id), seconds_min)
+    else
+        0;
+    const overshoot = if (param(params, 1)) |id|
+        std.math.clamp(param_value(program, slab, id), 0, overshoot_max)
+    else
+        0;
+    if (cache[0] == seconds and cache[1] == overshoot) {
+        return .{ .omega = cache[2], .zeta = cache[3], .damped_hz = cache[4] };
+    }
+    const omega = if (param(params, 0) != null) std.math.tau / seconds else fixed.omega;
+    const zeta = if (param(params, 1) != null) motion.SpringLaw.zeta_of(overshoot) else fixed.zeta;
+    const law = motion.SpringLaw.from_omega_zeta(omega, zeta);
+    cache[0..spring_cache_count].* = .{ seconds, overshoot, law.omega, law.zeta, law.damped_hz };
+    return law;
+}
+
+/// The limits of a Newtonian move at this step: `fixed`, with each limit from a node where it has
+/// one, clamped to at least `limit_min`.
+fn newtonian_limits_at(
+    program: *const Program,
+    slab: []const f64,
+    params: [3]u32,
+    fixed: motion.Limits,
+) motion.Limits {
+    var limits = fixed;
+    const fields = [3]*f64{ &limits.speed, &limits.accel, &limits.decel };
+    for (fields, 0..) |field, slot| {
+        const id = param(params, @intCast(slot)) orelse continue;
+        field.* = @max(param_value(program, slab, id), limit_min);
+    }
+    return limits;
+}
+
+/// Marks a law cache stale, so the next step works its law out: no time is -1.
+fn law_cache_reset(cache: []f64) void {
+    assert(cache.len == spring_cache_count);
+    @memset(cache, -1);
+}
+
 pub const Node = struct {
     op: Op,
     /// The index in the slab of this node's first value.
@@ -514,7 +676,7 @@ pub const Node = struct {
 
 comptime {
     // A follower is the largest op. The array is read in order, so this costs prefetch, not misses.
-    assert(@sizeOf(Node) <= 112);
+    assert(@sizeOf(Node) <= 128);
     assert(@sizeOf(Id) == @sizeOf(u32));
     assert(@alignOf(Node) == @alignOf(f64));
 }
@@ -528,6 +690,8 @@ pub const Program = struct {
     regions: []const simulation.Region,
     /// The recordings that `recorded` nodes play back.
     samples: []const Sample,
+    /// The tracks that `track` nodes read, which the client writes between reads (section 14).
+    tracks: *const Tracks,
     /// The cue simulated nodes start at, read only when `simulated`.
     start: Cue,
     /// Whether any node runs on the fixed step, so a read may cost steps.
@@ -543,12 +707,21 @@ pub const Program = struct {
             if (node.op.simulated()) simulated_count += 1;
             switch (node.op) {
                 .constant, .wave, .noise, .shift => {},
-                .chase => |op| assert(op.target.index < index),
+                .chase => |op| {
+                    assert(op.target.index < index);
+                    for (op.params) |id| assert(id == simulation.no_param or id < index);
+                },
                 .delay => |op| if (op.input) |input| assert(input.index < program.nodes.len),
                 .follow => |op| {
                     assert(op.regions.count > 0);
                     assert(op.regions.first + op.regions.count <= program.regions.len);
+                    for (op.params) |id| assert(id == simulation.no_param or id < index);
                 },
+                .oscillator => |op| {
+                    assert(op.rate.index < index);
+                    assert(op.phase >= 0 and op.phase < 1);
+                },
+                .track => |id| assert(id.index < program.tracks.count),
                 .add, .multiply => |op| {
                     assert(op.left.index < index);
                     assert(op.right.index < index);
@@ -725,11 +898,17 @@ pub const Program = struct {
             .wave, .noise => .{ .low = -1, .high = 1 },
             .tween => |*op| tween_range(op, if (op.previous) |id| result[id.index] else null),
             .motion => |*op| program.motion_range(op),
-            .chase => |op| range_module.spring(
-                Range.point(op.from).hull(result[op.target.index]),
-                op.law.zeta,
-            ),
-            .follow => |*op| program.follow_range(op),
+            .chase => |op| if (any_param(op.params))
+                // A spring whose law changes as it moves has no bound (section 14).
+                Range.unbounded
+            else
+                range_module.spring(
+                    Range.point(op.from).hull(result[op.target.index]),
+                    op.law.zeta,
+                ),
+            .follow => |*op| program.follow_range(op, result),
+            .oscillator => hull_widened(-1, 1),
+            .track => |id| Range.of(program.tracks.at(id).low, program.tracks.at(id).high),
             .shift => |op| hull_widened(op.low, op.high),
             .delay => unreachable,
             .bounce => |op| switch (op.output) {
@@ -758,14 +937,34 @@ pub const Program = struct {
     }
 
     /// A follower's range, from its start and its regions, widened by what its mover overshoots.
-    fn follow_range(program: *const Program, op: *const simulation.Follower) Range {
+    /// With parameters from nodes, as section 14 explains: a spring whose overshoot alone comes
+    /// from a node keeps its omega, so `range.follower_damping` bounds it; one whose time comes
+    /// from a node has no bound; a Newtonian move is bounded by its largest speed and smallest
+    /// decel.
+    fn follow_range(
+        program: *const Program,
+        op: *const simulation.Follower,
+        result: []const Range,
+    ) Range {
         var inputs = Range.point(op.from);
         for (program.regions[op.regions.first..][0..op.regions.count]) |region| {
             inputs = inputs.hull(Range.of(region.low, region.high));
         }
         return switch (op.law) {
-            .spring => |law| range_module.spring(inputs, law.zeta),
-            .newtonian => |limits| range_module.newtonian(inputs, limits.speed, limits.decel),
+            .spring => |law| if (param(op.params, 0) != null)
+                Range.unbounded
+            else if (param(op.params, 1) != null)
+                range_module.follower_damping(inputs, op.tolerance, law.omega)
+            else
+                range_module.spring(inputs, law.zeta),
+            .newtonian => |limits| {
+                var speed = limits.speed;
+                var decel = limits.decel;
+                if (param(op.params, 0)) |id| speed = @max(result[id.index].high, limit_min);
+                if (param(op.params, 2)) |id| decel = @max(result[id.index].low, limit_min);
+                if (!std.math.isFinite(speed)) return Range.unbounded;
+                return range_module.newtonian(inputs, speed, decel);
+            },
         };
     }
 };
@@ -781,6 +980,7 @@ pub const Builder = struct {
     goals: []const Goal,
     regions: []const simulation.Region,
     samples: []const Sample,
+    tracks: *const Tracks,
     start: Cue,
     seed: u64,
     /// The extent of every node built, 1 by 1 until a later step gives each node its own.
@@ -839,6 +1039,13 @@ pub const Builder = struct {
         DelayClosed,
         /// A clip that the sample table given in `Options` does not hold.
         UnknownSamples,
+        /// A track that the table given in `Options` does not have.
+        UnknownTrack,
+        /// A follower parameter from a node that its mover does not have: a spring's speed, or a
+        /// Newtonian move's time.
+        InvalidParameter,
+        /// An oscillator's phase outside [0, 1).
+        InvalidPhase,
     };
 
     pub const Options = struct {
@@ -852,6 +1059,9 @@ pub const Builder = struct {
         regions: []const simulation.Region = &.{},
         /// The recordings that `recorded` nodes play back, from `Samples.table`.
         samples: []const Sample = &.{},
+        /// The tracks that `track` nodes read. The program reads this table, so it sees later
+        /// writes, as section 14 explains.
+        tracks: *const Tracks = &Tracks.empty,
         /// The cue every simulated node starts at, as section 9 explains.
         start: Cue = .{ .index = 0 },
         /// Hashed into the seed of every noise, follower, and shift register, as section 7
@@ -870,6 +1080,7 @@ pub const Builder = struct {
             .goals = options.goals,
             .regions = options.regions,
             .samples = options.samples,
+            .tracks = options.tracks,
             .start = options.start,
             .seed = options.seed,
             .extent = .{ .lanes = 1, .components = 1 },
@@ -957,11 +1168,28 @@ pub const Builder = struct {
         try builder.check_start();
         if (!std.math.isFinite(source.from)) return error.NotFinite;
         const law = try spring_law(source.time, source.overshoot);
+        const params = try builder.params_of(.{ source.time_from, source.overshoot_from, null });
         return builder.push(.{ .chase = .{
             .target = source.target,
             .from = source.from,
             .law = law,
+            .params = params,
         } });
+    }
+
+    /// A wave whose rate is the value of `source.rate` at each step, simulated (section 14).
+    pub fn oscillator(builder: *Builder, source: Oscillator) Error!Id {
+        try builder.check_known(source.rate);
+        try builder.check_start();
+        if (std.math.isNan(source.phase)) return error.NotFinite;
+        if (!(source.phase >= 0 and source.phase < 1)) return error.InvalidPhase;
+        return builder.push(.{ .oscillator = source });
+    }
+
+    /// The value of the track `id` at each time, held forward from each sample (section 14).
+    pub fn track(builder: *Builder, id: TrackId) Error!Id {
+        if (id.index >= builder.tracks.count) return error.UnknownTrack;
+        return builder.push(.{ .track = id });
     }
 
     /// A goal follower, as `simulation.zig` explains, whose seed is `source.seed` hashed with the
@@ -979,6 +1207,19 @@ pub const Builder = struct {
                 .newtonian = try newtonian_limits(mover.speed, mover.accel, mover.decel),
             },
         };
+        const from = source.mover_from;
+        const params = switch (source.mover) {
+            .spring => spring: {
+                if (from.speed != null or from.accel != null or from.decel != null) {
+                    return error.InvalidParameter;
+                }
+                break :spring try builder.params_of(.{ from.time, from.overshoot, null });
+            },
+            .newtonian => newtonian: {
+                if (from.time != null or from.overshoot != null) return error.InvalidParameter;
+                break :newtonian try builder.params_of(.{ from.speed, from.accel, from.decel });
+            },
+        };
         if (!std.math.isFinite(source.tolerance)) return error.NotFinite;
         if (source.tolerance < 0) return error.InvalidTolerance;
         if (source.pause_min.flicks < 0) return error.InvalidPause;
@@ -994,6 +1235,7 @@ pub const Builder = struct {
             .pause_min_steps = @intCast(steps_rounded_up(source.pause_min)),
             .pause_max_steps = @intCast(pause_max_steps),
             .pick = source.pick,
+            .params = params,
         } });
     }
 
@@ -1150,6 +1392,7 @@ pub const Builder = struct {
             .goals = builder.goals,
             .regions = builder.regions,
             .samples = builder.samples,
+            .tracks = builder.tracks,
             .start = builder.start,
             .simulated = builder.simulated,
             .slab_count = builder.slab_count,
@@ -1161,6 +1404,18 @@ pub const Builder = struct {
     fn check_known(builder: *const Builder, id: Id) Error!void {
         assert(builder.node_count <= builder.nodes.len);
         if (id.index >= builder.node_count) return error.UnknownNode;
+    }
+
+    /// The parameter slots of a node whose parameters may come from `ids`, each a node built
+    /// already, as section 14 explains.
+    fn params_of(builder: *const Builder, ids: [3]?Id) Error![3]u32 {
+        var result: [3]u32 = @splat(simulation.no_param);
+        for (&result, ids) |*slot, maybe| {
+            const id = maybe orelse continue;
+            try builder.check_known(id);
+            slot.* = id.index;
+        }
+        return result;
     }
 
     fn push(builder: *Builder, op: Op) Error!Id {
@@ -1278,6 +1533,8 @@ pub const State = struct {
     step: ?u64,
     /// The cue generation the simulated state and the checkpoints were worked out under.
     generation: u64,
+    /// The track generation they were worked out under (section 14).
+    track_generation: u64,
     /// Steps run since `init`, for measuring what reads cost.
     steps_run: u64,
     /// The recordings `record` attached, each of one input, as section 12 explains.
@@ -1322,6 +1579,7 @@ pub const State = struct {
             .checkpoints_filled = 0,
             .step = null,
             .generation = program.cues.generation,
+            .track_generation = program.tracks.generation,
             .steps_run = 0,
             .recordings = undefined,
             .recordings_count = 0,
@@ -1437,7 +1695,7 @@ pub const State = struct {
     }
 
     /// The time of the start cue, after dropping the simulated state and the checkpoints if a cue
-    /// has moved since they were worked out.
+    /// has moved since they were worked out, or what a track write since then reaches.
     fn simulation_start(state: *State) Time {
         assert(state.program.simulated);
         const cues = state.program.cues;
@@ -1446,7 +1704,34 @@ pub const State = struct {
             state.checkpoints_filled = 0;
             state.step = null;
         }
-        return cues.at(state.program.start);
+        const start = cues.at(state.program.start);
+        const tracks = state.program.tracks;
+        if (tracks.generation != state.track_generation) {
+            const floor = tracks.floor_since(state.track_generation);
+            state.track_generation = tracks.generation;
+            state.forget_from(start, floor);
+        }
+        return start;
+    }
+
+    /// Drops the checkpoints, and the slab's own step, that hold a pass at or after `floor`, or
+    /// everything when `floor` is null, as section 14 explains. Checkpoint k holds the passes of
+    /// steps 0 to `k * checkpoint_interval - 1`, and the slab at step n those of steps 0 to n - 1.
+    fn forget_from(state: *State, start: Time, floor: ?Time) void {
+        const interval = simulation.checkpoint_interval;
+        const at = floor orelse {
+            state.checkpoints_filled = 0;
+            state.step = null;
+            return;
+        };
+        while (state.checkpoints_filled > 0) {
+            const last_pass = @as(u64, state.checkpoints_filled) * interval - 1;
+            if (step_time(start, last_pass).flicks < at.flicks) break;
+            state.checkpoints_filled -= 1;
+        }
+        if (state.step) |live| {
+            if (live > 0 and step_time(start, live - 1).flicks >= at.flicks) state.step = null;
+        }
     }
 
     /// Brings the simulated state to step `target`, from the nearest of the slab's own step and
@@ -1787,10 +2072,11 @@ fn eval_node(
                 @memset(out, tween.from);
             }
         },
-        .chase, .follow, .shift, .delay => {
+        .chase, .follow, .shift, .delay, .oscillator => {
             const cache = slab[node.offset + output_count ..][0 .. 2 * output_count];
             sample_into(out, cache[0..output_count], cache[output_count..], sampling);
         },
+        .track => |id| @memset(out, program.tracks.value(id, time)),
         .bounce => |*op| @memset(out, op.sample(time, program.cues.at(op.start))),
         .crossing => |*op| {
             const inputs = node_values(nodes, slab, op.input);
@@ -1900,7 +2186,10 @@ fn update_node(program: *const Program, slab: []f64, node: *const Node, index: u
             const target = node_values(program.nodes, slab, op.target);
             assert(target.len == output_count);
             const velocities = own[0..output_count];
-            const law: motion.Law = .{ .spring = op.law };
+            const law: motion.Law = .{ .spring = if (any_param(op.params))
+                spring_law_at(program, slab, op.params, op.law, own[output_count..])
+            else
+                op.law };
             for (after, velocities, target) |*position, *velocity, goal| {
                 const now: motion.Kinematics = .{ .position = position.*, .velocity = velocity.* };
                 const next = motion.advance(law, now, goal, simulation.step_seconds);
@@ -1914,9 +2203,19 @@ fn update_node(program: *const Program, slab: []f64, node: *const Node, index: u
             @memcpy(after, values);
         },
         .follow => |*op| {
-            const state = follower_unpack(after[0], own);
-            const next = simulation.follower_step(op, program.regions, state);
-            follower_pack(next.state, after, own);
+            const law: motion.Law = switch (op.law) {
+                .spring => |fixed| .{ .spring = if (any_param(op.params))
+                    spring_law_at(program, slab, op.params, fixed, own[follower_slots..])
+                else
+                    fixed },
+                .newtonian => |fixed| .{
+                    .newtonian = newtonian_limits_at(program, slab, op.params, fixed),
+                },
+            };
+            const kept = own[0..follower_slots];
+            const state = follower_unpack(after[0], kept);
+            const next = simulation.follower_step(op, program.regions, law, state);
+            follower_pack(next.state, after, kept);
             own[follower_slot_arrived] = @floatFromInt(@intFromBool(next.arrived));
             if (next.arrived) own[follower_slot_arrived_goal] = state.goal;
         },
@@ -1926,8 +2225,18 @@ fn update_node(program: *const Program, slab: []f64, node: *const Node, index: u
             own[0] = @floatFromInt(next.bucket);
             @memset(after, next.value);
         },
+        .oscillator => |*op| {
+            const rate = param_value(program, slab, op.rate);
+            for (after, own[0..output_count]) |*value, *phase| {
+                const turned = phase.* + rate * simulation.step_seconds;
+                phase.* = turned - @floor(turned);
+                // A sum one ulp below a whole turn can round up to 1 after the floor.
+                if (phase.* >= 1) phase.* = 0;
+                value.* = op.shape.at(phase.*);
+            }
+        },
         .constant, .add, .multiply, .map_range, .wave, .tween, .noise, .motion => unreachable,
-        .bounce, .cues, .crossing, .input, .recorded => unreachable,
+        .bounce, .cues, .crossing, .input, .recorded, .track => unreachable,
     }
     for (after) |value| assert(std.math.isFinite(value));
 }
@@ -1950,13 +2259,20 @@ fn reset_node(program: *const Program, slab: []f64, node: *const Node) void {
     switch (node.op) {
         .chase => |op| {
             @memset(after, op.from);
-            @memset(own, 0);
+            @memset(own[0..output_count], 0);
+            if (any_param(op.params)) law_cache_reset(own[output_count..]);
         },
         .delay => |op| @memset(after, op.initial),
         .follow => |*op| {
-            follower_pack(simulation.follower_start(op, program.regions), after, own);
-            own[follower_slot_arrived] = 0;
-            own[follower_slot_arrived_goal] = op.from;
+            const kept = own[0..follower_slots];
+            follower_pack(simulation.follower_start(op, program.regions), after, kept);
+            kept[follower_slot_arrived] = 0;
+            kept[follower_slot_arrived_goal] = op.from;
+            if (own.len > follower_slots) law_cache_reset(own[follower_slots..]);
+        },
+        .oscillator => |op| {
+            @memset(own, op.phase);
+            @memset(after, op.shape.at(op.phase));
         },
         .shift => |*op| {
             simulation.shift_fill(op, own[1..]);
@@ -1965,7 +2281,7 @@ fn reset_node(program: *const Program, slab: []f64, node: *const Node) void {
             @memset(after, simulation.shift_value(op, own[1..], position));
         },
         .constant, .add, .multiply, .map_range, .wave, .tween, .noise, .motion => unreachable,
-        .bounce, .cues, .crossing, .input, .recorded => unreachable,
+        .bounce, .cues, .crossing, .input, .recorded, .track => unreachable,
     }
     @memcpy(before, after);
 }
@@ -2217,6 +2533,7 @@ test "moving the memory changes nothing" {
         .goals = &.{},
         .regions = &.{},
         .samples = &.{},
+        .tracks = &Tracks.empty,
         .start = .{ .index = 0 },
         .simulated = false,
         .slab_count = program.slab_count,
@@ -2229,6 +2546,7 @@ test "moving the memory changes nothing" {
         .checkpoints_filled = 0,
         .step = null,
         .generation = 0,
+        .track_generation = 0,
         .steps_run = 0,
         .recordings = undefined,
         .recordings_count = 0,
@@ -2756,6 +3074,7 @@ test "a motion's cursor never changes a value" {
         .goals = track.goals.table(),
         .regions = &.{},
         .samples = &.{},
+        .tracks = &Tracks.empty,
         .start = .{ .index = 0 },
         .simulated = false,
         .slab_count = 2 * (1 + motion.cursor_count),
@@ -2804,6 +3123,7 @@ test "springs ignore the frame rate" {
         .goals = track.goals.table(),
         .regions = &.{},
         .samples = &.{},
+        .tracks = &Tracks.empty,
         .start = .{ .index = 0 },
         .simulated = false,
         .slab_count = 2 * (1 + motion.cursor_count),
@@ -2837,6 +3157,7 @@ test "moving a cue reaches a motion's cursor" {
         .goals = track.goals.table(),
         .regions = &.{},
         .samples = &.{},
+        .tracks = &Tracks.empty,
         .start = .{ .index = 0 },
         .simulated = false,
         .slab_count = 2 * (1 + motion.cursor_count),
@@ -3535,6 +3856,7 @@ test "a bounce hits its walls at exact flicks" {
         .goals = &.{},
         .regions = &.{},
         .samples = &.{},
+        .tracks = &Tracks.empty,
         .start = .{ .index = 0 },
         .simulated = false,
         .slab_count = 2,
@@ -3896,6 +4218,7 @@ test "overflow keeps the earliest events and counts the rest exactly" {
         .goals = &.{},
         .regions = &.{},
         .samples = &.{},
+        .tracks = &Tracks.empty,
         .start = .{ .index = 0 },
         .simulated = false,
         .slab_count = 2,
@@ -3967,6 +4290,7 @@ test "a crossing fires where its input crosses, in the step" {
             .goals = &.{},
             .regions = &.{},
             .samples = &.{},
+            .tracks = &Tracks.empty,
             .start = .{ .index = 0 },
             .simulated = true,
             .slab_count = 4,
@@ -4717,6 +5041,9 @@ const Drawn = struct {
     regions: simulation.Regions,
     sample_entries: [32]Sample,
     samples: recording_module.Samples,
+    track_entries: [2]track_module.Track,
+    track_samples: [2][64]Sample,
+    tracks: Tracks,
     nodes: [nodes_max]Node,
     program: Program,
 
@@ -4761,12 +5088,19 @@ const Drawn = struct {
             }
             clip.* = try drawn.samples.add(samples[0..count]);
         }
+        drawn.tracks = Tracks.init(&drawn.track_entries);
+        for (&drawn.track_samples) |*samples| {
+            const low = between(random, -2, 1);
+            const high = low + between(random, 0, 3);
+            _ = try drawn.tracks.add(samples, low, high, between(random, low, high));
+        }
         var builder = Builder.init(&drawn.nodes, .{
             .slab_count_max = slab_count_max,
             .cues = &drawn.cues,
             .goals = drawn.goals.table(),
             .regions = drawn.regions.table(),
             .samples = drawn.samples.table(),
+            .tracks = &drawn.tracks,
             .seed = random.int(u64),
         });
         const count = random.intRangeAtMost(u32, 2, nodes_max - 1);
@@ -4795,7 +5129,12 @@ const Drawn = struct {
             }
         }.of;
         const other: Id = .{ .index = random.uintLessThan(u32, @max(builder.node_count, 1)) };
-        const choice = if (builder.node_count == 0) 0 else random.uintLessThan(u32, 19);
+        const choice = if (builder.node_count == 0) 0 else random.uintLessThan(u32, 23);
+        const from = struct {
+            fn maybe(r: std.Random, id: Id) ?Id {
+                return if (r.boolean()) id else null;
+            }
+        }.maybe;
         _ = switch (choice) {
             0 => try builder.constant(between(random, -2, 2)),
             1 => try builder.add(any, other),
@@ -4917,8 +5256,70 @@ const Drawn = struct {
                 break :blk try builder.input(.{ .low = low, .high = high, .initial = low });
             },
             17 => try builder.recorded(clips[random.uintLessThan(usize, clips.len)]),
+            18 => try builder.track(.{ .index = random.uintLessThan(u32, 2) }),
+            19 => try builder.oscillator(.{
+                .shape = random.enumValue(@import("wave.zig").Shape),
+                .rate = any,
+                .phase = between(random, 0, 0.99),
+            }),
+            20 => try builder.chase(.{
+                .target = any,
+                .from = between(random, -2, 2),
+                .time = seconds(random, 0.1, 1),
+                .overshoot = between(random, 0, 0.6),
+                .time_from = from(random, other),
+                .overshoot_from = from(random, other),
+            }),
+            21 => try builder.follow(.{
+                .from = between(random, -2, 2),
+                .regions = spans[random.uintLessThan(usize, spans.len)],
+                .pick = random.enumValue(simulation.Pick),
+                .mover = .{ .spring = .{
+                    .time = seconds(random, 0.1, 1),
+                    .overshoot = between(random, 0, 0.6),
+                } },
+                .tolerance = between(random, 0.01, 0.1),
+                .pause_min = .{ .flicks = 0 },
+                .pause_max = seconds(random, 0, 0.3),
+                .seed = random.int(u64),
+                .mover_from = .{ .time = from(random, any), .overshoot = from(random, other) },
+            }),
+            22 => try builder.follow(.{
+                .from = between(random, -2, 2),
+                .regions = spans[random.uintLessThan(usize, spans.len)],
+                .pick = random.enumValue(simulation.Pick),
+                .mover = .{ .newtonian = .{
+                    .speed = between(random, 0.5, 4),
+                    .accel = between(random, 0.5, 8),
+                    .decel = between(random, 0.5, 8),
+                } },
+                .tolerance = between(random, 0.01, 0.1),
+                .pause_min = .{ .flicks = 0 },
+                .pause_max = seconds(random, 0, 0.3),
+                .seed = random.int(u64),
+                .mover_from = .{
+                    .speed = from(random, any),
+                    .accel = from(random, other),
+                    .decel = from(random, any),
+                },
+            }),
             else => try builder.add(any, any),
         };
+    }
+
+    /// Writes each track at a drawn time in [-1 s, 4 s), past its bounds now and then, which a
+    /// write clamps. A full track refuses, which changes nothing.
+    fn write_tracks(drawn: *Drawn, random: std.Random) void {
+        for (0..drawn.tracks.count) |index| {
+            if (random.boolean()) continue;
+            const track = drawn.tracks.at(.{ .index = @intCast(index) });
+            const flicks = random.intRangeLessThan(i64, -flicks_per_second, 4 * flicks_per_second);
+            const value = between(random, track.low - 1, track.high + 1);
+            const id: TrackId = .{ .index = @intCast(index) };
+            drawn.tracks.write(id, .{ .flicks = flicks }, value) catch |err| {
+                assert(err == error.TrackFull);
+            };
+        }
     }
 
     /// Sets every input of `state` to a drawn value, past its range now and then.
@@ -4954,7 +5355,7 @@ fn expect_in_ranges(state: *const State, ranges: []const Range, graph: usize, ti
 
 // Locks the page's first check: in 2,000 drawn graphs over every op, each read forwards at 60 Hz,
 // then backwards and at drawn times, with its inputs set to drawn values, some past their range,
-// no value ever leaves its node's range.
+// and its tracks written between reads (step 9.5), no value ever leaves its node's range.
 test "no sampled value leaves its range" {
     var prng = std.Random.DefaultPrng.init(0x7a6e);
     const random = prng.random();
@@ -4976,12 +5377,14 @@ test "no sampled value leaves its range" {
         var tick: i64 = -6;
         while (tick < 240) : (tick += 7) {
             drawn.set_inputs(&state, random);
+            drawn.write_tracks(random);
             const time = Time.from_ticks(tick, rate).?;
             state.eval(time);
             try expect_in_ranges(&state, ranges, graph, time);
         }
         for (0..12) |_| {
             drawn.set_inputs(&state, random);
+            drawn.write_tracks(random);
             const flicks = random.intRangeLessThan(i64, -flicks_per_second, 4 * flicks_per_second);
             const time: Time = .{ .flicks = flicks };
             state.eval(time);
@@ -5029,4 +5432,291 @@ test "a loop through a delay never leaves its range" {
             try expect_in_ranges(&state, ranges, graph, time);
         }
     }
+}
+
+/// A page of live parameters (step 9.5): an oscillator, a chase, and two followers whose rates,
+/// times, overshoots, and limits come from tracks, as Play's knobs drive them.
+const Live = struct {
+    cue_times: [1]Time,
+    cues: Cues,
+    region_entries: [1]simulation.Region,
+    regions: simulation.Regions,
+    track_entries: [4]track_module.Track,
+    track_samples: [4][2048]Sample,
+    tracks: Tracks,
+    ids: [4]TrackId,
+    nodes: [12]Node,
+    program: Program,
+    outputs: [4]Id,
+
+    const slab_count_max = 96;
+
+    fn init(live: *Live) !void {
+        live.cues = try cue_table_at_zero(&live.cue_times);
+        live.regions = simulation.Regions.init(&live.region_entries);
+        _ = try live.regions.add(&.{.{ .low = 0, .high = 1 }});
+        live.tracks = Tracks.init(&live.track_entries);
+        const bounds = [4][3]f64{
+            .{ 0.1, 3, 0.5 },
+            .{ 0.125, 2, 0.5 },
+            .{ 0, 0.9, 0.3 },
+            .{ 0.25, 4, 1 },
+        };
+        for (&live.ids, &live.track_samples, bounds) |*id, *samples, bound| {
+            id.* = try live.tracks.add(samples, bound[0], bound[1], bound[2]);
+        }
+        var builder = Builder.init(&live.nodes, .{
+            .slab_count_max = slab_count_max,
+            .cues = &live.cues,
+            .regions = live.regions.table(),
+            .tracks = &live.tracks,
+            .seed = 9,
+        });
+        const rate = try builder.track(live.ids[0]);
+        const oscillator = try builder.oscillator(.{ .shape = .sine, .rate = rate });
+        const time = try builder.track(live.ids[1]);
+        const chase = try builder.chase(.{
+            .target = oscillator,
+            .from = 0,
+            .time = .{ .flicks = @divExact(flicks_per_second, 2) },
+            .overshoot = 0.1,
+            .time_from = time,
+        });
+        const overshoot = try builder.track(live.ids[2]);
+        const sway = try builder.follow(.{
+            .from = 0.5,
+            .regions = .{ .first = 0, .count = 1 },
+            .pick = .random,
+            .mover = .{ .spring = .{ .time = .{ .flicks = flicks_per_second }, .overshoot = 0.3 } },
+            .tolerance = 0.01,
+            .pause_min = .{ .flicks = 0 },
+            .pause_max = .{ .flicks = flicks_per_second },
+            .seed = 4,
+            .mover_from = .{ .overshoot = overshoot },
+        });
+        const speed = try builder.track(live.ids[3]);
+        const four = try builder.constant(4);
+        const limit = try builder.multiply(speed, four);
+        const glide = try builder.follow(.{
+            .from = 0.5,
+            .regions = .{ .first = 0, .count = 1 },
+            .pick = .random,
+            .mover = .{ .newtonian = .{ .speed = 1, .accel = 4, .decel = 4 } },
+            .tolerance = 0.01,
+            .pause_min = .{ .flicks = 0 },
+            .pause_max = .{ .flicks = @divExact(flicks_per_second, 2) },
+            .seed = 9,
+            .mover_from = .{ .speed = speed, .accel = limit, .decel = limit },
+        });
+        live.outputs = .{ oscillator, chase, sway, glide };
+        live.program = builder.finish();
+    }
+
+    fn values(live: *const Live, state: *const State) [4]f64 {
+        var result: [4]f64 = undefined;
+        for (&result, live.outputs) |*value, id| value.* = state.value(id);
+        return result;
+    }
+
+    /// A fresh state's values at `time`, with no checkpoints, so from the start.
+    fn fresh(live: *const Live, time: Time) [4]f64 {
+        var slab: [slab_count_max]f64 = undefined;
+        var state = State.init(live.program, slab[0..live.program.slab_count]);
+        state.eval(time);
+        return live.values(&state);
+    }
+};
+
+fn whole_seconds(count: i64) Time {
+    return .{ .flicks = count * flicks_per_second };
+}
+
+/// Static, since a page and its checkpoints are too large for the test's stack.
+const live_fixture = struct {
+    var live: Live = undefined;
+    var slab: [Live.slab_count_max]f64 = undefined;
+    var checkpoints: [70 * Live.slab_count_max]f64 = undefined;
+};
+
+// Locks section 14's floor: a reader played to 60 s, then writes at 30 s, keeps the 30
+// checkpoints before 30 s, and its reads at 10, 30, 45, and 60 s equal a fresh state's, bit for
+// bit; the read at 10 s runs at most one interval of steps, from a kept checkpoint.
+test "a track write keeps the past and drops only what it reaches" {
+    const live = &live_fixture.live;
+    try live.init();
+    const used = live.program.slab_count;
+    var state = State.init_with_checkpoints(
+        live.program,
+        live_fixture.slab[0..used],
+        live_fixture.checkpoints[0 .. 70 * @as(usize, used)],
+    );
+    const rate = Rate.from_hz(60).?;
+    for (0..3601) |frame| state.eval(Time.from_ticks(@intCast(frame), rate).?);
+    try testing.expectEqual(@as(u32, 60), state.checkpoints_filled);
+    try live.tracks.write(live.ids[0], whole_seconds(30), 2);
+    try live.tracks.write(live.ids[2], whole_seconds(30), 0.8);
+    try live.tracks.write(live.ids[3], whole_seconds(30), 0.5);
+    const before = state.steps_run;
+    state.eval(whole_seconds(10));
+    try testing.expectEqual(@as(u32, 30), state.checkpoints_filled);
+    try testing.expect(state.steps_run - before <= simulation.checkpoint_interval);
+    try testing.expectEqualSlices(f64, &live.fresh(whole_seconds(10)), &live.values(&state));
+    for ([_]i64{ 30, 45, 60, 10 }) |at| {
+        state.eval(whole_seconds(at));
+        try testing.expectEqualSlices(f64, &live.fresh(whole_seconds(at)), &live.values(&state));
+    }
+}
+
+// Locks the cost of a knob: playing at 60 Hz for 30 s with a write of every track at the playhead
+// each frame, no frame runs more than its own steps and one interval, and the values are a fresh
+// state's at the end, bit for bit.
+test "a write at the playhead costs at most one interval" {
+    const live = &live_fixture.live;
+    try live.init();
+    const used = live.program.slab_count;
+    var state = State.init_with_checkpoints(
+        live.program,
+        live_fixture.slab[0..used],
+        live_fixture.checkpoints[0 .. 70 * @as(usize, used)],
+    );
+    const rate = Rate.from_hz(60).?;
+    var most: u64 = 0;
+    for (0..1801) |frame| {
+        const time = Time.from_ticks(@intCast(frame), rate).?;
+        const swing: f64 = @floatFromInt(frame % 7);
+        for (live.ids, 0..) |id, index| {
+            const track = live.tracks.at(id);
+            const share = (swing + @as(f64, @floatFromInt(index))) / 10;
+            try live.tracks.write(id, time, track.low + (track.high - track.low) * share);
+        }
+        const before = state.steps_run;
+        state.eval(time);
+        most = @max(most, state.steps_run - before);
+    }
+    try testing.expect(most <= 8 + simulation.checkpoint_interval);
+    try testing.expectEqualSlices(f64, &live.fresh(whole_seconds(30)), &live.values(&state));
+}
+
+// Locks parameters from nodes against constants: a chase, a spring follower, and a Newtonian
+// follower whose parameters come from constant nodes equal the same nodes with constant
+// parameters, at 60 Hz for 60 s, bit for bit.
+test "parameters from constant nodes equal constant parameters" {
+    var times: [1]Time = undefined;
+    const cues = try cue_table_at_zero(&times);
+    var region_entries: [1]simulation.Region = undefined;
+    var regions = simulation.Regions.init(&region_entries);
+    _ = try regions.add(&.{.{ .low = -1, .high = 1 }});
+    var nodes: [16]Node = undefined;
+    var builder = Builder.init(&nodes, .{
+        .slab_count_max = 128,
+        .cues = &cues,
+        .regions = regions.table(),
+        .seed = 3,
+    });
+    const target = try builder.wave(.{ .shape = .triangle, .hz = 0.7 });
+    const time: Time = .{ .flicks = 282_240_000 };
+    const seconds = try builder.constant(0.4);
+    const overshoot = try builder.constant(0.15);
+    const chase: Chase = .{ .target = target, .from = 0, .time = time, .overshoot = 0.15 };
+    var chase_from = chase;
+    chase_from.time_from = seconds;
+    chase_from.overshoot_from = overshoot;
+    const spring: Follow = .{
+        .from = 0,
+        .regions = .{ .first = 0, .count = 1 },
+        .pick = .random,
+        .mover = .{ .spring = .{ .time = time, .overshoot = 0.15 } },
+        .tolerance = 0.02,
+        .pause_min = .{ .flicks = 0 },
+        .pause_max = .{ .flicks = 282_240_000 },
+        .seed = 5,
+    };
+    var spring_from = spring;
+    spring_from.mover_from = .{ .time = seconds, .overshoot = overshoot };
+    var newtonian = spring;
+    newtonian.mover = .{ .newtonian = .{ .speed = 1.5, .accel = 6, .decel = 4 } };
+    var newtonian_from = newtonian;
+    newtonian_from.mover_from = .{
+        .speed = try builder.constant(1.5),
+        .accel = try builder.constant(6),
+        .decel = try builder.constant(4),
+    };
+    const pairs = [3][2]Id{
+        .{ try builder.chase(chase), try builder.chase(chase_from) },
+        .{ try builder.follow(spring), try builder.follow(spring_from) },
+        .{ try builder.follow(newtonian), try builder.follow(newtonian_from) },
+    };
+    const program = builder.finish();
+    var slab: [128]f64 = undefined;
+    var state = State.init(program, slab[0..program.slab_count]);
+    const rate = Rate.from_hz(60).?;
+    for (0..3601) |frame| {
+        state.eval(Time.from_ticks(@intCast(frame), rate).?);
+        for (pairs) |pair| {
+            const constant: u64 = @bitCast(state.value(pair[0]));
+            try testing.expectEqual(constant, @as(u64, @bitCast(state.value(pair[1]))));
+        }
+    }
+}
+
+// Locks the oscillator: at a constant rate it is the wave at that rate, at every step for 10 s,
+// within the rounding of its summed phase.
+test "an oscillator at a constant rate is the wave" {
+    var times: [1]Time = undefined;
+    const cues = try cue_table_at_zero(&times);
+    var nodes: [3]Node = undefined;
+    var builder = Builder.init(&nodes, .{ .slab_count_max = 16, .cues = &cues });
+    const rate = try builder.constant(1.25);
+    const oscillator = try builder.oscillator(.{ .shape = .sine, .rate = rate });
+    const program = builder.finish();
+    var slab: [16]f64 = undefined;
+    var state = State.init(program, slab[0..program.slab_count]);
+    const wave: Wave = .{ .shape = .sine, .hz = 1.25 };
+    for (0..4801) |step| {
+        const time = step_time(.{ .flicks = 0 }, step);
+        state.eval(time);
+        try testing.expectApproxEqAbs(wave.sample(time), state.value(oscillator), 1e-9);
+    }
+    var out: [3]Range = undefined;
+    const range = ranges_of(&program, &out)[oscillator.index];
+    try testing.expect(range.low <= -1 and range.high >= 1);
+}
+
+// Locks the refusals of step 9.5, by name.
+test "the builder refuses live parameters it cannot use" {
+    var times: [1]Time = undefined;
+    const cues = try cue_table_at_zero(&times);
+    var region_entries: [1]simulation.Region = undefined;
+    var regions = simulation.Regions.init(&region_entries);
+    _ = try regions.add(&.{.{ .low = 0, .high = 1 }});
+    var nodes: [4]Node = undefined;
+    var builder = Builder.init(&nodes, .{
+        .slab_count_max = 64,
+        .cues = &cues,
+        .regions = regions.table(),
+    });
+    const one = try builder.constant(1);
+    try testing.expectError(error.UnknownTrack, builder.track(.{ .index = 0 }));
+    const late: Oscillator = .{ .shape = .sine, .rate = one, .phase = 1 };
+    try testing.expectError(error.InvalidPhase, builder.oscillator(late));
+    const unknown: Oscillator = .{ .shape = .sine, .rate = .{ .index = 5 } };
+    try testing.expectError(error.UnknownNode, builder.oscillator(unknown));
+    var follow: Follow = .{
+        .from = 0,
+        .regions = .{ .first = 0, .count = 1 },
+        .pick = .cycle,
+        .mover = .{ .spring = .{ .time = .{ .flicks = flicks_per_second }, .overshoot = 0 } },
+        .tolerance = 0.01,
+        .pause_min = .{ .flicks = 0 },
+        .pause_max = .{ .flicks = 0 },
+        .seed = 1,
+        .mover_from = .{ .speed = one },
+    };
+    try testing.expectError(error.InvalidParameter, builder.follow(follow));
+    follow.mover = .{ .newtonian = .{ .speed = 1, .accel = 1, .decel = 1 } };
+    follow.mover_from = .{ .time = one };
+    try testing.expectError(error.InvalidParameter, builder.follow(follow));
+    follow.mover_from = .{ .decel = .{ .index = 7 } };
+    try testing.expectError(error.UnknownNode, builder.follow(follow));
+    try testing.expectEqual(@as(u32, 1), builder.node_count);
 }

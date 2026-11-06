@@ -183,6 +183,23 @@ pub fn spring_one(from: f64, goal: f64, zeta: f64) Range {
     return result.widen(result.scale(), margin_motion);
 }
 
+/// The range of a spring follower whose damping ratio changes from step to step and whose omega
+/// does not, with its start and regions in `inputs`, arriving within `tolerance`. Its amplitude
+/// about its goal, `A^2 = e^2 + (e' / omega)^2`, never grows while its goal holds, whatever the
+/// damping, since `d(A^2)/dt = -4 zeta e'^2 / omega`. It changes goal only after arriving, when
+/// `A <= tolerance (1 + 1 / omega)`, and a new goal is at most the hull's width W away, so from
+/// then on `A <= W + 2 tolerance (1 + 1 / omega)`. The first goal starts at rest, within W. So it
+/// stays within that of the hull. Looser than `spring`, which needs a constant law, and as sound.
+pub fn follower_damping(inputs: Range, tolerance: f64, omega: f64) Range {
+    inputs.assert_valid();
+    assert(tolerance >= 0);
+    assert(omega > 0);
+    if (!std.math.isFinite(inputs.low) or !std.math.isFinite(inputs.high)) return Range.unbounded;
+    const reach = (inputs.high - inputs.low) + 2 * tolerance * (1 + 1 / omega);
+    const result: Range = .{ .low = inputs.low - reach, .high = inputs.high + reach };
+    return result.widen(result.scale(), margin_motion);
+}
+
 /// The range of a Newtonian move with these limits whose inputs, its start included, stay in
 /// `inputs`, as section 4 explains.
 pub fn newtonian(inputs: Range, speed: f64, decel: f64) Range {
