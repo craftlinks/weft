@@ -1,0 +1,19 @@
+.{
+    .name = .play,
+    .version = "0.0.1",
+    .fingerprint = 0x5e89deba62227b10,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        .weft = .{ .path = ".." },
+        .patchwork = .{ .path = "../../patchwork" },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "app.zig",
+        "scope.zig",
+        "signals.zig",
+        "glue.zig",
+        "test",
+    },
+}

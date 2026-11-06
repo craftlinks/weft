@@ -116,7 +116,8 @@ sections below show each part in use.
 | Zig | **0.17.0** exactly (`minimum_zig_version`). |
 | Node | Only for `zig build regress`, which runs the wasm build. |
 
-The package has an empty dependency list, and the library links nothing, not even libc.
+The package has an empty dependency list, and the library links nothing, not even libc. Play, in
+`play/`, is a package of its own with its own requirements; see Play below.
 
 ## Try It
 
@@ -125,6 +126,7 @@ zig build test                      # unit tests
 zig build regress                   # sampled signals against the golden, native and wasm
 zig build regress -- --bless        # rewrite the golden, if native and wasm agree
 zig build wasm                      # the wasm32-freestanding build
+zig build bench -Doptimize=ReleaseFast   # what reads cost on this machine
 ```
 
 ## Layout
@@ -149,9 +151,11 @@ test/
   catalog.zig         the sampled signals, rendered as text of hex floats
   golden/signals.txt  the committed samples
 tools/
+  bench.zig           times four cases of reads, for zig build bench
   regress.zig         compares native and wasm text with the golden, and blesses
   regress_wasm.zig    the catalog on wasm32-freestanding
   regress_wasm.mjs    runs that module under Node and prints its text
+play/                 a package of its own: the Play app, on Weft and Patchwork
 ```
 
 Every file starts with a guide for reviewers: `//! … # Deep Architectural Guide for Reviewers:`.
@@ -451,3 +455,36 @@ regress: native differs from golden at line 700
 ```
 
 Bless only for a change the step means to make, in that step's commit.
+
+## Bench
+
+`zig build bench -Doptimize=ReleaseFast` prints its build mode and one line per case: a pure
+graph of 16 waves summed, per eval; four chases on a wave plus noise playing forwards at 60 Hz, per
+frame; that graph from a fresh state, the first eval at 60 s and at 600 s; and a bounce and cues,
+`events` per 128-frame block at 48 kHz. It is native only and needs no GPU. Its numbers depend on
+the machine, so it has no thresholds and is not part of `test` or `regress`.
+
+## Play
+
+Play is Weft's first client: a Patchwork app that plots eight signals, one or more of each class
+but live, over a window from one second before the playhead to three after it, with each signal's
+range, its goal where it has one, and the cues. Space or the button plays and pauses, the slider
+scrubs, Home goes to 0, and Left and Right step 100 ms.
+
+```bash
+cd play
+zig build run                       # natively (Wayland, and a GPU through wgpu-native)
+zig build serve-play                # in the browser, on localhost
+zig build test                      # its tests, with no GPU
+zig build regress -Doptimize=ReleaseFast   # its scenarios against test/golden (needs a GPU)
+```
+
+It needs Patchwork checked out beside Weft, at `../patchwork`, and Patchwork's requirements.
+`play/` depends on Weft through `.path = ".."` and on Patchwork through
+`.path = "../../patchwork"`, so neither library enters the other's `build.zig.zon`, and Weft's
+own package still has no dependencies.
+
+**The two-file rule.** Only `play/signals.zig`, the signal table, and `play/glue.zig` import
+`weft`. Everything else in Play draws plain numbers: the glue hands time over as a `Clock`, and the
+samples, ranges, classes, and report as `f32` arrays and plain structs. The glue has a budget of
+60 lines of code; growing past it says the boundary or Weft's API is wrong.
