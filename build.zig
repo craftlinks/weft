@@ -64,4 +64,19 @@ pub fn build(b: *std.Build) void {
     regress_run.addPassthruArgs();
     regress_run.has_side_effects = true;
     b.step("regress", "Compare sampled signals with the golden").dependOn(&regress_run.step);
+
+    // Native only, with no thresholds: its numbers depend on the machine (`tools/bench.zig`).
+    const bench = b.addExecutable(.{
+        .name = "weft-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/bench.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "weft", .module = weft }},
+        }),
+    });
+    const bench_run = b.addRunArtifact(bench);
+    bench_run.has_side_effects = true;
+    const bench_step = b.step("bench", "Time reads on this machine (use -Doptimize=ReleaseFast)");
+    bench_step.dependOn(&bench_run.step);
 }
