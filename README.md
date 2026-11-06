@@ -146,6 +146,7 @@ src/
     recording.zig     Samples and Recording: live input written down and played back
     simulation.zig    the fixed step, seeded draws, the goal follower, and the shift register
     time.zig          Time and Rate: an integer count of flicks
+    track.zig         Tracks: timed values a client writes, read as signals, latched from a time
     wave.zig          Wave: sine, triangle, saw, and square, pure functions of time
 test/
   catalog.zig         the sampled signals, rendered as text of hex floats
@@ -200,14 +201,14 @@ const value = state.value(output);
 ```
 
 The ops are `constant`, `add`, `multiply`, `map_range`, `wave`, `noise`, `tween`, `spring`,
-`newtonian`, `chase`, `follow`, `shift`, `delay`, `bounce`, `crossing`, `cues`, `input`, and
-`recorded`. The builder refuses by name what does not fit or cannot be evaluated:
-`error.NodeCapacityExceeded`, `error.SlabCapacityExceeded`, `error.UnknownNode`,
+`newtonian`, `chase`, `follow`, `shift`, `delay`, `bounce`, `crossing`, `cues`, `input`,
+`recorded`, `oscillator`, and `track`. The builder refuses by name what does not fit or cannot
+be evaluated: `error.NodeCapacityExceeded`, `error.SlabCapacityExceeded`, `error.UnknownNode`,
 `error.NotFinite`, `error.InvalidRange`, `error.UnknownCue`, `error.InvalidDuration`,
 `error.InvalidEase`, `error.InvalidRate`, `error.UnknownGoals`, `error.InvalidOvershoot`,
 `error.InvalidLimit`, `error.UnknownRegions`, `error.InvalidTolerance`, `error.InvalidPause`,
-`error.InvalidOdds`, `error.InvalidBuckets`, `error.NotADelay`, `error.DelayClosed`, and
-`error.UnknownSamples`.
+`error.InvalidOdds`, `error.InvalidBuckets`, `error.NotADelay`, `error.DelayClosed`,
+`error.UnknownSamples`, `error.UnknownTrack`, `error.InvalidParameter`, and `error.InvalidPhase`.
 
 A node can only refer to earlier nodes, so a cycle can only pass through a delay. Neither the node
 array nor the slab holds a pointer: copied as bytes, the nodes are the same program and the slab is
@@ -440,6 +441,39 @@ held forward from each sample, so the recorded program read at the same times gi
 values, bit for bit, and can be read at any time. `range.zig` and `recording.zig` explain the
 rules.
 
+## Live Parameters
+
+```zig
+var samples: [4096]weft.Sample = undefined;
+var entries: [1]weft.Track = undefined;
+var tracks = weft.Tracks.init(&entries);
+const knob = try tracks.add(&samples, 0.1, 2, 0.5);      // bounds, and the value before a write
+var builder = weft.Builder.init(&nodes, .{ .slab_count_max = 64, .cues = &cues,
+    .tracks = &tracks });                                // the program reads the table, as cues
+const time = try builder.track(knob);                    // the track's value at each time: pure
+const follower = try builder.chase(.{ .target = target, .from = 0, .time = half_second,
+    .overshoot = 0.1, .time_from = time });              // its spring's time, read at each step
+
+try tracks.write(knob, now, 1.25);                       // from now on: the past keeps its values
+```
+
+A knob can mean two things. A rebuild with a new parameter rewrites history: the whole timeline
+changes, which suits a document such as an explainer, and costs a read from the start cue to t for
+simulated nodes. A **track** applies from now on, as an instrument does: `write(track, t, v)` holds
+v from t until a later write and removes what was written after t, as a latch automation lane
+does. A program reads tracks as it reads cues, so it stays a function of t, seekable, and
+scrubbing back shows what was played. A write drops only the checkpoints that read a changed
+value, so a write at the playhead costs about a microsecond, and one in the past at most a
+second's steps.
+
+The parameters of simulated nodes can come from nodes: a chase's `time_from` and
+`overshoot_from`, and a follower's `mover_from` (a spring's time and overshoot, or a Newtonian
+move's speed, accel, and decel). An `oscillator` is a wave whose rate is a node; its phase is the
+rate summed over the steps, so it is simulated. Exact springs toward goals and waves keep constant
+parameters, since a varying one would make them simulated. A spring whose stiffness comes from a
+node has no range Weft can prove, so it reports an unbounded one; `graph.zig`, section 14,
+explains the bounds that hold.
+
 ## Regress
 
 `zig build regress` renders `test/catalog.zig` on native and on wasm and compares both with
@@ -460,9 +494,10 @@ Bless only for a change the step means to make, in that step's commit.
 
 `zig build bench -Doptimize=ReleaseFast` prints its build mode and one line per case: a pure
 graph of 16 waves summed, per eval; four chases on a wave plus noise playing forwards at 60 Hz, per
-frame; that graph from a fresh state, the first eval at 60 s and at 600 s; and a bounce and cues,
-`events` per 128-frame block at 48 kHz. It is native only and needs no GPU. Its numbers depend on
-the machine, so it has no thresholds and is not part of `test` or `regress`.
+frame; that graph from a fresh state, the first eval at 60 s and at 600 s; a bounce and cues,
+`events` per 128-frame block at 48 kHz; and a track write at the playhead at 600 s, then the
+frame's eval, which is what a knob costs from now on. It is native only and needs no GPU. Its
+numbers depend on the machine, so it has no thresholds and is not part of `test` or `regress`.
 
 ## Play
 

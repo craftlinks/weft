@@ -28,6 +28,7 @@ pub const range = @import("core/range.zig");
 pub const recording = @import("core/recording.zig");
 pub const simulation = @import("core/simulation.zig");
 pub const time = @import("core/time.zig");
+pub const track = @import("core/track.zig");
 pub const wave = @import("core/wave.zig");
 
 pub const Cue = cue.Cue;
@@ -45,7 +46,9 @@ pub const Extent = graph.Extent;
 pub const Follow = graph.Follow;
 pub const Id = graph.Id;
 pub const Input = graph.Input;
+pub const MoverFrom = graph.MoverFrom;
 pub const Node = graph.Node;
+pub const Oscillator = graph.Oscillator;
 pub const Program = graph.Program;
 pub const Range = range.Range;
 pub const Report = range.Report;
@@ -66,6 +69,9 @@ pub const Region = simulation.Region;
 pub const Regions = simulation.Regions;
 pub const Span = simulation.Span;
 pub const Rate = time.Rate;
+pub const Track = track.Track;
+pub const TrackId = track.TrackId;
+pub const Tracks = track.Tracks;
 pub const Time = time.Time;
 pub const Shape = wave.Shape;
 pub const Wave = wave.Wave;
@@ -82,5 +88,6 @@ test {
     _ = recording;
     _ = simulation;
     _ = time;
+    _ = track;
     _ = wave;
 }

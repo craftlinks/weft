@@ -51,7 +51,15 @@
 //! events, so every line before them is a line of step 7, and they lock the playback rule: the
 //! last sample at or before the time, held forward.
 //!
-//! ## 9. TigerStyle Invariants
+//! ## 9. Live Parameters
+//! Four graphs read tracks (step 9.5): an oscillator whose rate is a track, a chase whose time is
+//! one, a spring follower whose overshoot is one, and a Newtonian follower whose limits are one and
+//! four times it. Each track is written at fixed times after the epoch, so these too are the same
+//! at every epoch, and they lock the latch, an oscillator's summed phase, and the laws a step takes
+//! from its parameter nodes. They come after the recorded graph, so every line before them is a
+//! line of step 8.
+//!
+//! ## 10. TigerStyle Invariants
 //! - The text fits in `text_size_max` by construction, so `render` cannot fail.
 
 const std = @import("std");
@@ -103,6 +111,10 @@ const Graph = enum {
     shift,
     feedback,
     recorded,
+    oscillator,
+    live_chase,
+    live_sway,
+    live_glide,
 
     const nodes_count_max = 8;
     /// Room for the outputs of `nodes_count_max` nodes, and for the largest cache: two motions'
@@ -124,19 +136,38 @@ const Graph = enum {
         .{ 0.5, 0.25 }, .{ 1.125, -0.625 }, .{ 1.75, 0.875 }, .{ 2.625, -0.25 }, .{ 3.25, 0.5 },
     };
     const recorded_clip: weft.Clip = .{ .first = 0, .count = recorded_samples.len };
+
+    /// The tracks of the live graphs: their bounds and initial values, then their writes as
+    /// seconds after the epoch and values, in time order (section 9).
+    const tracks_count = 4;
+    const track_bounds = [tracks_count][3]f64{
+        .{ 0.25, 3, 1 }, // an oscillator's rate, Hz
+        .{ 0.125, 1, 0.5 }, // a chase's time, s
+        .{ 0, 0.9, 0.2 }, // a follower's overshoot
+        .{ 0.25, 4, 1 }, // a Newtonian follower's speed
+    };
+    const track_writes = [tracks_count][2][2]f64{
+        .{ .{ 0.5, 2 }, .{ 2, 0.75 } },
+        .{ .{ 1, 0.25 }, .{ 2.5, 0.875 } },
+        .{ .{ 0.75, 0.7 }, .{ 3, 0 } },
+        .{ .{ 1.25, 3 }, .{ 2.5, 0.5 } },
+    };
 };
 
 /// The graphs whose bits are the same at every epoch, because they read only differences of cue
 /// times and the time.
 const graphs_epoch_free = [_]Graph{
-    .sequence, .spring, .glide, .chase, .follow, .shift, .feedback, .recorded,
+    .sequence,   .spring,     .glide,     .chase,      .follow, .shift, .feedback, .recorded,
+    .oscillator, .live_chase, .live_sway, .live_glide,
 };
 
 /// The graphs rendered before the events, the graphs of step 6.
 const graphs = std.enums.values(Graph)[0 .. std.enums.values(Graph).len - graphs_after_events.len];
 
 /// The graphs rendered after the events, so the lines of step 7 stay where they were.
-const graphs_after_events = [_]Graph{.recorded};
+const graphs_after_events = [_]Graph{
+    .recorded, .oscillator, .live_chase, .live_sway, .live_glide,
+};
 
 /// The graphs whose events are listed, each built by `event_graph_build`.
 const EventGraph = enum {
@@ -195,7 +226,7 @@ pub const text_size_max = line_count * line_size_max;
 comptime {
     assert(wave_sample_count == 1536);
     assert(noise_sample_count == 768);
-    assert(graph_sample_count == 1056);
+    assert(graph_sample_count == 1440);
     const graphs_last = std.enums.values(Graph)[graphs.len..];
     for (graphs_after_events, graphs_last) |late, last| assert(late == last);
     assert(event_count == 144);
@@ -286,6 +317,9 @@ const Tables = struct {
     regions: weft.Regions,
     sample_entries: [Graph.recorded_samples.len]weft.Sample,
     samples: weft.Samples,
+    track_entries: [Graph.tracks_count]weft.Track,
+    track_samples: [Graph.tracks_count][2]weft.Sample,
+    tracks: weft.Tracks,
 
     fn init(tables: *Tables, epoch: *const Epoch) void {
         tables.cues = weft.Cues.init(&tables.cue_times);
@@ -326,6 +360,19 @@ const Tables = struct {
         }
         const clip = tables.samples.add(&samples) catch unreachable;
         assert(std.meta.eql(clip, Graph.recorded_clip));
+        tables.tracks = weft.Tracks.init(&tables.track_entries);
+        const second: f64 = @floatFromInt(weft.time.flicks_per_second);
+        const epoch_flicks = epoch.seconds * weft.time.flicks_per_second;
+        const rows = .{ &tables.track_samples, Graph.track_bounds, Graph.track_writes };
+        for (rows[0], rows[1], rows[2]) |*entries, bound, writes| {
+            const id = tables.tracks.add(entries, bound[0], bound[1], bound[2]) catch unreachable;
+            for (writes) |row| {
+                // Each time is a whole number of quarter seconds, so its flicks are exact.
+                const after: i64 = @intFromFloat(row[0] * second);
+                const time: weft.Time = .{ .flicks = epoch_flicks + after };
+                tables.tracks.write(id, time, row[1]) catch unreachable;
+            }
+        }
     }
 
     /// A builder over these tables, with the first cue as the start.
@@ -337,6 +384,7 @@ const Tables = struct {
             .goals = tables.goals.table(),
             .regions = tables.regions.table(),
             .samples = tables.samples.table(),
+            .tracks = &tables.tracks,
             .start = .{ .index = 0 },
             .seed = noise_seed,
         });
@@ -521,6 +569,58 @@ fn graph_build(graph: Graph, builder: *weft.Builder) weft.Builder.Error!weft.Id 
             });
             try builder.close(echo, result);
             return result;
+        },
+        // A triangle whose rate is a track, from 1 Hz, written to 2 Hz and back down to 0.75 Hz.
+        .oscillator => {
+            const rate = try builder.track(.{ .index = 0 });
+            return builder.oscillator(.{ .shape = .triangle, .rate = rate, .phase = 0.25 });
+        },
+        // A chase of the sequence whose time is a track: 0.5 s, then 0.25 s, then 0.875 s.
+        .live_chase => {
+            const target = try build_sequence(builder);
+            const time = try builder.track(.{ .index = 1 });
+            return builder.chase(.{
+                .target = target,
+                .from = 0,
+                .time = .{ .flicks = flicks_per_half_second },
+                .overshoot = 0.15,
+                .time_from = time,
+            });
+        },
+        // The follower of `follow` on a 0.4 s spring whose overshoot is a track.
+        .live_sway => {
+            const overshoot = try builder.track(.{ .index = 2 });
+            return builder.follow(.{
+                .from = 0,
+                .regions = .{ .first = 0, .count = Graph.regions_count },
+                .pick = .random,
+                .mover = .{ .spring = .{
+                    .time = .{ .flicks = 4 * @divExact(weft.time.flicks_per_second, 10) },
+                    .overshoot = 0.2,
+                } },
+                .tolerance = 0.02,
+                .pause_min = .{ .flicks = @divExact(weft.time.flicks_per_second, 10) },
+                .pause_max = .{ .flicks = 4 * @divExact(weft.time.flicks_per_second, 10) },
+                .seed = 7,
+                .mover_from = .{ .overshoot = overshoot },
+            });
+        },
+        // A Newtonian follower whose speed is a track and whose accel and decel are four times it.
+        .live_glide => {
+            const speed = try builder.track(.{ .index = 3 });
+            const four = try builder.constant(4);
+            const limit = try builder.multiply(speed, four);
+            return builder.follow(.{
+                .from = 0,
+                .regions = .{ .first = 0, .count = Graph.regions_count },
+                .pick = .random,
+                .mover = .{ .newtonian = .{ .speed = 1, .accel = 4, .decel = 4 } },
+                .tolerance = 0.02,
+                .pause_min = .{ .flicks = 0 },
+                .pause_max = .{ .flicks = 3 * @divExact(weft.time.flicks_per_second, 10) },
+                .seed = 8,
+                .mover_from = .{ .speed = speed, .accel = limit, .decel = limit },
+            });
         },
         // A spring chasing a recording played back.
         .recorded => {

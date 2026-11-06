@@ -159,15 +159,25 @@ pub const SpringLaw = struct {
     /// The law of a spring with this `time` and `overshoot`, which section 4 explains.
     pub fn of(time: Time, overshoot: f64) SpringLaw {
         assert(time.flicks > 0);
+        return of_seconds(time.seconds(), overshoot);
+    }
+
+    /// `of` with the time in seconds, as a parameter from a node gives it.
+    pub fn of_seconds(seconds: f64, overshoot: f64) SpringLaw {
+        assert(seconds > 0);
+        assert(std.math.isFinite(seconds));
+        return from_omega_zeta(std.math.tau / seconds, zeta_of(overshoot));
+    }
+
+    /// The damping ratio whose peak overshoot from rest is `overshoot`: 1 at 0.
+    pub fn zeta_of(overshoot: f64) f64 {
         assert(overshoot >= 0);
         assert(overshoot < 1);
-        const omega = std.math.tau / time.seconds();
-        if (overshoot == 0) return from_omega_zeta(omega, 1);
+        if (overshoot == 0) return 1;
         // The peak overshoot from rest is exp(-pi zeta / sqrt(1 - zeta^2)), solved for zeta.
         const log_overshoot = elementary.log(overshoot);
         const pi_squared = std.math.pi * std.math.pi;
-        const zeta = -log_overshoot / @sqrt(pi_squared + log_overshoot * log_overshoot);
-        return from_omega_zeta(omega, zeta);
+        return -log_overshoot / @sqrt(pi_squared + log_overshoot * log_overshoot);
     }
 
     pub fn from_omega_zeta(omega: f64, zeta: f64) SpringLaw {
