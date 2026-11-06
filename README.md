@@ -501,10 +501,21 @@ numbers depend on the machine, so it has no thresholds and is not part of `test`
 
 ## Play
 
-Play is Weft's first client: a Patchwork app that plots eight signals, one or more of each class
-but live, over a window from one second before the playhead to three after it, with each signal's
-range, its goal where it has one, and the cues. Space or the button plays and pauses, the slider
-scrubs, Home goes to 0, and Left and Right step 100 ms.
+Play is Weft's first client: a Patchwork app with two pages on one 600 s clock.
+
+- **scope** plots eight signals, one or more of each class but live, over a window from one second
+  before the playhead to three after it, with each signal's range, its goal where it has one, and
+  the cues.
+- **shapes** draws lines, a star, a filled pentagon, and a cubic curve whose 11 parameters are
+  destinations. Each reads one of 16 sources, the scope's eight and eight more, through the
+  source's declared range, so it never leaves its own range. A button beside each destination
+  re-points it to the next source, live, without touching the program. Four knobs set parameters
+  of the program from now on: each is a track (see Live Parameters), so a turn at t leaves the
+  past as it was played, scrubbing back shows the knob as it moved, and a turn costs tens of
+  microseconds a frame at any t.
+
+Space or the play button plays and pauses, the page button or 1 and 2 switch pages, the slider
+scrubs, Home and End go to the ends, Left and Right step 100 ms, and Page Up and Page Down 10 s.
 
 ```bash
 cd play
@@ -512,6 +523,7 @@ zig build run                       # natively (Wayland, and a GPU through wgpu-
 zig build serve-play                # in the browser, on localhost
 zig build test                      # its tests, with no GPU
 zig build regress -Doptimize=ReleaseFast   # its scenarios against test/golden (needs a GPU)
+zig build bench -Doptimize=ReleaseFast -- knob_600   # a knob dragged at 600 s, per frame
 ```
 
 It needs Patchwork checked out beside Weft, at `../patchwork`, and Patchwork's requirements.
@@ -520,6 +532,7 @@ It needs Patchwork checked out beside Weft, at `../patchwork`, and Patchwork's r
 own package still has no dependencies.
 
 **The two-file rule.** Only `play/signals.zig`, the signal table, and `play/glue.zig` import
-`weft`. Everything else in Play draws plain numbers: the glue hands time over as a `Clock`, and the
+`weft`. Everything else in Play (`app.zig`, `scope.zig`, `patch.zig`, `shapes.zig`) draws plain
+numbers: the glue hands time over as a `Clock`, and the
 samples, ranges, classes, and report as `f32` arrays and plain structs. The glue has a budget of
 60 lines of code; growing past it says the boundary or Weft's API is wrong.

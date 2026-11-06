@@ -1,44 +1,75 @@
-//! Play: Weft's own Modulator Play, a scope of eight signals around a playhead on Patchwork.
+//! Play: Weft's own Modulator Play on Patchwork: a scope of signals around a playhead, and a page
+//! of shapes whose parameters any signal can drive.
 //!
 //! # Deep Architectural Guide for Reviewers:
 //!
 //! ## 1. The Two-File Rule
-//! Only `signals.zig` and `glue.zig` import `weft`. This file and `scope.zig` see time as a
-//! `glue.Clock` and everything else as `f32` arrays and plain structs, so the app is the only glue
-//! between Weft and Patchwork, and neither library knows the other exists.
+//! Only `signals.zig` and `glue.zig` import `weft`. This file, `scope.zig`, `patch.zig`, and
+//! `shapes.zig` see time as a `glue.Clock` and everything else as `f32` arrays and plain structs,
+//! so the app is the only glue between Weft and Patchwork, and neither library knows the other
+//! exists. The app reads each row's name, accent, and goal kind from the signal table through
+//! `motion.signals`, which names no Weft type.
 //!
 //! ## 2. Screen
 //! ```text
 //! 1280 x 720 at scale 1
-//! y 0..48     transport: play button (8, 8, 88 x 32), scrub slider (104, 8, 720 x 32), label
-//! y 48..688   eight rows of 80 px: a 200 px label column, then the plot (`scope.zig`)
+//! y 0..48    transport: play (8, 8, 88 x 32), page (104, 8, 88 x 32), scrub (200, 8, 640 x 32),
+//!            then the label
+//! scope      eight rows of 80 px from y 48: a 200 px label column, then the plot (`scope.zig`)
+//! shapes     left column x 16..352: four knobs of 160 x 72 in two rows from y 56, then eleven
+//!            patch rows of 32 px from y 224 (name, source button, bar); the canvas x 368..1272,
+//!            y 56..712 (`shapes.zig`)
 //! ```
-//! Each plot is a window from `t - 1 s` to `t + 3 s`, so the playhead sits at a quarter of its
-//! width and a viewer sees where each signal is going, which only a seekable program can show.
+//! Each scope plot is a window from `t - 1 s` to `t + 3 s`, so the playhead sits at a quarter of
+//! its width. The shapes page reads only the playhead reader, so it never samples that window.
 //!
 //! ## 3. Transport
 //! Time follows frames: the timer is off, `t` advances on the `frame` event by its delta, clamped
 //! at `dt_max_ms` so a stall loses time, and the app asks for the next frame only while playing.
-//! Stopped, it sleeps. Space or the button plays and pauses; playing stops at 12 s, and play at the
-//! end starts again from 0. The slider shows `t / 12 s` each frame, and a press or drag on it seeks
-//! there and pauses. Home goes to 0; Left and Right step `step_ms`, clamped to the timeline.
+//! Stopped, it sleeps. Space or the play button plays and pauses; playing stops at 600 s, and play
+//! at the end starts again from 0. The slider shows `t / 600 s` each frame, and a press or drag on
+//! it seeks there and pauses. Home goes to 0 and End to 600 s; Left and Right step `step_ms`, and
+//! Page Up and Page Down `page_ms` back and forth, all clamped. The page button and the keys 1 and
+//! 2 switch pages.
 //!
-//! ## 4. Scenarios
-//! `still` is three frames at 0. `play` presses Space and lets 150 frames run on the regress
-//! clock. `scrub` clicks the slider where it maps to 6 s exactly. `scrub_back` clicks at about
-//! 10 s, waits 30 frames, and clicks the same point as `scrub`, so its golden equals `scrub`'s:
-//! scrubbing back draws the same picture.
+//! ## 4. Knobs Apply From Now On
+//! A knob's value v in [0, 1] maps to a parameter so that 0.5 is the default exactly
+//! (`knob_param`), and each parameter is a track (Weft's step 9.5). Turning a knob writes its
+//! parameter at t, latched from t on: the program is never rebuilt, the past keeps what was
+//! played, and a write costs the readers at most a second of steps. When not turned, a knob shows
+//! its track's value at t, so scrubbing back or replaying shows the knob move as it was played. A
+//! right press resets a knob to its default, from now on. A full track refuses the write, which
+//! changes nothing.
 //!
-//! ## 5. TigerStyle Invariants
+//! ## 5. Re-Pointing Costs Nothing in Weft
+//! `patch` holds the row each destination reads. A source button moves its destination to the next
+//! row with a finite range, wrapping, and the program is not touched. A destination's value is its
+//! source's value at t through the source's declared range (`patch.zig`, section 2), so it never
+//! leaves its range. The chase, whose spring time comes from a knob, has no finite range, so it is
+//! never a source.
+//!
+//! ## 6. Scenarios
+//! `still` is frames at 0. `play` presses Space and lets 150 frames run on the regress clock.
+//! `scrub` clicks the slider where it maps to 300 s exactly; `scrub_back` clicks near 500 s,
+//! waits 30 frames, and clicks the same point as `scrub`, so its golden equals `scrub`'s.
+//! `shapes` and `shapes_play` are the shapes page still and playing. `repoint` moves lines.width
+//! two rows on. `knob` moves to 2 s, drags `chase s` to 1 s there, and shows the scope: the chase
+//! slows from 2 s on and not before. `knob_600` drags `pulse hz` up and down at 600 s, a write each
+//! frame: the bench scenario.
+//!
+//! ## 7. TigerStyle Invariants
 //! - No allocation: the program, both readers' slabs and checkpoints, and the sampled frame live
 //!   in `App`, which the host keeps in static memory and which never moves.
+//! - A knob change is one track write; `writes` counts them for the tests.
 //! - The tests assert that no draw is refused, in every scenario.
 
 const std = @import("std");
 const assert = std.debug.assert;
 const patchwork = @import("patchwork");
 const glue = @import("glue.zig");
+const patch = @import("patch.zig");
 const scope = @import("scope.zig");
+const shapes = @import("shapes.zig");
 const input = patchwork.input;
 const quads = patchwork.draw;
 const text = patchwork.text;
@@ -52,54 +83,131 @@ const Context = patchwork.app.Context(App);
 
 pub const transport_height: f32 = 48;
 pub const row_height: f32 = 80;
-pub const button_rect: Rect = .{ .x = 8, .y = 8, .width = 88, .height = 32 };
-pub const scrub_rect: Rect = .{ .x = 104, .y = 8, .width = 720, .height = 32 };
-const label_rect: Rect = .{ .x = 840, .y = 0, .width = 424, .height = transport_height };
+pub const play_rect: Rect = .{ .x = 8, .y = 8, .width = 88, .height = 32 };
+pub const page_rect: Rect = .{ .x = 104, .y = 8, .width = 88, .height = 32 };
+pub const scrub_rect: Rect = .{ .x = 200, .y = 8, .width = 640, .height = 32 };
+const label_rect: Rect = .{ .x = 856, .y = 0, .width = 408, .height = transport_height };
 /// The longest frame delta the clock takes, so a stall loses time.
 pub const dt_max_ms: f32 = 100;
 pub const step_ms = 100;
+pub const page_ms = 10_000;
 /// Where the playhead sits in a plot's window.
 const head_at: f32 = @as(f32, glue.before_ms) / @as(f32, glue.before_ms + glue.after_ms);
 const line_cap = 96;
 
+pub const knob_count = 4;
+/// The knobs sit in two rows of two: the default skin draws the name and value beside the ring.
+pub const knob_y: f32 = 56;
+pub const knob_pitch: [2]f32 = .{ 168, 80 };
+pub const patch_y: f32 = 224;
+pub const patch_pitch: f32 = 32;
+const knob_names = [knob_count][]const u8{ "pulse hz", "chase s", "sway os", "glide v" };
+/// Each knob's parameter at its middle, the default: pulse hz, chase s, sway os, glide v.
+const knob_middles = [knob_count]f64{ 0.3, 0.5, 0.45, 1 };
+
 const ink = theme.dark.colors.text;
 const label_style: text.Style = .{ .face = .sans, .size = 14, .color = ink };
+const name_style: text.Style = .{ .face = .sans, .size = 13, .color = ink };
 const button_style: text.Style = .{ .face = .sans_bold, .size = 14, .color = ink };
+const source_style: text.Style = .{ .face = .sans, .size = 12, .color = ink };
 const button_paint: widgets.Paint = .{ .r = 0.30, .g = 0.46, .b = 0.70, .a = 1, .radius = 8 };
+const source_paint: widgets.Paint = .{ .r = 0.22, .g = 0.25, .b = 0.32, .a = 1, .radius = 6 };
 const left: text.Options = .{ .align_x = .start, .align_y = .center, .ellipsis = true };
+
+pub const Page = enum { scope, shapes };
 
 /// The x of slider value `value` from the slider's left edge, as a scenario's `click_at` takes it.
 pub fn scrub_x(value: f32) f32 {
     return widgets.knob_radius + value * (scrub_rect.width - 2 * widgets.knob_radius);
 }
 
+/// The rect of knob `index`.
+pub fn knob_rect(index: usize) Rect {
+    const column: f32 = @floatFromInt(index % 2);
+    const row: f32 = @floatFromInt(index / 2);
+    const x = 16 + knob_pitch[0] * column;
+    const y = knob_y + knob_pitch[1] * row;
+    return .{ .x = x, .y = y, .width = 160, .height = widgets.knob_height };
+}
+
+/// The rect of patch row `index`.
+pub fn patch_rect(index: usize) Rect {
+    const y = patch_y + patch_pitch * @as(f32, @floatFromInt(index));
+    return .{ .x = 16, .y = y, .width = 336, .height = patch_pitch };
+}
+
+/// Knob `index`'s parameter at value `value` (section 4): `sway os` is linear, `0.9 v`, and the
+/// rest are their middle times `4^(2v - 1)`, so each is its default at 0.5 exactly.
+pub fn knob_param(index: usize, value: f32) f64 {
+    assert(value >= 0 and value <= 1);
+    const v: f64 = value;
+    if (index == 2) return 2 * knob_middles[2] * v;
+    return knob_middles[index] * std.math.pow(f64, 4, 2 * v - 1);
+}
+
+/// The knob value whose parameter is `param`, the inverse of `knob_param`, clamped into [0, 1].
+pub fn knob_value(index: usize, param: f64) f32 {
+    assert(param >= 0);
+    const v = if (index == 2)
+        param / (2 * knob_middles[2])
+    else
+        (std.math.log2(param / knob_middles[index]) / 2 + 1) / 2;
+    return @floatCast(std.math.clamp(v, 0, 1));
+}
+
 const Step = patchwork.bench.Step;
 const space: Step = .{ .key = .{ .key = .other, .text = " " } };
+const page_1: Step = .{ .key = .{ .key = .other, .text = "1" } };
+const page_2: Step = .{ .key = .{ .key = .other, .text = "2" } };
+const end: Step = .{ .key = .{ .key = .end, .text = "" } };
 const scrub_target = patchwork.bench.area("scrub", 0);
-/// 6 s exactly: the slider's value is 0.5 there.
-const click_6s: Step = .{ .click_at = .{ .target = scrub_target, .x = scrub_x(0.5), .y = 16 } };
-/// About 10 s: 592 px along a 696 px travel, a value of 580 / 696 in f32.
-const click_10s: Step = .{ .click_at = .{ .target = scrub_target, .x = 592, .y = 16 } };
+/// 300 s exactly: the slider's value is 0.5 there.
+const click_300s: Step = .{ .click_at = .{ .target = scrub_target, .x = scrub_x(0.5), .y = 16 } };
+/// Near 500 s: 513 px along a 616 px travel.
+const click_500s: Step = .{ .click_at = .{ .target = scrub_target, .x = 525, .y = 16 } };
+const repoint_width: Step = .{ .click = patchwork.bench.area("source", 1) };
+const right: Step = .{ .key = .{ .key = .right, .text = "" } };
+
+/// A drag of `dy` px on knob `index` from its centre: up is positive v, 120 px for the whole range.
+fn knob_drag(comptime index: u32, dy: f32) Step {
+    return .{ .drag = .{
+        .target = patchwork.bench.area("knob", index),
+        .from_x = 40,
+        .from_y = 36,
+        .dx = 0,
+        .dy = dy,
+    } };
+}
 
 pub const App = struct {
     clock: glue.Clock,
     playing: bool,
+    page: Page,
     motion: glue.Motion,
     frame: glue.Frame,
     play: widgets.Button,
+    page_button: widgets.Button,
     scrub: widgets.Slider,
+    knobs: [knob_count]widgets.Knob,
+    /// Track writes made by the knobs (section 4).
+    writes: u32,
+    /// The row each destination reads (section 5).
+    patch: [patch.count]u8,
+    sources: [patch.count]widgets.Button,
 
     pub const config: patchwork.app.Config = .{
         .title = "play",
         .timer_period_ms = 0,
         .draw = &.{
-            .{ .type = quads.Box, .cap = 160 },
+            .{ .type = quads.Box, .cap = 192 },
+            .{ .type = quads.Arc, .cap = 16 },
+            .{ .type = quads.Fill, .cap = 32 },
             .{ .type = quads.Path, .cap = 1024 },
-            .{ .type = quads.Glyph, .cap = 1024 },
+            .{ .type = quads.Glyph, .cap = 1536 },
         },
         .batch_order = .registered,
         .batch_cap = 32,
-        .area_cap = 8,
+        .area_cap = 32,
         .point_cap = 8192,
     };
 
@@ -108,15 +216,44 @@ pub const App = struct {
         .{ .name = "play", .setup = &.{space}, .cycle = &.{}, .frames = 150 },
         .{
             .name = "scrub",
-            .setup = &.{ click_6s, .{ .wait = 3 } },
+            .setup = &.{ click_300s, .{ .wait = 3 } },
             .cycle = &.{.{ .wait = 1 }},
             .frames = 10,
         },
         .{
             .name = "scrub_back",
-            .setup = &.{ click_10s, .{ .wait = 30 }, click_6s, .{ .wait = 3 } },
+            .setup = &.{ click_500s, .{ .wait = 30 }, click_300s, .{ .wait = 3 } },
             .cycle = &.{.{ .wait = 1 }},
             .frames = 10,
+        },
+        .{
+            .name = "shapes",
+            .setup = &.{ page_2, .{ .wait = 2 } },
+            .cycle = &.{.{ .wait = 1 }},
+            .frames = 1,
+        },
+        .{ .name = "shapes_play", .setup = &.{ page_2, space }, .cycle = &.{}, .frames = 150 },
+        .{
+            .name = "repoint",
+            .setup = &.{ page_2, repoint_width, repoint_width, .{ .wait = 3 } },
+            .cycle = &.{.{ .wait = 1 }},
+            .frames = 1,
+        },
+        .{
+            .name = "knob",
+            .setup = &([_]Step{page_2} ++ @as([20]Step, @splat(right)) ++ [_]Step{
+                knob_drag(1, -30),
+                page_1,
+                .{ .wait = 3 },
+            }),
+            .cycle = &.{.{ .wait = 1 }},
+            .frames = 1,
+        },
+        .{
+            .name = "knob_600",
+            .setup = &.{ end, page_2, .{ .wait = 2 } },
+            .cycle = &.{ knob_drag(0, -1), knob_drag(0, 1) },
+            .frames = 20,
         },
     };
 
@@ -124,16 +261,10 @@ pub const App = struct {
         _ = textures;
         app.clock = .{};
         app.playing = false;
-        app.motion.init();
-        app.play = .{
-            .id = ui.id("play", 0),
-            .label = "play",
-            .style = button_style,
-            .padding = .xy(8, 0),
-            .paint = button_paint,
-            .hover = .init(widgets.hover_rate_per_ms),
-            .down = .init(widgets.down_rate_per_ms),
-        };
+        app.page = .scope;
+        app.motion.build();
+        app.play = button(ui.id("play", 0), "play", button_style, button_paint);
+        app.page_button = button(ui.id("page", 0), "shapes", button_style, button_paint);
         app.scrub = .{
             .id = ui.id("scrub", 0),
             .hover = .init(widgets.hover_rate_per_ms),
@@ -142,10 +273,31 @@ pub const App = struct {
             .fill = widgets.paint_of(theme.dark.colors.value, widgets.track_radius),
             .knob = widgets.paint_of(theme.dark.colors.control, widgets.knob_radius),
         };
+        for (&app.knobs, knob_names, 0..) |*knob, name, index| {
+            const id = ui.id("knob", @intCast(index));
+            knob.* = widgets.Knob.init(id, name, 0.5, widgets.accents[index % widgets.accents.len]);
+        }
+        app.writes = 0;
+        for (&app.patch, &app.sources, 0..) |*row, *source, index| {
+            row.* = app.row_named(patch.destinations[index].source);
+            const id = ui.id("source", @intCast(index));
+            source.* = button(id, app.motion.signals.rows[row.*].name, source_style, source_paint);
+        }
+    }
+
+    /// The index of the row named `name`, which must exist.
+    pub fn row_named(app: *const App, name: []const u8) u8 {
+        for (app.motion.signals.rows, 0..) |row, index| {
+            if (std.mem.eql(u8, row.name, name)) return @intCast(index);
+        }
+        unreachable;
     }
 
     pub fn event(app: *App, cx: *Context, event_value: input.Event) void {
         if (app.play.handle(cx, event_value) == .clicked) app.toggle(cx);
+        if (app.page_button.handle(cx, event_value) == .clicked) {
+            app.show(cx, if (app.page == .scope) .shapes else .scope);
+        }
         switch (app.scrub.handle(cx, event_value)) {
             .changed => |value| {
                 app.playing = false;
@@ -153,6 +305,19 @@ pub const App = struct {
                 cx.redraw();
             },
             .none, .released => {},
+        }
+        for (&app.knobs, 0..) |*knob, index| switch (knob.handle(cx, event_value)) {
+            .changed, .reset => |value| {
+                if (app.motion.write(index, app.clock, knob_param(index, value))) app.writes += 1;
+                cx.redraw();
+            },
+            .none, .released => {},
+        };
+        for (&app.patch, &app.sources) |*row, *source| {
+            if (source.handle(cx, event_value) != .clicked) continue;
+            row.* = app.next_source(row.*);
+            source.label = app.motion.signals.rows[row.*].name;
+            cx.redraw();
         }
         switch (event_value) {
             .frame => |dt_ms| {
@@ -169,11 +334,17 @@ pub const App = struct {
     fn key(app: *App, cx: *Context, press: input.KeyPress) void {
         switch (press.key) {
             .home => app.clock.seek(0),
+            .end => app.clock.seek(1),
             .left => app.clock.step(-step_ms),
             .right => app.clock.step(step_ms),
+            .page_up => app.clock.step(-page_ms),
+            .page_down => app.clock.step(page_ms),
             .other => {
-                if (!std.mem.eql(u8, press.typed(), " ")) return;
-                app.toggle(cx);
+                const typed = press.typed();
+                if (std.mem.eql(u8, typed, " ")) return app.toggle(cx);
+                if (std.mem.eql(u8, typed, "1")) return app.show(cx, .scope);
+                if (std.mem.eql(u8, typed, "2")) return app.show(cx, .shapes);
+                return;
             },
             else => return,
         }
@@ -187,8 +358,24 @@ pub const App = struct {
         cx.redraw();
     }
 
+    fn show(app: *App, cx: *Context, page: Page) void {
+        app.page = page;
+        cx.redraw();
+    }
+
     fn at_end(app: *const App) bool {
         return app.clock.millis() == glue.timeline_ms;
+    }
+
+    /// The row after `row` with a finite range, wrapping (section 5).
+    pub fn next_source(app: *const App, row: u8) u8 {
+        var next = row;
+        for (0..glue.row_count) |_| {
+            next = @intCast((next + 1) % glue.row_count);
+            const range = app.motion.ranges[next];
+            if (std.math.isFinite(range[0]) and std.math.isFinite(range[1])) return next;
+        }
+        unreachable;
     }
 
     pub fn timer(app: *App, cx: *Context, now_ms: u64) void {
@@ -200,23 +387,81 @@ pub const App = struct {
     pub fn draw(app: *App, cx: *Context) void {
         const clip: Clip = .{ .x0 = 0, .y0 = 0, .x1 = cx.window.width, .y1 = cx.window.height };
         app.draw_transport(cx, clip);
-        app.motion.sample(app.clock, &app.frame);
-        for (0..glue.row_count) |index| {
+        app.motion.sample_head(app.clock, &app.frame);
+        switch (app.page) {
+            .scope => app.draw_scope(cx, clip),
+            .shapes => app.draw_shapes(cx, clip),
+        }
+    }
+
+    fn draw_scope(app: *App, cx: *Context, clip: Clip) void {
+        app.motion.sample_window(app.clock, &app.frame);
+        for (0..glue.scope_row_count) |index| {
             const rect: Rect = .{
                 .x = 0,
                 .y = transport_height + row_height * @as(f32, @floatFromInt(index)),
                 .width = cx.window.width,
                 .height = row_height,
             };
-            scope.draw(cx, app.row(index), rect, clip);
+            scope.draw(cx, app.scope_row(index), rect, clip);
         }
+    }
+
+    fn draw_shapes(app: *App, cx: *Context, clip: Clip) void {
+        const values = app.destination_values();
+        for (&app.knobs, 0..) |*knob, index| {
+            knob.value = knob_value(index, app.motion.knob(index, app.clock));
+            var buffer: [16]u8 = undefined;
+            const shown = app.knob_text(index, &buffer);
+            _ = cx.begin_at(knob_rect(index), .{ .flow = .down });
+            knob.draw_text(cx, ui.sized(.fill, .fill), shown);
+            _ = cx.end();
+        }
+        for (&app.sources, patch.destinations, values, 0..) |*source, destination, value, index| {
+            const rect = patch_rect(index);
+            const name: Rect = .{ .x = rect.x, .y = rect.y, .width = 120, .height = rect.height };
+            text.place(cx.drawing(), name_style, destination.name, name, clip, left);
+            const at: Rect = .{ .x = rect.x + 128, .y = rect.y + 2, .width = 112, .height = 28 };
+            _ = cx.begin_at(at, .{ .flow = .down });
+            source.draw(cx, ui.sized(.fill, .fill));
+            _ = cx.end();
+            const share = (value - destination.low) / (destination.high - destination.low);
+            const track: Rect = .{ .x = rect.x + 248, .y = rect.y + 12, .width = 88, .height = 8 };
+            var bar = track;
+            bar.width = track.width * share;
+            const row_accent = accent(app.motion.signals.rows[app.patch[index]].accent);
+            box(cx, track, clip, theme.dark.colors.track, 4);
+            if (bar.width > 0) box(cx, bar, clip, row_accent, 4);
+        }
+        var accents: [4][4]f32 = undefined;
+        for (&accents, 0..) |*color, index| color.* = accent(@intCast(index));
+        shapes.draw(cx, &values, accents, clip);
+    }
+
+    /// Every destination's value at the playhead, through its source's range (section 5).
+    pub fn destination_values(app: *const App) [patch.count]f32 {
+        var values: [patch.count]f32 = undefined;
+        for (&values, patch.destinations, app.patch) |*value, destination, row| {
+            value.* = patch.map(destination, app.frame.heads[row], app.motion.ranges[row]);
+        }
+        return values;
+    }
+
+    /// Knob `index`'s parameter at t, to two decimals.
+    fn knob_text(app: *const App, index: usize, out: *[16]u8) []const u8 {
+        const value = app.motion.knob(index, app.clock);
+        return std.fmt.bufPrint(out, "{d:.2}", .{value}) catch unreachable;
     }
 
     fn draw_transport(app: *App, cx: *Context, clip: Clip) void {
         app.play.label = if (app.playing) "pause" else "play";
+        app.page_button.label = if (app.page == .scope) "shapes" else "scope";
         app.scrub.value = app.clock.fraction();
-        _ = cx.begin_at(button_rect, .{ .flow = .down });
+        _ = cx.begin_at(play_rect, .{ .flow = .down });
         app.play.draw(cx, ui.sized(.fill, .fill));
+        _ = cx.end();
+        _ = cx.begin_at(page_rect, .{ .flow = .down });
+        app.page_button.draw(cx, ui.sized(.fill, .fill));
         _ = cx.end();
         _ = cx.begin_at(scrub_rect, .{ .flow = .down });
         app.scrub.draw(cx, ui.sized(.fill, .fill));
@@ -225,19 +470,20 @@ pub const App = struct {
         text.place(cx.drawing(), label_style, app.label(&buffer), label_rect, clip, left);
     }
 
-    /// The transport label: `t` to the millisecond, then the report.
+    /// The transport label: the page, `t` to the millisecond, then the report.
     pub fn label(app: *const App, out: *[line_cap]u8) []const u8 {
         const ms: u64 = @intCast(app.clock.millis());
         const report = app.motion.report;
         const seekable = if (report.seekable) "seekable" else "not seekable";
         const name = if (report.first) |index| app.motion.signals.rows[index].name else "";
         const stepped = if (report.stepped) ", stepped from " else "";
-        const args = .{ @divFloor(ms, 1000), @mod(ms, 1000), seekable, stepped, name };
-        return std.fmt.bufPrint(out, "t {d}.{d:0>3} s   {s}{s}{s}", args) catch unreachable;
+        const page = @tagName(app.page);
+        const args = .{ page, @divFloor(ms, 1000), @mod(ms, 1000), seekable, stepped, name };
+        return std.fmt.bufPrint(out, "{s}   t {d}.{d:0>3} s   {s}{s}{s}", args) catch unreachable;
     }
 
     /// Row `index` of the scope, from the last sampled frame.
-    fn row(app: *const App, index: usize) scope.Row {
+    fn scope_row(app: *const App, index: usize) scope.Row {
         const frame = &app.frame;
         const signal = &app.motion.signals.rows[index];
         const goal: ?[]const f32 = if (signal.goal == .node) &frame.goals[index] else null;
@@ -260,6 +506,22 @@ pub const App = struct {
     }
 };
 
+fn button(id: ui.Id, name: []const u8, style: text.Style, paint: widgets.Paint) widgets.Button {
+    return .{
+        .id = id,
+        .label = name,
+        .style = style,
+        .padding = .xy(8, 0),
+        .paint = paint,
+        .hover = .init(widgets.hover_rate_per_ms),
+        .down = .init(widgets.down_rate_per_ms),
+    };
+}
+
+fn box(cx: *Context, rect: Rect, clip: Clip, color: [4]f32, radius: f32) void {
+    cx.append(quads.Box, null, .of(rect, clip, .{ .fill = color, .radius = radius })) catch {};
+}
+
 fn accent(index: u8) [4]f32 {
     const paint = widgets.accents[index % widgets.accents.len];
     return .{ paint.r, paint.g, paint.b, paint.a };
@@ -270,7 +532,10 @@ comptime {
     const Steps = @typeInfo(@FieldType(glue.Frame, "steps")).array.child;
     assert(@typeInfo(Steps).array.len <= scope.steps_max);
     assert(scrub_rect.x + scrub_rect.width < label_rect.x);
-    assert(transport_height + glue.row_count * row_height <= 720);
+    assert(transport_height + glue.scope_row_count * row_height <= 720);
+    assert(patch_y + patch.count * patch_pitch <= 720);
+    assert(knob_y + knob_pitch[1] + widgets.knob_height <= patch_y);
+    assert(glue.row_count <= std.math.maxInt(u8));
     patchwork.app.check(App);
 }
 
@@ -302,28 +567,45 @@ fn key_down(key_value: input.Key, typed: []const u8) input.Event {
     return .{ .key_down = input.key_press(key_value, .none, false, typed) };
 }
 
+fn replay(app: *App, name: []const u8, steps_limit: u32) !void {
+    for (App.scenarios) |*scenario| {
+        if (!std.mem.eql(u8, scenario.name, name)) continue;
+        const cx = &fixture.context;
+        const bench = patchwork.bench;
+        const size = .{ 1280, 720 };
+        _ = try bench.replay_headless_paced(App, app, cx, scenario, size, steps_limit, 16);
+        return;
+    }
+    unreachable;
+}
+
 test {
     _ = glue;
     _ = scope;
+    _ = patch;
+    _ = shapes;
 }
 
-// Locks the transport's ends: playing stops at 12 s and play from there restarts at 0, and a
+// Locks the transport's ends: playing stops at 600 s and play from there restarts at 0, and a
 // paused frame asks for no redraw and no further frame.
 test "playing stops at the end and starts again from zero" {
     const app = new_app();
     const cx = frame_at(app);
     try std.testing.expect(!ui.animate(App, app, cx, 16));
     try std.testing.expect(!cx.dirty);
+    send(app, key_down(.end, ""));
+    send(app, key_down(.left, ""));
+    try std.testing.expectEqual(@as(i64, glue.timeline_ms - step_ms), app.clock.millis());
     send(app, key_down(.other, " "));
     try std.testing.expect(app.playing);
     var frames: u32 = 0;
     while (ui.animate(App, app, cx, 50)) : (frames += 1) {
-        try std.testing.expect(frames < 1000);
+        try std.testing.expect(frames < 100);
         _ = frame_at(app);
     }
     try std.testing.expect(!app.playing);
     try std.testing.expectEqual(@as(i64, glue.timeline_ms), app.clock.millis());
-    try std.testing.expectEqual(@as(u32, 239), frames);
+    try std.testing.expectEqual(@as(u32, 1), frames);
     _ = frame_at(app);
     try std.testing.expect(!ui.animate(App, app, cx, 16));
     try std.testing.expect(!cx.dirty);
@@ -334,44 +616,65 @@ test "playing stops at the end and starts again from zero" {
     try std.testing.expectEqual(@as(i64, 100), app.clock.millis());
 }
 
-// Locks the keys: Home goes to 0, the arrows step 100 ms, and both ends clamp.
-test "home and the arrows clamp to the timeline" {
+// Locks the keys: Home and End, the arrows by 100 ms, and Page Up and Down by 10 s, all clamped;
+// 1 and 2 and the page button switch pages, and the shapes page, paused, asks for no frame.
+test "the keys move along the timeline and switch pages" {
     const app = new_app();
     send(app, key_down(.left, ""));
     try std.testing.expectEqual(@as(i64, 0), app.clock.millis());
     send(app, key_down(.right, ""));
     send(app, key_down(.right, ""));
     try std.testing.expectEqual(@as(i64, 200), app.clock.millis());
+    send(app, key_down(.page_down, ""));
+    try std.testing.expectEqual(@as(i64, 10_200), app.clock.millis());
+    send(app, key_down(.page_up, ""));
+    send(app, key_down(.page_up, ""));
+    try std.testing.expectEqual(@as(i64, 0), app.clock.millis());
+    send(app, key_down(.end, ""));
+    send(app, key_down(.page_down, ""));
+    try std.testing.expectEqual(@as(i64, glue.timeline_ms), app.clock.millis());
     send(app, key_down(.home, ""));
     try std.testing.expectEqual(@as(i64, 0), app.clock.millis());
-    app.clock.seek(1);
-    send(app, key_down(.right, ""));
-    try std.testing.expectEqual(@as(i64, glue.timeline_ms), app.clock.millis());
-    send(app, key_down(.left, ""));
-    try std.testing.expectEqual(@as(i64, glue.timeline_ms - step_ms), app.clock.millis());
+    send(app, key_down(.other, "2"));
+    try std.testing.expectEqual(Page.shapes, app.page);
+    const cx = frame_at(app);
+    try std.testing.expect(!ui.animate(App, app, cx, 16));
+    try std.testing.expect(!cx.dirty);
+    send(app, key_down(.other, "1"));
+    try std.testing.expectEqual(Page.scope, app.page);
+    _ = frame_at(app);
+    const page = fixture.context.find(ui.id("page", 0)).?;
+    const at: input.Button = .{
+        .x = page.rect[0] + 10,
+        .y = page.rect[1] + 10,
+        .time_ms = 0,
+        .button = .left,
+        .mods = .none,
+    };
+    send(app, .{ .pointer_down = at });
+    send(app, .{ .pointer_up = at });
+    try std.testing.expectEqual(Page.shapes, app.page);
 }
 
-// Locks the label and the report: seekable, stepped, and the chase named as the first simulated.
-test "the label shows the time and the report" {
+// Locks the label and the report: the page, seekable, stepped, and the chase named first.
+test "the label shows the page, the time, and the report" {
     const app = new_app();
     app.clock.seek(0.5);
     var buffer: [line_cap]u8 = undefined;
-    const expected = "t 6.000 s   seekable, stepped from chase";
+    const expected = "scope   t 300.000 s   seekable, stepped from chase";
     try std.testing.expectEqualStrings(expected, app.label(&buffer));
 }
 
-// Locks the scrub clicks: `scrub` lands on 6 s exactly and pauses, `scrub_back` near 10 s first.
+// Locks the scrub clicks: `scrub` lands on 300 s exactly and pauses, `scrub_back` near 500 s first.
 test "the scrub scenarios land where their clicks map" {
-    const bench = patchwork.bench;
-    const cx = &fixture.context;
     var app = new_app();
     send(app, key_down(.other, " "));
-    _ = try bench.replay_headless_paced(App, app, cx, &App.scenarios[2], .{ 1280, 720 }, 1, 16);
-    try std.testing.expectEqual(@as(i64, 6000), app.clock.millis());
+    try replay(app, "scrub", 1);
+    try std.testing.expectEqual(@as(i64, 300_000), app.clock.millis());
     try std.testing.expect(!app.playing);
     app = new_app();
-    _ = try bench.replay_headless_paced(App, app, cx, &App.scenarios[3], .{ 1280, 720 }, 1, 16);
-    try std.testing.expectEqual(@as(i64, 9999), app.clock.millis());
+    try replay(app, "scrub_back", 1);
+    try std.testing.expectEqual(@as(i64, 499_675), app.clock.millis());
 }
 
 /// Copies of two frames' Path instances and point pools, static for their size.
@@ -380,18 +683,17 @@ const frozen = struct {
 };
 
 // Locks the picture after a scrub back: `scrub_back` ends with the very Path instances and point
-// pool `scrub` does, byte for byte, though its scope reader came from 10 s and its checkpoints.
+// pool `scrub` does, byte for byte, though its scope reader came from 500 s and its checkpoints.
 test "scrubbing back draws the same picture" {
-    const bench = patchwork.bench;
     const cx = &fixture.context;
     var paths: [2][]const u8 = undefined;
     var points: [2][]const u8 = undefined;
     const copies = &frozen.copies;
-    for (App.scenarios[2..4], 0..) |*scenario, index| {
+    for ([_][]const u8{ "scrub", "scrub_back" }, 0..) |name, index| {
         const app = new_app();
-        _ = try bench.replay_headless_paced(App, app, cx, scenario, .{ 1280, 720 }, 64, 16);
+        try replay(app, name, 64);
         _ = frame_at(app);
-        try std.testing.expectEqual(@as(i64, 6000), app.clock.millis());
+        try std.testing.expectEqual(@as(i64, 300_000), app.clock.millis());
         const path_bytes = std.mem.sliceAsBytes(cx.draw.items(quads.Path));
         const point_bytes = std.mem.sliceAsBytes(cx.draw.points[0..cx.draw.point_count]);
         @memcpy(copies[index][0][0..path_bytes.len], path_bytes);
@@ -404,13 +706,143 @@ test "scrubbing back draws the same picture" {
     try std.testing.expectEqualSlices(u8, points[0], points[1]);
 }
 
+// Locks the knob maps: every knob at 0.5 gives its track's default exactly, the map and its
+// inverse agree, and the `knob` scenario's drag of 30 px at 2 s puts `chase s` at 0.75, which is
+// 1 s exactly, written once at 2 s and nowhere else.
+test "the knobs give their defaults at 0.5 and 1 s at 0.75" {
+    for (0..knob_count) |index| {
+        try std.testing.expectEqual(knob_middles[index], knob_param(index, 0.5));
+        try std.testing.expectEqual(@as(f32, 0.5), knob_value(index, knob_middles[index]));
+        try std.testing.expectEqual(@as(f32, 0.75), knob_value(index, knob_param(index, 0.75)));
+    }
+    var app = new_app();
+    try replay(app, "knob", 22);
+    try std.testing.expectEqual(@as(i64, 2000), app.clock.millis());
+    try std.testing.expectEqual(@as(f32, 0.75), app.knobs[1].value);
+    try std.testing.expectEqual(@as(f64, 1), app.motion.knob(1, app.clock));
+    try std.testing.expectEqual(@as(u32, 1), app.writes);
+    var before = app.clock;
+    before.step(-1);
+    try std.testing.expectEqual(@as(f64, 0.5), app.motion.knob(1, before));
+    app = new_app();
+    try replay(app, "knob", 64);
+    try std.testing.expectEqual(Page.scope, app.page);
+}
+
+// Locks what a knob means: a turn at 10 s leaves the program and every value before 10 s as they
+// were, bit for bit, changes what follows, and the knob shows the value played at each time: its
+// default at 5 s, its turn at 12 s. A right press at 12 s resets it from 12 s on, not before.
+test "a knob applies from now on and shows what was played" {
+    const app = new_app();
+    send(app, key_down(.other, "2"));
+    send(app, key_down(.page_down, ""));
+    _ = frame_at(app);
+    const nodes = app.motion.signals.program.nodes.ptr;
+    var five: glue.Clock = .{};
+    five.step(5000);
+    var twelve: glue.Clock = .{};
+    twelve.step(12_000);
+    app.motion.sample_head(five, &app.frame);
+    const at_five = app.frame.heads;
+    app.motion.sample_head(twelve, &app.frame);
+    const at_twelve = app.frame.heads;
+    const knob = fixture.context.find(ui.id("knob", 0)).?;
+    const down: input.Button = .{
+        .x = knob.rect[0] + 40,
+        .y = knob.rect[1] + 36,
+        .time_ms = 0,
+        .button = .left,
+        .mods = .none,
+    };
+    send(app, .{ .pointer_down = down });
+    var moved = down;
+    moved.y -= 60;
+    send(app, .{ .pointer_move = .{ .x = moved.x, .y = moved.y } });
+    send(app, .{ .pointer_up = moved });
+    try std.testing.expect(app.writes >= 1);
+    try std.testing.expectEqual(nodes, app.motion.signals.program.nodes.ptr);
+    app.motion.sample_head(five, &app.frame);
+    try std.testing.expectEqualSlices(f32, &at_five, &app.frame.heads);
+    app.motion.sample_head(twelve, &app.frame);
+    try std.testing.expect(!std.mem.eql(f32, &at_twelve, &app.frame.heads));
+    app.clock = five;
+    _ = frame_at(app);
+    try std.testing.expectEqual(@as(f32, 0.5), app.knobs[0].value);
+    app.clock = twelve;
+    _ = frame_at(app);
+    try std.testing.expectEqual(@as(f32, 1), app.knobs[0].value);
+    var right_press = down;
+    right_press.button = .right;
+    send(app, .{ .pointer_down = right_press });
+    send(app, .{ .pointer_up = right_press });
+    try std.testing.expectEqual(knob_middles[0], app.motion.knob(0, twelve));
+    var eleven: glue.Clock = .{};
+    eleven.step(11_000);
+    try std.testing.expectEqual(knob_param(0, 1), app.motion.knob(0, eleven));
+}
+
+// Locks re-pointing: a click on lines.width's source button moves it to the next row and leaves
+// the program and both readers as they were, and the destination reads the new row's value. The
+// chase, with no finite range, is skipped.
+test "re-pointing a destination does not touch the program" {
+    const app = new_app();
+    send(app, key_down(.other, "2"));
+    send(app, key_down(.page_down, ""));
+    _ = frame_at(app);
+    const nodes = app.motion.signals.program.nodes.ptr;
+    const steps_run = .{ app.motion.readers[0].steps_run, app.motion.readers[1].steps_run };
+    const width = @backingInt(patch.Dest.lines_width);
+    try std.testing.expectEqualStrings("pulse", app.motion.signals.rows[app.patch[width]].name);
+    try replay(app, "repoint", 3);
+    try std.testing.expectEqualStrings("soft", app.motion.signals.rows[app.patch[width]].name);
+    try std.testing.expectEqualStrings("soft", app.sources[width].label);
+    try std.testing.expectEqual(nodes, app.motion.signals.program.nodes.ptr);
+    try std.testing.expectEqual(steps_run[0], app.motion.readers[0].steps_run);
+    try std.testing.expectEqual(@as(u32, 0), app.writes);
+    const newtonian = app.row_named("newtonian");
+    const after_newtonian = app.motion.signals.rows[app.next_source(newtonian)];
+    try std.testing.expectEqualStrings("follow", after_newtonian.name);
+    _ = frame_at(app);
+    const row = app.patch[width];
+    const range = app.motion.ranges[row];
+    const expected = patch.map(patch.destinations[width], app.frame.heads[row], range);
+    try std.testing.expectEqual(expected, app.destination_values()[width]);
+}
+
+// Locks the range proof: every row with a finite range, pointed at every destination, every
+// quarter second of the 600 s, sits inside its declared range (`patch.fraction` asserts it), so
+// every destination stays in its own range. The knobs are written along the way, at their ends.
+test "every destination stays in its range for every source" {
+    const app = new_app();
+    var clock: glue.Clock = .{};
+    var turns: u32 = 0;
+    while (true) : (clock.step(250)) {
+        if (@mod(clock.millis(), 37_000) == 0) {
+            turns += 1;
+            for (0..knob_count) |index| {
+                const extreme: f32 = if ((turns + index) % 2 == 0) 0 else 1;
+                try std.testing.expect(app.motion.write(index, clock, knob_param(index, extreme)));
+            }
+        }
+        app.motion.sample_head(clock, &app.frame);
+        for (app.frame.heads, app.motion.ranges) |value, range| {
+            if (!std.math.isFinite(range[0]) or !std.math.isFinite(range[1])) continue;
+            for (patch.destinations) |destination| {
+                const mapped = patch.map(destination, value, range);
+                try std.testing.expect(mapped >= destination.low and mapped <= destination.high);
+            }
+        }
+        if (clock.millis() == glue.timeline_ms) break;
+    }
+}
+
 // Locks the scenarios without a GPU (`patchwork.bench`, section 2a): none refuses a draw.
+// `knob_600` reads 600 s cold once, so it runs its setup and two drags.
 test "the scenarios replay headless" {
-    const bench = patchwork.bench;
-    const cx = &fixture.context;
-    for (App.scenarios) |*scenario| {
+    for (App.scenarios) |scenario| {
         const app = new_app();
-        _ = try bench.replay_headless_paced(App, app, cx, scenario, .{ 1280, 720 }, 200, 16);
-        try std.testing.expectEqual(@as(u32, 0), cx.draw.overflow_count);
+        const limit: u32 = if (std.mem.eql(u8, scenario.name, "knob_600")) 6 else 200;
+        try replay(app, scenario.name, limit);
+        try std.testing.expectEqual(@as(u32, 0), fixture.context.draw.overflow_count);
     }
 }
