@@ -19,10 +19,14 @@
 //!   label_width                    the rest of the row, inset by `inset`
 //! ```
 //!
+//! A row's dots are its events in the window, each a fraction of the window and a value on the
+//! row's axis: where a spring or a Newtonian move reached its goal, a follower arrived, or a shift
+//! register entered a bucket, at the bucket's value.
+//!
 //! ## 2. Back to Front
 //! The plot face, the range band, and the cue lines are Boxes, the two traces are Paths, both on
-//! the base layer, whose batches draw in the registered order Box, Path, Glyph. The playhead's
-//! line and dot are Boxes on `playhead_layer`, above the traces.
+//! the base layer, whose batches draw in the registered order Box, Path, Glyph. The dots and the
+//! playhead's line and dot are Boxes on `playhead_layer`, above the traces.
 //!
 //! ## 3. The Axis
 //! `axis` is the range padded by `axis_pad` of its width when both ends are finite, and the hull of
@@ -72,7 +76,12 @@ pub const Row = struct {
     head_at: f32,
     head: f32,
     color: [4]f32,
+    /// Events as a fraction of the window and a value (section 1).
+    dots: []const [2]f32,
 };
+
+/// A dot's side, in logical pixels.
+pub const dot_size: f32 = 7;
 
 /// The vertical axis of a row (section 3).
 pub fn axis(
@@ -153,6 +162,16 @@ pub fn draw(cx: anytype, row: Row, rect: Rect, clip: Clip) void {
     _ = quads.path.plot(cx.drawing(), row.samples, plot, row.axis, stroke, inside);
     const previous = cx.drawing().layer(playhead_layer);
     defer _ = cx.drawing().layer(previous);
+    for (row.dots) |dot| {
+        assert(dot[0] >= 0 and dot[0] <= 1);
+        const at: Rect = .{
+            .x = plot.x + dot[0] * plot.width - dot_size / 2,
+            .y = y_of(dot[1], plot, row.axis) - dot_size / 2,
+            .width = dot_size,
+            .height = dot_size,
+        };
+        box(cx, at, inside, with_alpha(ink, 0.9), dot_size / 2);
+    }
     const x = plot.x + row.head_at * plot.width;
     const line: Rect = .{ .x = x - 0.75, .y = plot.y, .width = 1.5, .height = plot.height };
     box(cx, line, inside, with_alpha(ink, 0.6), 0);

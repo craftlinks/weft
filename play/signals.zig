@@ -42,7 +42,17 @@
 //! keeps it inside `App`, which the host and the tests keep in static memory. A builder error here
 //! is a mistake in this table, not a run-time condition, so it is unreachable.
 //!
-//! ## 4. TigerStyle Invariants
+//! ## 4. The Bouncers
+//! The bouncers page has a program of its own, `Bouncers`, which is pure:
+//! ```text
+//! cues   every 2 s from 0 to 600 s: the bars, 301 cues
+//! lane   0.7  1  1.5  2  2.5  3  3.5   units a second, between 0 and 1 from the first bar
+//! bars   one `cues` node over every bar
+//! ```
+//! Six legs are whole flicks, so those lanes hit 2 to 7 times a bar, exactly on the bars. The
+//! 0.7 lane is step 7's worked bounce, whose hits land one flick after the exact multiples.
+//!
+//! ## 5. TigerStyle Invariants
 //! - Every capacity is a constant here, and the build asserts the program fits them.
 
 const std = @import("std");
@@ -255,6 +265,79 @@ pub const Signals = struct {
             .{ .name = "glide_b", .accent = 3, .id = glide_b, .goal = .none },
         };
         signals.program = builder.finish();
+    }
+};
+
+/// The bouncers page's lanes: step 7's worked bounce, then six that hit 2 to 7 times a bar.
+pub const lane_count = 7;
+/// Bars every 2 s, from 0 to the timeline's end: 301 cues.
+pub const bar_ms: i64 = 2000;
+pub const bar_count: u32 = @intCast(@divExact(timeline_ms, bar_ms) + 1);
+/// The bouncer program: two nodes a lane, then the bars, one f64 each.
+pub const bouncer_node_count = 2 * lane_count + 1;
+
+pub const Lane = struct {
+    name: []const u8,
+    /// How it reads beside the lane: its hits a bar.
+    note: []const u8,
+    accent: u8,
+    speed: f64,
+    /// The position node, which fires the hits.
+    id: weft.Id,
+};
+
+const lane_names = [lane_count][]const u8{ "0.7", "1", "1.5", "2", "2.5", "3", "3.5" };
+const lane_notes = [lane_count][]const u8{
+    "1.4 a bar", "2 a bar", "3 a bar", "4 a bar", "5 a bar", "6 a bar", "7 a bar",
+};
+/// Units a second between 0 and 1: a leg of `1 / speed` s. Every leg but the first is a whole
+/// number of flicks, since 705,600,000 divides by 2 to 7 and the f64 quotient is then exact.
+const lane_speeds = [lane_count]f64{ 0.7, 1, 1.5, 2, 2.5, 3, 3.5 };
+
+/// The bouncers page's program (section 4): seven bounces between 0 and 1 from the first bar, and
+/// a `cues` node over every bar, so the bars are events too. It is pure, so a window of its
+/// events costs no steps, which is why it is a program of its own and not rows of `Signals`: an
+/// events query runs every simulated node's steps across its range, whatever the caller wants.
+pub const Bouncers = struct {
+    nodes: [bouncer_node_count]weft.Node,
+    bar_times: [bar_count]weft.Time,
+    cues: weft.Cues,
+    lanes: [lane_count]Lane,
+    bars: weft.Id,
+    program: weft.Program,
+
+    /// Fills the bar cues and the node array in place, and finishes the program.
+    pub fn build(bouncers: *Bouncers) void {
+        bouncers.build_nodes() catch unreachable;
+        assert(bouncers.program.nodes.len == bouncer_node_count);
+        assert(bouncers.program.slab_count == bouncer_node_count);
+        assert(!bouncers.program.simulated);
+    }
+
+    fn build_nodes(bouncers: *Bouncers) !void {
+        bouncers.cues = weft.Cues.init(&bouncers.bar_times);
+        for (0..bar_count) |index| {
+            _ = try bouncers.cues.add(ms(bar_ms * @as(i64, @intCast(index))));
+        }
+        var builder = weft.Builder.init(&bouncers.nodes, .{
+            .slab_count_max = bouncer_node_count,
+            .cues = &bouncers.cues,
+        });
+        const first: weft.Cue = .{ .index = 0 };
+        for (&bouncers.lanes, 0..) |*lane, index| {
+            const speed = lane_speeds[index];
+            const bounce: weft.Bounce = .{ .low = 0, .high = 1, .speed = speed, .start = first };
+            const ids = try builder.bounce(bounce);
+            lane.* = .{
+                .name = lane_names[index],
+                .note = lane_notes[index],
+                .accent = @intCast(index % 4),
+                .speed = speed,
+                .id = ids.position,
+            };
+        }
+        bouncers.bars = try builder.cues(.{ .first = first, .count = bar_count });
+        bouncers.program = builder.finish();
     }
 };
 
