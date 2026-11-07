@@ -406,6 +406,14 @@ run each step once, and an `eval(t1)` after them costs nothing more. `events` le
 outputs at no particular time, so `value` asserts until the next `eval`. `graph.zig`, section 11,
 and `event.zig` explain the rules.
 
+**Evals and events on one reader.** An `eval(s)` at a time exactly on a step leaves the slab one
+step past it, so an `events(s, ...)` right after it restores a checkpoint. A reader that
+interleaves the two, as a scope sampling a window does, can read its events as `(s, s']`, that is
+`events(s + 1, s' + 1)` in flicks: that range starts at the very step `eval(s)` left and ends at
+the one `eval(s')` needs, so it never restores and runs no step the evals would not. An events
+query runs every simulated node's steps across its range, whatever sources the caller wants, so
+events of pure sources are cheapest in a pure program of their own (Play's bouncers are one).
+
 ## Ranges and Seekability
 
 ```zig
@@ -501,11 +509,11 @@ numbers depend on the machine, so it has no thresholds and is not part of `test`
 
 ## Play
 
-Play is Weft's first client: a Patchwork app with two pages on one 600 s clock.
+Play is Weft's first client: a Patchwork app with three pages on one 600 s clock.
 
 - **scope** plots eight signals, one or more of each class but live, over a window from one second
-  before the playhead to three after it, with each signal's range, its goal where it has one, and
-  the cues.
+  before the playhead to three after it, with each signal's range, its goal where it has one, the
+  cues, and a dot at each event: a goal reached, a follower arriving, a bucket entered.
 - **shapes** draws lines, a star, a filled pentagon, and a cubic curve whose 11 parameters are
   destinations. Each reads one of 16 sources, the scope's eight and eight more, through the
   source's declared range, so it never leaves its own range. A button beside each destination
@@ -513,9 +521,17 @@ Play is Weft's first client: a Patchwork app with two pages on one 600 s clock.
   of the program from now on: each is a track (see Live Parameters), so a turn at t leaves the
   past as it was played, scrubbing back shows the knob as it moved, and a turn costs tens of
   microseconds a frame at any t.
+- **bouncers** runs seven bounces between 0 and 1 on a pure program of their own: step 7's worked
+  bounce at 0.7 units a second, and six that hit 2 to 7 times a 2 s bar, so the lanes show
+  polyrhythms that land together on every bar. Each lane is the scope's window, its triangle a
+  stroke whose corners are its hits; a small bouncer beside it flashes the wall it last hit, and a
+  log lists the last six hits at their exact times, in seconds and flicks. Every hit is read from
+  the graph each frame and none is kept, so a pause, a scrub, or a frame rate never changes what
+  a time shows.
 
-Space or the play button plays and pauses, the page button or 1 and 2 switch pages, the slider
-scrubs, Home and End go to the ends, Left and Right step 100 ms, and Page Up and Page Down 10 s.
+Space or the play button plays and pauses, the page button cycles the pages and 1, 2, and 3 go to
+each, the slider scrubs, Home and End go to the ends, Left and Right step 100 ms, and Page Up and
+Page Down 10 s.
 
 ```bash
 cd play
@@ -524,6 +540,7 @@ zig build serve-play                # in the browser, on localhost
 zig build test                      # its tests, with no GPU
 zig build regress -Doptimize=ReleaseFast   # its scenarios against test/golden (needs a GPU)
 zig build bench -Doptimize=ReleaseFast -- knob_600   # a knob dragged at 600 s, per frame
+zig build bench -Doptimize=ReleaseFast -- play_590   # the scope and its dots playing at 590 s
 ```
 
 It needs Patchwork checked out beside Weft, at `../patchwork`, and Patchwork's requirements.
@@ -532,7 +549,7 @@ It needs Patchwork checked out beside Weft, at `../patchwork`, and Patchwork's r
 own package still has no dependencies.
 
 **The two-file rule.** Only `play/signals.zig`, the signal table, and `play/glue.zig` import
-`weft`. Everything else in Play (`app.zig`, `scope.zig`, `patch.zig`, `shapes.zig`) draws plain
-numbers: the glue hands time over as a `Clock`, and the
-samples, ranges, classes, and report as `f32` arrays and plain structs. The glue has a budget of
+`weft`. Everything else in Play (`app.zig`, `scope.zig`, `patch.zig`, `shapes.zig`,
+`bouncers.zig`) draws plain numbers: the glue hands time over as a `Clock`, and the samples,
+events, ranges, classes, and report as `f32` arrays and plain structs. The glue has a budget of
 60 lines of code; growing past it says the boundary or Weft's API is wrong.
