@@ -172,6 +172,7 @@ test/
   modules.zig         modules against the same graphs written by hand
   carry.zig           a recompile's carried reader against a fresh one, bit for bit
   vectors.zig         vectors and colours against the scalar files they stand for
+  lanes.zig           lanes in the language against the builder's region, and the lane errors
   cli.zig             the weft command's output against its goldens, and a client's nouns
   golden/signals.txt  the committed samples
   golden/cli/         the weft command's committed output
@@ -637,6 +638,44 @@ light = sweep.l * 2                      # a colour's components are .l .a .b
   error that says so (`wrong_shape`). `describe` marks the parameters that take a shape, and
   `sample` writes a vector's value as an array of its components.
 
+## Lanes
+
+One program evaluates many elements as lanes: a node's values are lane after lane in the slab, and
+each node has its own lane count. `lanes(n, body)` checks its body in a region of n lanes, where
+`lane` is each lane's index:
+
+```txt
+cue c0 = 0s
+rise = lanes(1000, tween(from: 0, to: 1, at: c0, over: 0.6s, ease: out, stagger: 2ms))
+height = lanes(1000, map(noise(smooth, 0.25hz), -1..1, to: 0.2..1))
+bars = rise * height                     # 1,000 lanes
+across = lanes(1000, lane * 0.001)       # each bar's place, from its index
+hits = lanes(1000, bounce(0..1, speed: 0.5, at: c0, stagger: 3ms))   # events carry their lane
+```
+
+- **Only what varies has lanes.** In a region, a noise, a follower, a shift register, and a delay
+  have the region's lanes, each lane its own seed; a wave, a tween, a spring, a Newtonian move,
+  and a bounce given a `stagger:` do too, lane i starting i × stagger after lane 0, exact to the
+  flick. Anything else has the most lanes of what it reads, so a constant, a knob, or a name bound
+  outside the region is one value, broadcast, however many lanes read it.
+- **Events carry their lane** as their instance, in the order of time, source, then lane, and a
+  full buffer counts what it drops, so a thousand bounces read as one stream.
+- **A client reads a lane array** at once: `State.values(id)` is lanes × components f64, lane
+  after lane, ready to copy into an instance buffer, and `State.extent(id)` gives the counts.
+- **A lane count is fixed** when the program is built. A client whose data changes size
+  recompiles, and the carry keeps every simulated node whose size did not change.
+- **Lanes are checked** where they are written: two counts above 1 meet only when equal, a
+  parameter a signal sets takes one value for every lane, regions do not nest, and `lane` and
+  `stagger:` belong inside a region, each with an error that says so (`wrong_lanes`). `sample`
+  writes a signal of many lanes with `"lanes"`, each value an array of its lanes.
+
+In the core, `Builder.lanes` opens a region and `Builder.Options.lane_first` names its lane 0, so
+lane i of a family built together equals lane i built alone, bit for bit, which
+`src/core/graph_test/lanes.zig` checks for a thousand lanes. At 100,000 lanes of a noise, a
+staggered tween, a map, a product, and a staggered bounce, an eval costs about 2.5 ms on an
+i5-13600K, most of it in the noise; `@Vector` loops for the arithmetic made no difference, since
+the compiler already vectorizes them.
+
 ## The weft Command
 
 `zig build` installs `zig-out/bin/weft`, the tool an agent uses in place of watching motion. It
@@ -688,15 +727,17 @@ Bless only for a change the step means to make, in that step's commit.
 graph of 16 waves summed, per eval; four chases on a wave plus noise playing forwards at 60 Hz, per
 frame; that graph from a fresh state, the first eval at 60 s and at 600 s; a bounce and cues,
 `events` per 128-frame block at 48 kHz; a track write at the playhead at 600 s, then the
-frame's eval, which is what a knob costs from now on; a compile of Play's `signals.weft`; and a
-compile of modules nested 8 deep, 511 instances. It is native only and needs no GPU. Its
-numbers depend on the machine, so it has no thresholds and is not part of `test` or `regress`.
+frame's eval, which is what a knob costs from now on; a compile of Play's `signals.weft`; a
+compile of modules nested 8 deep, 511 instances; and a region of a noise, a staggered tween, a
+map, a product, and a staggered bounce at 1,000 and 100,000 lanes, an eval and a frame's events
+per frame. It is native only and needs no GPU. Its numbers depend on the machine, so it has no
+thresholds and is not part of `test` or `regress`.
 
 ## Play
 
-Play is Weft's first client: a Patchwork app with five pages on one 600 s clock. Its signals are
-text, `play/signals.weft`, `play/bouncers.weft`, and `play/vectors.weft`, compiled at start, and
-the first can be edited while it runs.
+Play is Weft's first client: a Patchwork app with six pages on one 600 s clock. Its signals are
+text, `play/signals.weft`, `play/bouncers.weft`, `play/vectors.weft`, and `play/lanes.weft`,
+compiled at start, and the first can be edited while it runs.
 
 - **scope** plots eight signals, one or more of each class but live, over a window from one second
   before the playhead to three after it, with each signal's range, its goal where it has one, the
@@ -730,8 +771,13 @@ the first can be edited while it runs.
   packed noises, drawn on a plane with its trail over the window, and three colours as strips over
   the window: a colour tween, a colour spring whose overshoot leaves the sRGB gamut and is mapped
   back, and an OKLab colour whose a and b are noises. The dot takes the colour spring's colour.
+- **lanes** runs a thousand lanes of one pure program as a field of dots: each rises 3 ms after
+  the one before to a height of its own noise, in a colour of its own two noises, and flashes when
+  its bounce, 5 ms behind the one before, reaches the top wall. The flashes are every lane's
+  events of the last quarter second, read in one buffer each frame, whose count and drops show
+  under the field. A frame costs under 0.2 ms at any time.
 
-Space or the play button plays and pauses, the page button cycles the pages and 1 to 5 go to
+Space or the play button plays and pauses, the page button cycles the pages and 1 to 6 go to
 each, the slider scrubs, Home and End go to the ends, Left and Right step 100 ms, and Page Up and
 Page Down 10 s.
 
@@ -753,6 +799,6 @@ own package still has no dependencies.
 
 **The two-file rule.** Only `play/signals.zig`, the signal table, and `play/glue.zig` import
 `weft`. Everything else in Play (`app.zig`, `scope.zig`, `patch.zig`, `shapes.zig`,
-`bouncers.zig`, `vectors.zig`) draws plain numbers: the glue hands time over as a `Clock`, and the samples,
+`bouncers.zig`, `vectors.zig`, `field.zig`) draws plain numbers: the glue hands time over as a `Clock`, and the samples,
 events, ranges, classes, and report as `f32` arrays and plain structs. The glue has a budget of
 60 lines of code; growing past it says the boundary or Weft's API is wrong.

@@ -15,6 +15,8 @@
 //!          a write of the track at the playhead, then the eval
 //! compile  Play's `signals.weft` (step 12), parse to program      per compile
 //! modules  a patch of modules nested 8 deep, 511 instances           per compile
+//! lanes    a noise, a staggered tween, a map, a product, and a      per frame, at 1,000 and
+//!          staggered bounce over n lanes: an eval, then the events  100,000 lanes
 //! ```
 //! `write` is what a knob costs when it applies from now on (step 9.5), beside `cold`, which is
 //! what it cost as a rebuild.
@@ -56,6 +58,9 @@ var events_out: [64]weft.Event = undefined;
 var track_entries: [1]weft.Track = undefined;
 var track_samples: [4096]weft.Sample = undefined;
 var tracks: weft.Tracks = undefined;
+/// The lanes case's program at 100,000 lanes: 6 nodes of a lane each, and the bounce's two.
+var lanes_slab: [8 * 100_000]f64 = undefined;
+var lanes_events: [4096]weft.Event = undefined;
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
@@ -67,6 +72,8 @@ pub fn main(init: std.process.Init) !void {
     write(io);
     compile(io);
     modules(io);
+    lanes(io, 1_000);
+    lanes(io, 100_000);
 }
 
 fn now(io: std.Io) i96 {
@@ -324,6 +331,64 @@ fn modules(io: std.Io) void {
         best = @min(best, now(io) - start);
     }
     report("compile 8 deep of modules, per compile", best, count, total);
+}
+
+/// Case 8: a region of `count` lanes, as a dataviz page would have, read at 60 Hz for 10 s from
+/// 0: each frame an eval and a sum over every bar, then the frame's events in another reader.
+fn lanes(io: std.Io, count: u32) void {
+    start_cues = weft.Cues.init(&start_times);
+    _ = start_cues.add(.{ .flicks = 0 }) catch |err| fail(err);
+    var builder = weft.Builder.init(&nodes, .{ .slab_count_max = lanes_slab.len, .cues = &start_cues });
+    builder.lanes = count;
+    const ms: i64 = @divExact(flicks_per_second, 1000);
+    const noise = builder.noise(.{ .shape = .smooth, .hz = 0.25, .seed = 3 }) catch |err| fail(err);
+    const rise = builder.tween(.{
+        .from = 0,
+        .to = 1,
+        .duration = .{ .flicks = 600 * ms },
+        .ease = weft.Ease.out,
+        .start = .{ .index = 0 },
+        .previous = null,
+        .stagger = .{ .flicks = 2 * ms },
+    }) catch |err| fail(err);
+    const height = builder.map_range(.{ .input = noise, .input_low = -1, .input_high = 1, .output_low = 0.2, .output_high = 1 }) catch |err| fail(err);
+    const bars = builder.multiply(rise, height) catch |err| fail(err);
+    _ = builder.bounce(.{ .low = 0, .high = 1, .speed = 0.5, .start = .{ .index = 0 }, .stagger = .{ .flicks = ms } }) catch |err| fail(err);
+    const program = builder.finish();
+    assert(program.slab_count <= lanes_slab.len);
+    const rate = weft.Rate.from_hz(60).?;
+    const frames = 600;
+    var best_eval: i96 = std.math.maxInt(i96);
+    var best_events: i96 = std.math.maxInt(i96);
+    var total: f64 = 0;
+    var found_total: f64 = 0;
+    for (0..repeats) |_| {
+        var state = weft.State.init(program, lanes_slab[0..program.slab_count]);
+        var spent: i96 = 0;
+        for (0..frames) |frame| {
+            const start = now(io);
+            state.eval(weft.Time.from_ticks(@intCast(frame), rate).?);
+            for (state.values(bars)) |value| total += value;
+            spent += now(io) - start;
+        }
+        best_eval = @min(best_eval, spent);
+        var reader = weft.State.init(program, lanes_slab[0..program.slab_count]);
+        spent = 0;
+        for (0..frames) |frame| {
+            const t0 = weft.Time.from_ticks(@intCast(frame), rate).?;
+            const t1 = weft.Time.from_ticks(@intCast(frame + 1), rate).?;
+            const start = now(io);
+            const found = reader.events(t0, t1, &lanes_events);
+            spent += now(io) - start;
+            found_total += @floatFromInt(found.count + found.dropped);
+        }
+        best_events = @min(best_events, spent);
+    }
+    var label_buffer: [64]u8 = undefined;
+    const eval_label = std.fmt.bufPrint(&label_buffer, "lanes   {d} lanes, eval per frame", .{count}) catch unreachable;
+    report(eval_label, best_eval, frames, total);
+    const events_label = std.fmt.bufPrint(&label_buffer, "lanes   {d} lanes, events per frame", .{count}) catch unreachable;
+    report(events_label, best_events, frames, found_total);
 }
 
 fn fail(err: anyerror) noreturn {

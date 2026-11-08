@@ -240,22 +240,32 @@ test "the builder refuses a tween it cannot evaluate" {
     try testing.expectEqual(@as(u32, 0), builder.node_count);
 }
 
-// Locks that a tween fills every lane of its extent, from itself and from `previous`.
+// Locks that a tween takes the lanes of its `previous`, following each lane before its start,
+// and that a staggered one starts each lane `stagger` after the one before (section 16).
 test "a tween loops over the extent of its node" {
     var times: [1]Time = undefined;
     var cues = Cues.init(&times);
     const cue = try cues.add(.{ .flicks = 705_600_000 });
-    var nodes: [2]Node = undefined;
-    var builder = Builder.init(&nodes, .{ .slab_count_max = 12, .cues = &cues });
-    builder.extent = .{ .lanes = 6, .components = 1 };
-    const before = try builder.constant(7);
+    var nodes: [3]Node = undefined;
+    var builder = Builder.init(&nodes, .{ .slab_count_max = 18, .cues = &cues });
+    builder.lanes = 6;
+    const before = try builder.lane();
     var source = tween_of(1, 9, cue, .linear);
     source.previous = before;
     const tween = try builder.tween(source);
-    var slab: [12]f64 = undefined;
+    var staggered = tween_of(0, 1, cue, .linear);
+    staggered.stagger = .{ .flicks = 705_600_000 / 4 };
+    const rise = try builder.tween(staggered);
+    var slab: [18]f64 = undefined;
     var state = State.init(builder.finish(), &slab);
     state.eval(.{ .flicks = 0 });
-    try testing.expectEqualSlices(f64, &@as([6]f64, @splat(7)), state.values(tween));
+    try testing.expectEqualSlices(f64, &.{ 0, 1, 2, 3, 4, 5 }, state.values(tween));
     state.eval(.{ .flicks = 3 * 705_600_000 });
     try testing.expectEqualSlices(f64, &@as([6]f64, @splat(9)), state.values(tween));
+    // At 2 s, lane l has run 1 s less l quarters of a second of its 1.5 s, and lane 5 not yet.
+    state.eval(.{ .flicks = 2 * 705_600_000 });
+    for (state.values(rise), 0..) |value, lane| {
+        const elapsed: f64 = @floatFromInt(@max(0, 705_600_000 - 176_400_000 * @as(i64, @intCast(lane))));
+        try testing.expectEqual(elapsed / (3 * 352_800_000), value);
+    }
 }

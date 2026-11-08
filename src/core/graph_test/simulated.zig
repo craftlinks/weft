@@ -396,18 +396,18 @@ test "moving a cue reaches a simulation" {
 
 // Locks the layout of section 9 over 3 lanes: after a constant at 0, a chase at 3 keeps 3 lanes
 // of before, after, and velocity, so a delay after it starts at 15, and the delay's 3 lanes of
-// before and after end the slab at 24. Each chase lane follows its own lane of the target, and
-// the delay holds its initial value in all three at the start.
+// before and after end the slab at 24. Each chase lane follows its own lane of the target, a
+// lane index, and the delay holds its initial value in all three at the start.
 test "a simulated node keeps its state after its output" {
     var times: [1]Time = undefined;
     var cues = Cues.init(&times);
     _ = try cues.add(.{ .flicks = 0 });
     var nodes: [3]Node = undefined;
     var builder = Builder.init(&nodes, .{ .slab_count_max = 30, .cues = &cues });
-    builder.extent = .{ .lanes = 3, .components = 1 };
-    const two = try builder.constant(2);
+    builder.lanes = 3;
+    const index = try builder.lane();
     const chase = try builder.chase(.{
-        .target = two,
+        .target = index,
         .from = 0,
         .time = .{ .flicks = flicks_per_second },
         .overshoot = 0,
@@ -421,9 +421,10 @@ test "a simulated node keeps its state after its output" {
     var slab: [24]f64 = undefined;
     var state = State.init(program, &slab);
     state.eval(.{ .flicks = flicks_per_second });
-    const value = state.values(chase)[0];
-    try testing.expect(value > 1.9);
-    try testing.expectEqualSlices(f64, &@as([3]f64, @splat(value)), state.values(chase));
+    const values = state.values(chase);
+    try testing.expectEqual(@as(f64, 0), values[0]);
+    try testing.expect(values[1] > 0.95 and values[1] < 1);
+    try testing.expect(values[2] > 1.9 and values[2] < 2);
     state.eval(.{ .flicks = 0 });
     try testing.expectEqualSlices(f64, &@as([3]f64, @splat(-1)), state.values(echo));
 

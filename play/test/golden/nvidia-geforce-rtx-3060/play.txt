@@ -9,6 +9,8 @@ bouncers_590   9f1ae6c66683bde3
 bouncers_play  c4862beadab369c2
 knob           74ff5cca350a11a6
 knob_600       cb4d5b6abb8a3c9e
+lanes          30bacb3be334325e
+lanes_play     4cd2c9b68db9b910
 play           9720074c0a619016
 play_590       c80015db46ab58f4
 repoint        f185c28692a92598
@@ -24,5 +26,5 @@ text_error     3623c4742e3200d2
 text_knob      c13e83fdcfd569d7
 text_knob_60   b85715806c5f9e41
 text_knob_600  a7fc6c1479abc8da
-vectors        07055a4a55db0632
-vectors_play   411e3d7f9b3f5809
+vectors        c3f3a6b0234300b9
+vectors_play   df4b13b6ed81eb37

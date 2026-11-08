@@ -643,6 +643,9 @@ const fuzz_seeds = [_][]const u8{
         "c = tween(from: srgb(1, 0.5, 0), to: oklab(0.6, -0.1, 0.1), at: c0, over: 2s)\n" ++
         "v = chase(vec3(wave(sine, 1hz), 0, p.y), time: 0.25s) * 2 - p.x\nl = c.l + map(p, from: 0..1, to: 2..3).y\n" ++
         "module m(a) = a.x * vec2(1, 2)\nq = m(p)\nr = spring([c0: 1], from: 0, time: 1s)\n",
+    "cue c0 = 0s\nb = lanes(8, tween(from: 0, to: lane * 0.1, at: c0, over: 1s, stagger: 5ms))\n" ++
+        "n = lanes(8, noise(smooth, 1hz) + lane)\nh = lanes(8, bounce(0..1, speed: 1, at: c0, stagger: -2ms))\n" ++
+        "fb = lanes(8, delay(0))\nfb <- n * 0.5 + fb * 0.25\nv = lanes(8, vec2(lane, 1)) + b\n",
 };
 
 var fuzz_syntax: Syntax(.{}) = undefined;

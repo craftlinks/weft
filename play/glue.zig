@@ -87,6 +87,13 @@
 //! vec2, and the three colours, OKLab, which cross as sRGB through `weft.colour.to_srgb`, so the
 //! app gets bytes it can draw and never sees OKLab. Then one eval at t gives the dot and the
 //! swatches. The goals cross as points, with the index of the last one whose cue is at or before t.
+//!
+//! ## 8. Lanes
+//! The lanes page reads `Field` (`signals.zig`, section 8), a thousand lanes of one program: one
+//! eval at t gives every dot's size and colour as lane arrays, copied as they are, the colours
+//! through `weft.colour.to_srgb`. Then the events of `(t - 250 ms, t]`, every lane's in one
+//! buffer, give each dot's flash from its last hit at the top wall, by the event's instance,
+//! which is its lane; the count and the drops cross too, so the page can show them.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -206,6 +213,23 @@ pub const Vectors = struct {
     goal: ?usize,
 };
 
+pub const field_count = signals.field_count;
+/// How long a dot flashes after a hit, and the events that window can hold (section 8): a lane
+/// hits a wall every 1/0.6 s, so a thousand give at most about 150 in 250 ms.
+pub const field_flash_ms = 250;
+pub const field_events_max = 512;
+
+/// The lanes page at one time (section 8).
+pub const Field = struct {
+    sizes: [field_count]f32,
+    tints: [field_count][3]f32,
+    /// How much each dot still flashes, from 1 at its hit to 0 after `field_flash_ms`.
+    flashes: [field_count]f32,
+    /// Events in the flash window, every lane's, and those the buffer dropped.
+    events: u32,
+    dropped: u64,
+};
+
 /// What a recompile did (section 3b).
 pub const Outcome = enum { invalid, fresh, carried };
 
@@ -240,6 +264,10 @@ pub const Motion = struct {
     vector_slab: [signals.vector_slab_count]f64,
     vector_reader: weft.State,
     vector_report: Report,
+    field: signals.Field,
+    field_slab: [signals.field_slab_count]f64,
+    field_reader: weft.State,
+    field_report: Report,
 
     /// Builds the program and starts both readers fresh (section 3a).
     pub fn build(motion: *Motion) void {
@@ -268,6 +296,35 @@ pub const Motion = struct {
         motion.vector_reader = .init(motion.vectors.program, &motion.vector_slab);
         const vector_plain = motion.vectors.program.report();
         motion.vector_report = .{ .seekable = vector_plain.seekable, .stepped = vector_plain.stepped, .first = null };
+        motion.field.build();
+        motion.field_reader = .init(motion.field.program, &motion.field_slab);
+        const field_plain = motion.field.program.report();
+        motion.field_report = .{ .seekable = field_plain.seekable, .stepped = field_plain.stepped, .first = null };
+    }
+
+    /// The lanes page at `clock` (section 8).
+    pub fn sample_field(motion: *Motion, clock: Clock, out: *Field) void {
+        const reader = &motion.field_reader;
+        reader.eval(clock.t);
+        for (&out.sizes, reader.values(motion.field.size)) |*size, value| size.* = @floatCast(value);
+        const tints = reader.values(motion.field.tint);
+        for (&out.tints, 0..) |*tint, lane| {
+            const srgb = weft.colour.to_srgb(tints[3 * lane ..][0..3].*);
+            for (tint, srgb) |*channel, value| channel.* = @floatCast(value);
+        }
+        var found: [field_events_max]weft.Event = undefined;
+        const flash_flicks = signals.ms(field_flash_ms).flicks;
+        const window = reader.events(one_after(clock.t.flicks - flash_flicks), one_after(clock.t.flicks), &found);
+        out.events = window.count;
+        out.dropped = window.dropped;
+        out.flashes = @splat(0);
+        for (found[0..window.count]) |event| {
+            // The hop fires at both walls; the top's carries the speed going up.
+            if (event.source.index != motion.field.hop.index or event.value < 0) continue;
+            const age: f64 = @floatFromInt(clock.t.flicks - event.time.flicks);
+            const flash: f32 = @floatCast(1 - age / @as(f64, @floatFromInt(flash_flicks)));
+            out.flashes[event.instance] = @max(out.flashes[event.instance], flash);
+        }
     }
 
     /// The vectors page at `clock` (section 7).
@@ -799,13 +856,11 @@ test "the bouncers hit at step 7's worked times and on the bars" {
 
 /// Whether two reads of the bouncers page are the same, field by field where it was written.
 fn expect_same_hits(expected: *const Hits, found: *const Hits) !void {
-    const bytes = std.mem.sliceAsBytes;
-    const window = expected.window[0..expected.window_count];
-    try testing.expectEqualSlices(u8, bytes(window), bytes(found.window[0..found.window_count]));
+    // Field by field: a `Hit`'s padding bytes are whatever its copy left there.
+    try testing.expectEqualDeep(expected.window[0..expected.window_count], found.window[0..found.window_count]);
     const bars = expected.bars[0..expected.bar_count];
     try testing.expectEqualSlices(f32, bars, found.bars[0..found.bar_count]);
-    const recent = expected.recent[0..expected.recent_count];
-    try testing.expectEqualSlices(u8, bytes(recent), bytes(found.recent[0..found.recent_count]));
+    try testing.expectEqualDeep(expected.recent[0..expected.recent_count], found.recent[0..found.recent_count]);
     try testing.expectEqualDeep(expected.ends, found.ends);
     try testing.expectEqualDeep(expected.heads, found.heads);
     try testing.expectEqualDeep(expected.since, found.since);

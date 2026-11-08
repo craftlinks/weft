@@ -199,7 +199,7 @@ test "moving a cue reaches a motion's cursor" {
 }
 
 // Locks the layout of section 2 for a motion: 3 lanes of output then 4 f64 of cursor, so the next
-// node starts at 7, and every lane holds the value.
+// node starts at 7, and a staggered lane is the motion a second later per lane (section 16).
 test "a motion keeps its cursor after its output" {
     var times: [1]Time = undefined;
     var cues = Cues.init(&times);
@@ -213,22 +213,25 @@ test "a motion keeps its cursor after its output" {
         .cues = &cues,
         .goals = goals.table(),
     });
-    builder.extent = .{ .lanes = 3, .components = 1 };
+    builder.lanes = 3;
     const move = try builder.newtonian(.{
         .from = 0,
         .goals = path,
         .speed = 1,
         .accel = 1,
         .decel = 1,
+        .stagger = .{ .flicks = 705_600_000 },
     });
     const after = try builder.constant(5);
     const program = builder.finish();
     try testing.expectEqual(@as(u32, 7), program.nodes[after.index].offset);
-    try testing.expectEqual(@as(u32, 10), program.slab_count);
+    try testing.expectEqual(@as(u32, 8), program.slab_count);
     var slab: [10]f64 = undefined;
     var state = State.init(program, &slab);
     state.eval(.{ .flicks = 705_600_000 });
-    try testing.expectEqualSlices(f64, &@as([3]f64, @splat(0.5)), state.values(move));
+    try testing.expectEqualSlices(f64, &.{ 0.5, 0, 0 }, state.values(move));
+    state.eval(.{ .flicks = 2 * 705_600_000 });
+    try testing.expectEqualSlices(f64, &.{ 1.5, 0.5, 0 }, state.values(move));
 }
 
 // Locks each refusal of `spring` and `newtonian` by name, and that nothing refused was built.

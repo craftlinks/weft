@@ -50,6 +50,9 @@ pub const Shape = enum {
 pub const Wave = struct {
     shape: Shape,
     hz: f64,
+    /// How much later each lane of a graph's lane region reads it (`graph.zig`, section 16). A
+    /// sample ignores it.
+    stagger: Time = .{ .flicks = 0 },
 
     /// The value of the wave at `time`, in [-1, 1].
     pub fn sample(wave: Wave, time: Time) f64 {

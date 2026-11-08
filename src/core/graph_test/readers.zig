@@ -144,17 +144,22 @@ test "the builder refuses a noise it cannot evaluate" {
     _ = try builder.noise(source);
 }
 
-// Locks that a noise fills every lane of its extent.
-test "a noise loops over the extent of its node" {
+// Locks section 16 for a noise: in a region of 6 lanes, lane l is the noise whose seed is its
+// node's seed hashed with l, so no two lanes are equal.
+test "a noise in a lane region draws each lane from its own seed" {
     var nodes: [1]Node = undefined;
     var builder = Builder.init(&nodes, .{ .slab_count_max = 6 });
-    builder.extent = .{ .lanes = 6, .components = 1 };
+    builder.lanes = 6;
     const source: Noise = .{ .shape = .smooth, .hz = 2, .seed = 4 };
     const noise = try builder.noise(source);
     var slab: [6]f64 = undefined;
     var state = State.init(builder.finish(), &slab);
     const time = Time{ .flicks = 444_444_444 };
     state.eval(time);
-    const expected = source.derive(0).sample(time);
-    try testing.expectEqualSlices(f64, &@as([6]f64, @splat(expected)), state.values(noise));
+    for (state.values(noise), 0..) |value, lane| {
+        var expected = source.derive(0);
+        expected.seed = graph_module.lane_seed(expected.seed, lane);
+        try testing.expectEqual(expected.sample(time), value);
+        for (state.values(noise)[0..lane]) |earlier| try testing.expect(earlier != value);
+    }
 }

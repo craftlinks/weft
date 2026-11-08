@@ -133,6 +133,9 @@ pub const Spring = struct {
     time: Time,
     /// The peak overshoot of a move from rest, as a fraction of the move, in [0, 1).
     overshoot: f64,
+    /// How much later each lane of a graph's lane region heads for its goals (`graph.zig`,
+    /// section 16).
+    stagger: Time = .{ .flicks = 0 },
 };
 
 /// A Newtonian move, as a client describes it.
@@ -146,6 +149,8 @@ pub const Newtonian = struct {
     accel: f64,
     /// The deceleration while slowing down, in units per second squared, above zero.
     decel: f64,
+    /// As `Spring.stagger`.
+    stagger: Time = .{ .flicks = 0 },
 };
 
 /// A spring's constants, worked out once when it is built.
@@ -208,6 +213,8 @@ pub const Motion = struct {
     from: f64,
     goals: Path,
     law: Law,
+    /// As `Spring.stagger`; a sample ignores it.
+    stagger: Time = .{ .flicks = 0 },
 };
 
 pub const Kinematics = struct {

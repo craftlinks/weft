@@ -1,5 +1,5 @@
-//! The signals Play shows: three Weft files, `signals.weft`, `bouncers.weft`, and `vectors.weft`,
-//! compiled once, and the rows that name what to show.
+//! The signals Play shows: four Weft files, `signals.weft`, `bouncers.weft`, `vectors.weft`, and
+//! `lanes.weft`, compiled once, and the rows that name what to show.
 //!
 //! # Deep Architectural Guide for Reviewers:
 //!
@@ -72,6 +72,19 @@
 //! moving and curves. The dot's goals are read once from the checked file, since a vector motion has no goal source
 //! (Weft's back end, section 6): the call bound to `dot`, its path, and one run a component. The
 //! glow's overshoot leaves the sRGB gamut, which `weft.colour.to_srgb` maps back at the read.
+//!
+//! ## 8. The Lanes
+//! The lanes page (step 17) has `Field`, from `lanes.weft`: a thousand dots, one a lane of one
+//! program, pure and closed form:
+//! ```text
+//! rise    a tween from 0 to 1 over 0.8 s from c0, each lane 3 ms after the one before   pure
+//! height  a smooth noise at 0.2 Hz a lane, mapped to 0.3..1                             pure
+//! size    rise * height, a dot's size                                                    pure
+//! tint    OKLab at lightness 0.74, its a and b two noises at 0.1 Hz a lane, times 0.13   pure
+//! hop     a bounce between 0 and 1 at 0.6 a second, each lane 5 ms after the one before  pure
+//! ```
+//! A noise in a region draws each lane from its own seed, so no two dots share a height or a
+//! colour, and the hop's hits at the top wall are the flashes, each event's instance its lane.
 //!
 //! ## 6. Editing
 //! The text page edits `signals.weft` (step 15), so a `Signals` is built from any text, not only
@@ -421,6 +434,50 @@ pub const Vectors = struct {
     }
 };
 
+/// The lanes page's program (section 8).
+pub const field_count = 1000;
+pub const field_node_count = 14;
+pub const field_slab_count = 13 * field_count + 3;
+pub const field_source = @embedFile("lanes.weft");
+
+const FieldCompiled = weft.lang.Compiled(.{
+    .tokens = 512,
+    .tree = 256,
+    .names = 16,
+    .nodes = field_node_count,
+    .slab = field_slab_count,
+    .cues = 1,
+    .goals = 0,
+    .regions = 0,
+    .tracks = 0,
+    .track_samples = 0,
+    .errors = 4,
+});
+
+pub const Field = struct {
+    compiled: FieldCompiled,
+    size: weft.Id,
+    tint: weft.Id,
+    hop: weft.Id,
+    program: weft.Program,
+
+    /// Compiles `lanes.weft` in place and finds its signals by name.
+    pub fn build(field: *Field) void {
+        const compiled = &field.compiled;
+        compiled.compile(field_source) catch unreachable;
+        field.size = compiled.signal("size").?;
+        field.tint = compiled.signal("tint").?;
+        field.hop = compiled.signal("hop").?;
+        field.program = compiled.program;
+        assert(field.program.nodes.len == field_node_count);
+        assert(field.program.slab_count == field_slab_count);
+        assert(!field.program.simulated);
+        for ([_]weft.Id{ field.size, field.tint, field.hop }) |id| {
+            assert(field.program.nodes[id.index].extent.lanes == field_count);
+        }
+    }
+};
+
 /// A time `count` milliseconds after zero: 705,600 flicks each, exactly.
 pub fn ms(count: i64) weft.Time {
     return .{ .flicks = count * @divExact(weft.time.flicks_per_second, 1000) };
@@ -431,6 +488,29 @@ const testing = std.testing;
 var built: Signals = undefined;
 var built_bouncers: Bouncers = undefined;
 var built_vectors: Vectors = undefined;
+var built_field: Field = undefined;
+var field_slab: [field_slab_count]f64 = undefined;
+
+// Locks section 8: a thousand lanes, each its own dot. Before c0 every dot is at size 0, lane
+// 400 is still at 0 at 1.2 s while lane 0 has risen, no two lanes share a tint, and the first
+// hits at the top wall are lane 0's then lane 1's, 5 ms apart.
+test "the lanes program is a thousand dots of their own" {
+    built_field.build();
+    var reader = weft.State.init(built_field.program, &field_slab);
+    reader.eval(ms(1200));
+    const size = reader.values(built_field.size);
+    try testing.expect(size[0] > 0.29);
+    try testing.expectEqual(@as(f64, 0), size[400]);
+    const tint = reader.values(built_field.tint);
+    try testing.expectEqual(@as(usize, 3 * field_count), tint.len);
+    try testing.expect(tint[1] != tint[4] and tint[2] != tint[5]);
+    var events: [4]weft.Event = undefined;
+    const found = reader.events(ms(0), ms(1675), &events);
+    try testing.expectEqual(@as(u32, 2), found.count);
+    try testing.expectEqual(@as(u32, 0), events[0].instance);
+    try testing.expectEqual(@as(u32, 1), events[1].instance);
+    try testing.expectEqual(ms(5).flicks, events[1].time.flicks - events[0].time.flicks);
+}
 
 // Locks section 7: the dot's goals and their cues come from the checked file, and the colours
 // are OKLab, the sweep starting at the orange its `srgb` names.
@@ -467,13 +547,15 @@ fn program_hash(program: weft.Program, tracks: *const weft.Tracks) u64 {
 
 // Locks both programs as built from the text: the hashes are those of the hand-built tables the
 // text replaced in step 12, checked field for field then, so a change to either file or to the
-// compiler that moves a node shows here, before the goldens.
+// compiler that moves a node shows here, before the goldens. Step 17's `stagger` fields moved
+// them only by their printing: with those fields cut from each node's text, both were the step
+// 12 hashes, 0xdea1386a4be8a783 and 0x69071b1bdb435f6a.
 test "the text compiles to the programs it replaced" {
     try testing.expect(built.build(source));
     built_bouncers.build();
-    try testing.expectEqual(@as(u64, 0xdea1386a4be8a783), program_hash(built.program, built.tracks));
+    try testing.expectEqual(@as(u64, 0x8ebcd160a135c39d), program_hash(built.program, built.tracks));
     const bouncer_tracks = &built_bouncers.compiled.tables.tracks;
-    try testing.expectEqual(@as(u64, 0x69071b1bdb435f6a), program_hash(built_bouncers.program, bouncer_tracks));
+    try testing.expectEqual(@as(u64, 0x8def344e14662829), program_hash(built_bouncers.program, bouncer_tracks));
 }
 
 // Locks what the rows find by name: the spring's and the Newtonian move's shared path, the chase's
@@ -495,7 +577,7 @@ var formatted: [8192]u8 = undefined;
 
 // Locks the round trip: both files are in the canonical format, so formatting gives their bytes.
 test "both files are canonical" {
-    for ([_][]const u8{ source, bouncer_source, vector_source }) |text| {
+    for ([_][]const u8{ source, bouncer_source, vector_source, field_source }) |text| {
         try testing.expect(syntax.parse_source(text));
         try testing.expectEqualStrings(text, try syntax.format_into(&formatted));
     }
