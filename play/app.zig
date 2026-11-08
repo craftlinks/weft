@@ -1,14 +1,14 @@
 //! Play: Weft's own Modulator Play on Patchwork: a scope of signals around a playhead, a page of
 //! shapes whose parameters any signal can drive, a page of bouncers whose hits are events, a
 //! page where `signals.weft` is edited while it runs, a page of vectors and colours, and a page
-//! of a thousand lanes.
+//! of a thousand lanes, and a page of forty-eight wanderers.
 //!
 //! # Deep Architectural Guide for Reviewers:
 //!
 //! ## 1. The Three-File Rule
 //! Only `signals.zig`, `glue.zig`, and `language.zig` import `weft`; the last only for its
 //! tokenizer, which colours the editor. This file, `scope.zig`, `patch.zig`,
-//! `shapes.zig`, `bouncers.zig`, `vectors.zig`, and `field.zig` see time as a `glue.Clock` and everything else as `f32`
+//! `shapes.zig`, `bouncers.zig`, `vectors.zig`, and `field.zig`, and `swarm.zig` see time as a `glue.Clock` and everything else as `f32`
 //! arrays and plain structs, so the app is the only glue between Weft and Patchwork, and neither
 //! library knows the other exists. The app reads each row's name, accent, and goal kind from the
 //! signal table through `motion.signals`, and each lane's from `motion.bouncers`, which names no
@@ -31,10 +31,12 @@
 //!            x 672..1272 (`vectors.zig`)
 //! lanes      a field of 40 by 25 cells of 25 px at x 140..1140, y 56..681, a dot a lane, and
 //!            the line of its events under it (`field.zig`)
+//! swarm      an arena of 616 px at x 332..948, y 56..672, forty-eight dots each with a ghost
+//!            behind it, and the line of its events under it (`swarm.zig`)
 //! ```
 //! Each scope plot and each lane is a window from `t - 1 s` to `t + 3 s`, so the playhead sits at
 //! a quarter of its width. The shapes page reads only the playhead reader, so it never samples
-//! that window, and the bouncers, vectors, and lanes pages read only their own programs' readers.
+//! that window, and the bouncers, vectors, lanes, and swarm pages read only their own programs' readers.
 //!
 //! ## 3. Transport
 //! Time follows frames: the timer is off, `t` advances on the `frame` event by its delta, clamped
@@ -43,7 +45,7 @@
 //! at the end starts again from 0. The slider shows `t / 600 s` each frame, and a press or drag on
 //! it seeks there and pauses. Home goes to 0 and End to 600 s; Left and Right step `step_ms`, and
 //! Page Up and Page Down `page_ms` back and forth, all clamped. The page button cycles the pages
-//! and names the next; the keys 1 to 6 go to each.
+//! and names the next; the keys 1 to 7 go to each.
 //!
 //! ## 4. Knobs Apply From Now On
 //! A knob's value v in [0, 1] maps to a parameter so that 0.5 is the default exactly
@@ -80,7 +82,9 @@
 //! first colour, and `vectors_play` plays the page's first 2.5 s. Its frame costs about 50 us at
 //! any t, which a test prints in ReleaseFast: the program is closed form, so it has no steps.
 //! `lanes` steps to 1.2 s, the field half risen, and `lanes_play` plays its first 2.5 s, the
-//! first dots flashing from 1.67 s; a test prints its frame at 60 s and 600 s too.
+//! first dots flashing from 1.67 s; a test prints its frame at 60 s and 600 s too. `swarm` steps
+//! to 4 s, the wanderers spread over the arena with their ghosts behind, and `swarm_play` plays
+//! its first 2.5 s; its program is stepped, so a test prints its frame at 60 s and 600 s as well.
 //!
 //! ## 7. Events Are Read, Never Kept
 //! Each frame reads its events as a window around the playhead (`glue.zig`, section 6): the
@@ -131,6 +135,7 @@ const shapes = @import("shapes.zig");
 const bouncers = @import("bouncers.zig");
 const vectors = @import("vectors.zig");
 const field = @import("field.zig");
+const swarm = @import("swarm.zig");
 const language = @import("language.zig");
 const input = patchwork.input;
 const literal = patchwork.editor.literal;
@@ -172,6 +177,7 @@ comptime {
     assert(glue.colour_count == vectors.colour_count);
     assert(glue.vector_goal_count == vectors.goal_count);
     assert(glue.field_count == field.count);
+    assert(glue.swarm_count == swarm.count);
 }
 const knob_names = [knob_count][]const u8{ "pulse hz", "chase s", "sway os", "glide v" };
 /// Each knob's parameter at its middle, the default: pulse hz, chase s, sway os, glide v.
@@ -193,6 +199,7 @@ pub const Page = enum {
     text,
     vectors,
     lanes,
+    swarm,
 
     /// The page the page button goes to.
     pub fn next(page: Page) Page {
@@ -202,7 +209,8 @@ pub const Page = enum {
             .bouncers => .text,
             .text => .vectors,
             .vectors => .lanes,
-            .lanes => .scope,
+            .lanes => .swarm,
+            .swarm => .scope,
         };
     }
 };
@@ -280,6 +288,7 @@ const right: Step = .{ .key = .{ .key = .right, .text = "" } };
 const page_4: Step = .{ .key = .{ .key = .other, .text = "4" } };
 const page_5: Step = .{ .key = .{ .key = .other, .text = "5" } };
 const page_6: Step = .{ .key = .{ .key = .other, .text = "6" } };
+const page_7: Step = .{ .key = .{ .key = .other, .text = "7" } };
 const line_end: Step = .{ .key = .{ .key = .end, .text = "" } };
 const backspace: Step = .{ .key = .{ .key = .backspace, .text = "" } };
 /// A click on line 21 of `signals.weft`, `wave = wave(sine, 0.5hz)`, which gives the editor focus.
@@ -340,6 +349,8 @@ pub const App = struct {
     vectors: glue.Vectors,
     /// The lanes page as last read.
     field: glue.Field,
+    /// The swarm page as last read.
+    swarm: glue.Swarm,
     row_dots: [glue.scope_row_count][glue.dots_max][2]f32,
     row_dot_counts: [glue.scope_row_count]u32,
     /// The text page (section 8): `signals.weft` in the editor.
@@ -498,6 +509,13 @@ pub const App = struct {
             .frames = 1,
         },
         .{ .name = "lanes_play", .setup = &.{ page_6, space }, .cycle = &.{}, .frames = 150 },
+        .{
+            .name = "swarm",
+            .setup = &([_]Step{page_7} ++ @as([40]Step, @splat(right)) ++ [_]Step{.{ .wait = 2 }}),
+            .cycle = &.{.{ .wait = 1 }},
+            .frames = 1,
+        },
+        .{ .name = "swarm_play", .setup = &.{ page_7, space }, .cycle = &.{}, .frames = 150 },
     };
 
     pub fn init(app: *App, textures: *quads.Textures) void {
@@ -604,6 +622,7 @@ pub const App = struct {
                 if (std.mem.eql(u8, typed, "4")) return app.show(cx, .text);
                 if (std.mem.eql(u8, typed, "5")) return app.show(cx, .vectors);
                 if (std.mem.eql(u8, typed, "6")) return app.show(cx, .lanes);
+                if (std.mem.eql(u8, typed, "7")) return app.show(cx, .swarm);
                 return;
             },
             else => return,
@@ -655,7 +674,20 @@ pub const App = struct {
             .text => app.draw_text(cx, clip),
             .vectors => app.draw_vectors(cx, clip),
             .lanes => app.draw_lanes(cx, clip),
+            .swarm => app.draw_swarm(cx, clip),
         }
+    }
+
+    fn draw_swarm(app: *App, cx: *Context, clip: Clip) void {
+        app.motion.sample_swarm(app.clock, &app.swarm);
+        const page = &app.swarm;
+        swarm.draw(cx, .{
+            .places = &page.places,
+            .ghosts = &page.ghosts,
+            .tints = &page.tints,
+            .lit = &page.lit,
+            .gate = glue.swarm_gate,
+        }, clip);
     }
 
     fn draw_lanes(app: *App, cx: *Context, clip: Clip) void {
@@ -1012,11 +1044,13 @@ pub const App = struct {
             .bouncers => app.motion.bouncer_report,
             .vectors => app.motion.vector_report,
             .lanes => app.motion.field_report,
+            .swarm => app.motion.swarm_report,
             else => app.motion.report,
         };
         const seekable = if (report.seekable) "seekable" else "not seekable";
-        const name = if (report.first) |index| app.motion.signals.rows[index].name else "";
-        assert(report.stepped == (report.first != null));
+        // The swarm's own program has no scope row to name; its first stepped node is `wander_x`.
+        const name = if (report.first) |index| app.motion.signals.rows[index].name else if (app.page == .swarm) "wander_x" else "";
+        assert(report.stepped == (report.first != null) or app.page == .swarm);
         const stepped = if (report.stepped) ", stepped from " else "";
         const page = @tagName(app.page);
         const args = .{ page, @divFloor(ms, 1000), @mod(ms, 1000), seekable, stepped, name };
@@ -1148,6 +1182,7 @@ test {
     _ = bouncers;
     _ = vectors;
     _ = field;
+    _ = swarm;
     _ = language;
 }
 
@@ -1424,12 +1459,12 @@ test "the scenarios replay headless" {
     }
 }
 
-// Locks the pages: the page button cycles scope, shapes, bouncers, text, vectors, lanes and names
+// Locks the pages: the page button cycles scope, shapes, bouncers, text, vectors, lanes, swarm and names
 // the next; 3 goes to the bouncers, whose label reports their own program, seekable with no
 // steps, and which, paused, ask for no frame.
-test "the page button cycles the six pages" {
+test "the page button cycles the seven pages" {
     const app = new_app();
-    const order = [_]Page{ .shapes, .bouncers, .text, .vectors, .lanes, .scope };
+    const order = [_]Page{ .shapes, .bouncers, .text, .vectors, .lanes, .swarm, .scope };
     for (order) |expected| {
         _ = frame_at(app);
         try std.testing.expectEqualStrings(@tagName(expected), app.page_button.label);
@@ -1701,6 +1736,40 @@ test "the cost of a vectors frame at 60 s and 600 s" {
         }
         std.debug.print("vectors at {d} s: frame at most {d} us, read at most {d} us\n", .{
             @divFloor(app.clock.millis(), 1000),
+            @divFloor(frame_ns, 1000),
+            @divFloor(read_ns, 1000),
+        });
+    }
+}
+
+// Measures, and prints, what a frame of the swarm page costs at 60 s and 600 s, playing on from a
+// seek: the steps since the last frame of a stepped program of forty-eight lanes, the colours to
+// sRGB, and the draw of 48 dots, ghosts, and threads. The first frame after the seek, which runs
+// every step of the way from 0 and fills the checkpoints, is printed apart. Only in ReleaseFast.
+test "the cost of a swarm frame at 60 s and 600 s" {
+    if (@import("builtin").mode != .fast) return;
+    const io = std.testing.io;
+    const app = new_app();
+    send(app, key_down(.other, "7"));
+    for ([_]f32{ 0.1, 1 }) |at| {
+        app.clock.seek(at);
+        const seek_start = std.Io.Clock.awake.now(io).nanoseconds;
+        _ = frame_at(app);
+        const seek_ns = std.Io.Clock.awake.now(io).nanoseconds - seek_start;
+        var frame_ns: i96 = 0;
+        var read_ns: i96 = 0;
+        for (0..20) |step| {
+            app.clock.step(16 * @as(i64, @intCast(step % 2)));
+            var start = std.Io.Clock.awake.now(io).nanoseconds;
+            _ = frame_at(app);
+            frame_ns = @max(frame_ns, std.Io.Clock.awake.now(io).nanoseconds - start);
+            start = std.Io.Clock.awake.now(io).nanoseconds;
+            app.motion.sample_swarm(app.clock, &app.swarm);
+            read_ns = @max(read_ns, std.Io.Clock.awake.now(io).nanoseconds - start);
+        }
+        std.debug.print("swarm at {d} s: first frame after the seek {d} us, then frame at most {d} us, read at most {d} us\n", .{
+            @divFloor(app.clock.millis(), 1000),
+            @divFloor(seek_ns, 1000),
             @divFloor(frame_ns, 1000),
             @divFloor(read_ns, 1000),
         });

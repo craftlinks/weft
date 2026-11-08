@@ -86,6 +86,19 @@
 //! A noise in a region draws each lane from its own seed, so no two dots share a height or a
 //! colour, and the hop's hits at the top wall are the flashes, each event's instance its lane.
 //!
+//! ## 9. The Swarm
+//! The swarm page (step 18's agent trial) has `Swarm`, from `swarm.weft`: forty-eight dots, one a lane
+//! of one program, stepped (it has followers and chases) but with no live input, so seekable:
+//! ```text
+//! wander_x, wander_y  a follower a lane over -1..1 on a spring of 0.7 s, pausing up to 0.8 s   stepped
+//! place               vec2(wander_x, wander_y), the dot                                         stepped
+//! ghost               vec2 of two chases of the wanderers, 0.4 s behind                         stepped
+//! tint                OKLab at lightness 0.74, a and b two noises a lane                        pure
+//! gate                a crossing of wander_x at 0.25: 1 while the dot is at or past it                stepped
+//! ```
+//! Each lane draws its own seed, so no two dots wander alike, and the gate's events carry the lane
+//! as their instance. The page reads values only: a frame costs the steps since the last one.
+//!
 //! ## 6. Editing
 //! The text page edits `signals.weft` (step 15), so a `Signals` is built from any text, not only
 //! the embedded file: `build` copies the text first, since the program's names and the errors'
@@ -478,6 +491,54 @@ pub const Field = struct {
     }
 };
 
+/// The swarm page's program (section 9).
+pub const swarm_count = 48;
+pub const swarm_node_count = 15;
+pub const swarm_slab_count = 1876;
+pub const swarm_source = @embedFile("swarm.weft");
+/// Seconds of checkpoints the swarm's reader keeps: the timeline and a little more.
+pub const swarm_checkpoint_seconds = 604;
+
+const SwarmCompiled = weft.lang.Compiled(.{
+    .tokens = 1024,
+    .tree = 512,
+    .names = 32,
+    .nodes = swarm_node_count,
+    .slab = swarm_slab_count,
+    .cues = 1,
+    .goals = 0,
+    .regions = 1,
+    .tracks = 0,
+    .track_samples = 0,
+    .errors = 4,
+});
+
+pub const Swarm = struct {
+    compiled: SwarmCompiled,
+    place: weft.Id,
+    ghost: weft.Id,
+    tint: weft.Id,
+    gate: weft.Id,
+    program: weft.Program,
+
+    /// Compiles `swarm.weft` in place and finds its signals by name.
+    pub fn build(swarm: *Swarm) void {
+        const compiled = &swarm.compiled;
+        compiled.compile(swarm_source) catch unreachable;
+        swarm.place = compiled.signal("place").?;
+        swarm.ghost = compiled.signal("ghost").?;
+        swarm.tint = compiled.signal("tint").?;
+        swarm.gate = compiled.signal("gate").?;
+        swarm.program = compiled.program;
+        assert(swarm.program.nodes.len == swarm_node_count);
+        assert(swarm.program.slab_count == swarm_slab_count);
+        assert(swarm.program.simulated);
+        for ([_]weft.Id{ swarm.place, swarm.ghost, swarm.tint, swarm.gate }) |id| {
+            assert(swarm.program.nodes[id.index].extent.lanes == swarm_count);
+        }
+    }
+};
+
 /// A time `count` milliseconds after zero: 705,600 flicks each, exactly.
 pub fn ms(count: i64) weft.Time {
     return .{ .flicks = count * @divExact(weft.time.flicks_per_second, 1000) };
@@ -490,6 +551,9 @@ var built_bouncers: Bouncers = undefined;
 var built_vectors: Vectors = undefined;
 var built_field: Field = undefined;
 var field_slab: [field_slab_count]f64 = undefined;
+var built_swarm: Swarm = undefined;
+var swarm_slab: [swarm_slab_count]f64 = undefined;
+var swarm_checkpoints: [8 * swarm_slab_count]f64 = undefined;
 
 // Locks section 8: a thousand lanes, each its own dot. Before c0 every dot is at size 0, lane
 // 400 is still at 0 at 1.2 s while lane 0 has risen, no two lanes share a tint, and the first
@@ -510,6 +574,29 @@ test "the lanes program is a thousand dots of their own" {
     try testing.expectEqual(@as(u32, 0), events[0].instance);
     try testing.expectEqual(@as(u32, 1), events[1].instance);
     try testing.expectEqual(ms(5).flicks, events[1].time.flicks - events[0].time.flicks);
+}
+
+// Locks section 9: forty-eight wanderers, each its own. At t = 0 every dot is at the origin; at 5 s
+// no two share an x and the ghost, a chase of the dot, is not on it; the gate is 1 for the
+// lanes whose x is at or past 0.25.
+test "the swarm program is forty-eight wanderers of their own" {
+    built_swarm.build();
+    var reader = weft.State.init_with_checkpoints(built_swarm.program, &swarm_slab, &swarm_checkpoints);
+    reader.eval(ms(0));
+    for (reader.values(built_swarm.place)) |component| try testing.expectEqual(@as(f64, 0), component);
+    reader.eval(ms(5000));
+    const place = reader.values(built_swarm.place);
+    const ghost = reader.values(built_swarm.ghost);
+    try testing.expectEqual(@as(usize, 2 * swarm_count), place.len);
+    try testing.expect(place[0] != place[2] and place[1] != place[3]);
+    try testing.expect(place[0] != ghost[0]);
+    // The gate is 1 exactly for the lanes at or past 0.25, and some lane is.
+    var lit: u32 = 0;
+    for (reader.values(built_swarm.gate), 0..) |gate, lane| {
+        try testing.expectEqual(@as(f64, if (place[2 * lane] >= 0.25) 1 else 0), gate);
+        lit += @intFromBool(gate == 1);
+    }
+    try testing.expect(lit > 0);
 }
 
 // Locks section 7: the dot's goals and their cues come from the checked file, and the colours
@@ -577,7 +664,7 @@ var formatted: [8192]u8 = undefined;
 
 // Locks the round trip: both files are in the canonical format, so formatting gives their bytes.
 test "both files are canonical" {
-    for ([_][]const u8{ source, bouncer_source, vector_source, field_source }) |text| {
+    for ([_][]const u8{ source, bouncer_source, vector_source, field_source, swarm_source }) |text| {
         try testing.expect(syntax.parse_source(text));
         try testing.expectEqualStrings(text, try syntax.format_into(&formatted));
     }

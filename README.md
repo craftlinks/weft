@@ -787,8 +787,8 @@ or a clock.
 
 ## Play
 
-Play is Weft's first client: a Patchwork app with six pages on one 600 s clock. Its signals are
-text, `play/signals.weft`, `play/bouncers.weft`, `play/vectors.weft`, and `play/lanes.weft`,
+Play is Weft's first client: a Patchwork app with seven pages on one 600 s clock. Its signals are
+text, `play/signals.weft`, `play/bouncers.weft`, `play/vectors.weft`, `play/lanes.weft`, and `play/swarm.weft`,
 compiled at start, and the first can be edited while it runs.
 
 - **scope** plots eight signals, one or more of each class but live, over a window from one second
@@ -828,8 +828,15 @@ compiled at start, and the first can be edited while it runs.
   its bounce, 5 ms behind the one before, reaches the top wall. The flashes are every lane's
   events of the last quarter second, read in one buffer each frame, whose count and drops show
   under the field. A frame costs under 0.2 ms at any time.
+- **swarm** runs forty-eight lanes of one stepped program: each dot is a follower of its own x and
+  y wandering a square, trailed by a ghost, a chase 0.4 s behind it, joined to it by a thread whose
+  length is the lag, and ringed while a `crossing` gate on its x reads 1. Its steps run from the
+  start, so a scrub to 600 s costs a second or more the first time, which fills the reader's
+  checkpoints; playing on costs under 0.1 ms a frame at any time, and a jump to anywhere after
+  that costs at most 479 steps. It reads no events, since a window behind the playhead restores a
+  checkpoint every frame on a stepped program.
 
-Space or the play button plays and pauses, the page button cycles the pages and 1 to 6 go to
+Space or the play button plays and pauses, the page button cycles the pages and 1 to 7 go to
 each, the slider scrubs, Home and End go to the ends, Left and Right step 100 ms, and Page Up and
 Page Down 10 s.
 
@@ -851,6 +858,6 @@ own package still has no dependencies.
 
 **The two-file rule.** Only `play/signals.zig`, the signal table, and `play/glue.zig` import
 `weft`. Everything else in Play (`app.zig`, `scope.zig`, `patch.zig`, `shapes.zig`,
-`bouncers.zig`, `vectors.zig`, `field.zig`) draws plain numbers: the glue hands time over as a `Clock`, and the samples,
+`bouncers.zig`, `vectors.zig`, `field.zig`, `swarm.zig`) draws plain numbers: the glue hands time over as a `Clock`, and the samples,
 events, ranges, classes, and report as `f32` arrays and plain structs. The glue has a budget of
 60 lines of code; growing past it says the boundary or Weft's API is wrong.
