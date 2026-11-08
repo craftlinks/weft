@@ -56,6 +56,7 @@ pub const Code = enum(u8) {
     not_live,
     unknown_word,
     unknown_output,
+    wrong_shape,
     // Modules and libraries.
     not_a_parameter,
     module_cycle,

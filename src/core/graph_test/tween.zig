@@ -247,7 +247,7 @@ test "a tween loops over the extent of its node" {
     const cue = try cues.add(.{ .flicks = 705_600_000 });
     var nodes: [2]Node = undefined;
     var builder = Builder.init(&nodes, .{ .slab_count_max = 12, .cues = &cues });
-    builder.extent = .{ .lanes = 3, .components = 2 };
+    builder.extent = .{ .lanes = 6, .components = 1 };
     const before = try builder.constant(7);
     var source = tween_of(1, 9, cue, .linear);
     source.previous = before;

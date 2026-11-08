@@ -1,5 +1,5 @@
-//! The signals Play shows: two Weft files, `signals.weft` and `bouncers.weft`, compiled once, and
-//! the rows that name what to show.
+//! The signals Play shows: three Weft files, `signals.weft`, `bouncers.weft`, and `vectors.weft`,
+//! compiled once, and the rows that name what to show.
 //!
 //! # Deep Architectural Guide for Reviewers:
 //!
@@ -54,6 +54,24 @@
 //! ```
 //! Six legs are whole flicks, so those lanes hit 2 to 7 times a bar, exactly on the bars. The
 //! 0.7 lane is step 7's worked bounce, whose hits land one flick after the exact multiples.
+//!
+//! ## 7. The Vectors
+//! The vectors page (step 16) has a program of its own too, `Vectors`, from `vectors.weft`, which
+//! is pure and closed form, so a read at any time costs one pass and no steps:
+//! ```text
+//! cues    c0 to c3, every 0.8 s from 0 s
+//! dot     a vec2 spring through four goals from (0.5, 0.5); 0.7 s, overshoot 0.35  exact
+//! sway    two smooth noises at 0.7 Hz, packed, times 0.08                         pure
+//! place   dot + sway, the point the page draws                                    exact
+//! sweep   a colour tween from orange to blue, over 6 s from c0                    pure
+//! glow    a colour spring through four colours at the cues, from the first;
+//!         0.5 s, overshoot 0.4                                                     exact
+//! drift   OKLab at lightness 0.72, its a and b two noises at 0.2 Hz times 0.12     pure
+//! ```
+//! Each goal comes before the spring settles on the last, so the place arrives at a goal still
+//! moving and curves. The dot's goals are read once from the checked file, since a vector motion has no goal source
+//! (Weft's back end, section 6): the call bound to `dot`, its path, and one run a component. The
+//! glow's overshoot leaves the sRGB gamut, which `weft.colour.to_srgb` maps back at the read.
 //!
 //! ## 6. Editing
 //! The text page edits `signals.weft` (step 15), so a `Signals` is built from any text, not only
@@ -341,6 +359,68 @@ pub const Bouncers = struct {
     }
 };
 
+/// The vectors page's program (section 7).
+pub const vector_node_count = 25;
+pub const vector_slab_count = 55;
+pub const vector_goal_count = 4;
+pub const vector_source = @embedFile("vectors.weft");
+
+const VectorCompiled = weft.lang.Compiled(.{
+    .tokens = 512,
+    .tree = 256,
+    .names = 16,
+    .nodes = vector_node_count,
+    .slab = vector_slab_count,
+    .cues = 4,
+    .goals = 8 + 12,
+    .regions = 0,
+    .tracks = 0,
+    .track_samples = 0,
+    .errors = 4,
+});
+
+/// The colours the page draws as strips over the window, by name, in order.
+pub const colour_count = 3;
+pub const colour_names = [colour_count][]const u8{ "sweep", "glow", "drift" };
+
+pub const Vectors = struct {
+    compiled: VectorCompiled,
+    place: weft.Id,
+    colours: [colour_count]weft.Id,
+    /// The dot's goals: where, and the cue's time.
+    goals: [vector_goal_count][2]f64,
+    goal_times: [vector_goal_count]weft.Time,
+    program: weft.Program,
+
+    /// Compiles `vectors.weft` in place, finds its signals by name, and reads the dot's goals.
+    pub fn build(vectors: *Vectors) void {
+        const compiled = &vectors.compiled;
+        compiled.compile(vector_source) catch unreachable;
+        vectors.place = compiled.signal("place").?;
+        for (&vectors.colours, colour_names) |*id, name| id.* = compiled.signal(name).?;
+        const checked = &compiled.checked;
+        const binding = for (checked.bindings) |entry| {
+            if (std.mem.eql(u8, entry.name, "dot")) break entry;
+        } else unreachable;
+        const expr = checked.exprs[binding.index];
+        assert(expr.tag == .call);
+        const path = checked.call_values(expr.a)[0].path;
+        assert(checked.paths[path].shape.components == 2);
+        for (0..2) |k| {
+            const run = checked.paths[path + k];
+            assert(run.count == vector_goal_count);
+            for (checked.goals[run.first..][0..run.count], 0..) |goal, at| {
+                vectors.goals[at][k] = goal.value;
+                vectors.goal_times[at] = compiled.tables.cues.at(.{ .index = goal.cue });
+            }
+        }
+        vectors.program = compiled.program;
+        assert(vectors.program.nodes.len == vector_node_count);
+        assert(vectors.program.slab_count == vector_slab_count);
+        assert(!vectors.program.simulated);
+    }
+};
+
 /// A time `count` milliseconds after zero: 705,600 flicks each, exactly.
 pub fn ms(count: i64) weft.Time {
     return .{ .flicks = count * @divExact(weft.time.flicks_per_second, 1000) };
@@ -350,6 +430,24 @@ const testing = std.testing;
 
 var built: Signals = undefined;
 var built_bouncers: Bouncers = undefined;
+var built_vectors: Vectors = undefined;
+
+// Locks section 7: the dot's goals and their cues come from the checked file, and the colours
+// are OKLab, the sweep starting at the orange its `srgb` names.
+test "the vectors program finds its goals and colours" {
+    built_vectors.build();
+    try testing.expectEqual([2]f64{ 0.2, 0.75 }, built_vectors.goals[0]);
+    try testing.expectEqual([2]f64{ 0.3, 0.3 }, built_vectors.goals[3]);
+    try testing.expectEqual(ms(2400), built_vectors.goal_times[3]);
+    var slab: [vector_slab_count]f64 = undefined;
+    var reader = weft.State.init(built_vectors.program, &slab);
+    reader.eval(ms(0));
+    const sweep = reader.values(built_vectors.colours[0]);
+    const orange = weft.colour.from_srgb(.{ 0.95, 0.35, 0.2 });
+    try testing.expectEqualSlices(f64, &orange, sweep);
+    // The dot starts at its `from`, and the sway moves it at most 0.08 a component.
+    for (reader.values(built_vectors.place)) |component| try testing.expectApproxEqAbs(@as(f64, 0.5), component, 0.08);
+}
 
 /// A hash of a program and the tables it reads, from each node's and entry's printed fields, so
 /// padding bytes never count (section 1's lock).
@@ -397,7 +495,7 @@ var formatted: [8192]u8 = undefined;
 
 // Locks the round trip: both files are in the canonical format, so formatting gives their bytes.
 test "both files are canonical" {
-    for ([_][]const u8{ source, bouncer_source }) |text| {
+    for ([_][]const u8{ source, bouncer_source, vector_source }) |text| {
         try testing.expect(syntax.parse_source(text));
         try testing.expectEqualStrings(text, try syntax.format_into(&formatted));
     }

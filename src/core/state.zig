@@ -621,11 +621,11 @@ fn eval_node(
         .constant => |constant| @memset(out, constant),
         .add => |op| {
             const left = node_values(nodes, slab, op.left);
-            add_into(out, left, node_values(nodes, slab, op.right));
+            add_into(out, left, node_values(nodes, slab, op.right), node.extent.components);
         },
         .multiply => |op| {
             const left = node_values(nodes, slab, op.left);
-            multiply_into(out, left, node_values(nodes, slab, op.right));
+            multiply_into(out, left, node_values(nodes, slab, op.right), node.extent.components);
         },
         .map_range => |*op| map_range_into(out, node_values(nodes, slab, op.input), op),
         .wave => |wave| @memset(out, wave.sample(time)),
@@ -661,6 +661,14 @@ fn eval_node(
         },
         // Set by `State.set_input`, which a pass leaves as it is.
         .input => {},
+        .pack => |op| for (op.inputs[0..op.count], 0..) |id, component| {
+            for (node_values(nodes, slab, id), 0..) |value, lane| out[lane * op.count + component] = value;
+        },
+        .pick => |op| {
+            const values = node_values(nodes, slab, op.input);
+            const components = nodes[op.input.index].extent.components;
+            for (out, 0..) |*value, lane| value.* = values[lane * components + op.component];
+        },
         .recorded => |op| {
             const clip = program.samples[op.clip.first..][0..op.clip.count];
             @memset(out, recording_module.play(clip, time));
@@ -808,7 +816,7 @@ fn update_node(program: *const Program, slab: []f64, node: *const Node, index: u
             }
         },
         .constant, .add, .multiply, .map_range, .wave, .tween, .noise, .motion => unreachable,
-        .bounce, .cues, .crossing, .input, .recorded, .track => unreachable,
+        .bounce, .cues, .crossing, .input, .recorded, .track, .pack, .pick => unreachable,
     }
     for (after) |value| assert(std.math.isFinite(value));
 }
@@ -853,7 +861,7 @@ fn reset_node(program: *const Program, slab: []f64, node: *const Node) void {
             @memset(after, simulation.shift_value(op, own[1..], position));
         },
         .constant, .add, .multiply, .map_range, .wave, .tween, .noise, .motion => unreachable,
-        .bounce, .cues, .crossing, .input, .recorded, .track => unreachable,
+        .bounce, .cues, .crossing, .input, .recorded, .track, .pack, .pick => unreachable,
     }
     @memcpy(before, after);
 }
@@ -881,16 +889,21 @@ fn follower_pack(state: simulation.FollowerState, after: []f64, own: []f64) void
     own[3] = @floatFromInt(state.pause_left);
 }
 
-fn add_into(out: []f64, left: []const f64, right: []const f64) void {
-    assert(left.len == out.len);
-    assert(right.len == out.len);
-    for (out, left, right) |*value, a, b| value.* = a + b;
+/// `left + right` per component of `components`, an operand of one component broadcast across
+/// the components of its lane (`graph.zig`, section 15).
+fn add_into(out: []f64, left: []const f64, right: []const f64, components: u32) void {
+    for (out, 0..) |*value, at| value.* = operand(left, out.len, components, at) + operand(right, out.len, components, at);
 }
 
-fn multiply_into(out: []f64, left: []const f64, right: []const f64) void {
-    assert(left.len == out.len);
-    assert(right.len == out.len);
-    for (out, left, right) |*value, a, b| value.* = a * b;
+fn multiply_into(out: []f64, left: []const f64, right: []const f64, components: u32) void {
+    for (out, 0..) |*value, at| value.* = operand(left, out.len, components, at) * operand(right, out.len, components, at);
+}
+
+/// Value `at` of an output of `count` f64 and `components` a lane, from an operand of the same
+/// shape or of one component a lane.
+fn operand(values: []const f64, count: usize, components: u32, at: usize) f64 {
+    assert(values.len == count or values.len * components == count);
+    return if (values.len == count) values[at] else values[at / components];
 }
 
 fn map_range_into(out: []f64, input: []const f64, map: *const MapRange) void {

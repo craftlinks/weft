@@ -85,6 +85,9 @@ pub const Param = struct {
     /// A signal may set it, read at each step (`graph.zig` section 14).
     live: bool = false,
     positional: bool = false,
+    /// It takes a vector or a colour of one shape as well as one value (step 16), and the back
+    /// end builds one node per component.
+    shaped: bool = false,
     default: Default = .required,
     words: []const []const u8 = &.{},
 };
@@ -110,6 +113,10 @@ pub const Op = enum {
     map,
     spring_mover,
     newtonian_mover,
+    /// `vec2`, `vec3`, and `oklab`: scalars packed into one value (step 16).
+    pack,
+    /// `srgb`: a colour from three numbers, converted to OKLab at compile time.
+    srgb,
     /// A client's noun: checked like the rest, built by the client from `Checked.calls`.
     client,
 };
@@ -177,28 +184,28 @@ pub const entries = [_]Entry{
         .{ .name = "seed", .kind = .seed, .default = .seed },
     } },
     .{ .name = "tween", .op = .tween, .role = .signal, .summary = "a move from one value to another, from a cue", .params = &.{
-        .{ .name = "from", .kind = .number },
-        .{ .name = "to", .kind = .number },
+        .{ .name = "from", .kind = .number, .shaped = true },
+        .{ .name = "to", .kind = .number, .shaped = true },
         .{ .name = "at", .kind = .cue },
         .{ .name = "over", .kind = .time },
         .{ .name = "ease", .kind = .ease, .default = .{ .word = 0 }, .words = ease_words },
-        .{ .name = "after", .kind = .signal, .default = .absent },
+        .{ .name = "after", .kind = .signal, .shaped = true, .default = .absent },
     } },
     .{ .name = "spring", .op = .spring, .role = .signal, .summary = "a spring toward goals at cues", .params = &.{
-        .{ .name = "goals", .kind = .path, .positional = true },
-        .{ .name = "from", .kind = .number, .default = .{ .number = 0 } },
+        .{ .name = "goals", .kind = .path, .positional = true, .shaped = true },
+        .{ .name = "from", .kind = .number, .shaped = true, .default = .{ .number = 0 } },
         .{ .name = "time", .kind = .time },
         .{ .name = "overshoot", .kind = .number, .default = .{ .number = 0 } },
     } },
     .{ .name = "newtonian", .op = .newtonian, .role = .signal, .summary = "a Newtonian move toward goals at cues", .params = &.{
-        .{ .name = "goals", .kind = .path, .positional = true },
-        .{ .name = "from", .kind = .number, .default = .{ .number = 0 } },
+        .{ .name = "goals", .kind = .path, .positional = true, .shaped = true },
+        .{ .name = "from", .kind = .number, .shaped = true, .default = .{ .number = 0 } },
         .{ .name = "speed", .kind = .number },
         .{ .name = "accel", .kind = .number },
         .{ .name = "decel", .kind = .number },
     } },
     .{ .name = "chase", .op = .chase, .role = .signal, .summary = "a spring chasing a signal", .params = &.{
-        .{ .name = "target", .kind = .signal, .positional = true },
+        .{ .name = "target", .kind = .signal, .positional = true, .shaped = true },
         .{ .name = "from", .kind = .number, .default = .{ .number = 0 } },
         .{ .name = "time", .kind = .time, .live = true },
         .{ .name = "overshoot", .kind = .number, .live = true, .default = .{ .number = 0 } },
@@ -247,9 +254,28 @@ pub const entries = [_]Entry{
         .{ .name = "initial", .kind = .number, .default = .{ .number = 0 } },
     } },
     .{ .name = "map", .op = .map, .role = .signal, .summary = "a signal moved from one range to another", .params = &.{
-        .{ .name = "input", .kind = .signal, .positional = true },
+        .{ .name = "input", .kind = .signal, .positional = true, .shaped = true },
         .{ .name = "from", .kind = .number_range, .positional = true },
         .{ .name = "to", .kind = .number_range },
+    } },
+    .{ .name = "vec2", .op = .pack, .role = .signal, .summary = "a 2D vector of two signals", .params = &.{
+        .{ .name = "x", .kind = .signal, .positional = true },
+        .{ .name = "y", .kind = .signal, .positional = true },
+    } },
+    .{ .name = "vec3", .op = .pack, .role = .signal, .summary = "a 3D vector of three signals", .params = &.{
+        .{ .name = "x", .kind = .signal, .positional = true },
+        .{ .name = "y", .kind = .signal, .positional = true },
+        .{ .name = "z", .kind = .signal, .positional = true },
+    } },
+    .{ .name = "oklab", .op = .pack, .role = .signal, .summary = "a colour of three signals: lightness and the a and b axes of OKLab", .params = &.{
+        .{ .name = "l", .kind = .signal, .positional = true },
+        .{ .name = "a", .kind = .signal, .positional = true },
+        .{ .name = "b", .kind = .signal, .positional = true },
+    } },
+    .{ .name = "srgb", .op = .srgb, .role = .signal, .summary = "a colour of three sRGB numbers in [0, 1], kept as OKLab", .params = &.{
+        .{ .name = "r", .kind = .number, .positional = true },
+        .{ .name = "g", .kind = .number, .positional = true },
+        .{ .name = "b", .kind = .number, .positional = true },
     } },
     .{ .name = "spring", .op = .spring_mover, .role = .mover, .summary = "a follower's spring", .params = &.{
         .{ .name = "time", .kind = .time, .live = true },

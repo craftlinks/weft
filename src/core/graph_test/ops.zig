@@ -133,14 +133,14 @@ test "the builder refuses a capacity overflow by name" {
     try testing.expectEqual(@as(u32, 2), builder.slab_count);
 
     builder = Builder.init(&nodes, .{ .slab_count_max = 5 });
-    builder.extent = .{ .lanes = 3, .components = 2 };
+    builder.extent = .{ .lanes = 6, .components = 1 };
     try testing.expectError(error.SlabCapacityExceeded, builder.constant(1));
     try testing.expectEqual(@as(u32, 0), builder.node_count);
     try testing.expectEqual(@as(u32, 0), builder.slab_count);
     builder.extent = .{ .lanes = 5, .components = 1 };
     _ = try builder.constant(1);
     try testing.expectEqual(@as(u32, 5), builder.slab_count);
-    builder.extent = .{ .lanes = std.math.maxInt(u32), .components = std.math.maxInt(u32) };
+    builder.extent = .{ .lanes = std.math.maxInt(u32), .components = 1 };
     try testing.expectError(error.SlabCapacityExceeded, builder.constant(1));
 }
 
@@ -267,13 +267,13 @@ test "eval depends only on the time" {
     try testing.expectEqual(expected, state.value(output));
 }
 
-// Locks the layout of section 2 with lanes and components above 1, which every op must loop over.
-// 3 lanes of 2 components is 6 f64 per node, at offsets 0, 6, 12, 18, and 24, and a thousand 2D
-// values is 2,000 f64 at one offset.
+// Locks the layout of section 2 with lanes above 1, which every op must loop over: 6 lanes is
+// 6 f64 per node, at offsets 0, 6, 12, 18, and 24, and a thousand 2D values, a pack of two
+// scalars over a thousand lanes, is 2,000 f64 at one offset.
 test "each op loops over the extent of its node" {
     var nodes: [5]Node = undefined;
     var builder = Builder.init(&nodes, .{ .slab_count_max = 30 });
-    builder.extent = .{ .lanes = 3, .components = 2 };
+    builder.extent = .{ .lanes = 6, .components = 1 };
     const two = try builder.constant(2);
     const three = try builder.constant(3);
     const sum = try builder.add(two, three);
@@ -296,12 +296,13 @@ test "each op loops over the extent of its node" {
     try testing.expectEqualSlices(f64, &@as([6]f64, @splat(15)), state.values(product));
     try testing.expectEqualSlices(f64, &@as([6]f64, @splat(0.5)), state.values(mapped));
 
-    var nodes_many: [2]Node = undefined;
+    var nodes_many: [3]Node = undefined;
     var builder_many = Builder.init(&nodes_many, .{ .slab_count_max = 4000 });
-    builder_many.extent = .{ .lanes = 1000, .components = 2 };
-    _ = try builder_many.wave(carrier);
+    builder_many.extent = .{ .lanes = 1000, .components = 1 };
+    const first = try builder_many.wave(carrier);
     const second = try builder_many.wave(swell);
-    try testing.expectEqual(@as(u32, 2000), builder_many.nodes[second.index].offset);
+    const both = try builder_many.pack(&.{ first, second });
+    try testing.expectEqual(@as(u32, 2000), builder_many.nodes[both.index].offset);
     try testing.expectEqual(@as(u32, 4000), builder_many.finish().slab_count);
 }
 
@@ -311,4 +312,69 @@ test "an empty program evaluates" {
     var state = State.init(builder.finish(), &.{});
     state.eval(.{ .flicks = 0 });
     try testing.expectEqual(@as(usize, 0), state.slab.len);
+}
+
+// Locks section 15: a pack of three scalars, a pick of each component, a vector plus a vector,
+// a vector times a scalar broadcast, a map per component, and the ranges of a pack and a pick.
+test "pack, pick, and arithmetic per component" {
+    var nodes: [12]Node = undefined;
+    var builder = Builder.init(&nodes, .{ .slab_count_max = 32 });
+    const one = try builder.constant(1);
+    const two = try builder.constant(2);
+    const three = try builder.constant(3);
+    const vector = try builder.pack(&.{ one, two, three });
+    const doubled = try builder.multiply(vector, two);
+    const sum = try builder.add(vector, doubled);
+    const mapped = try builder.map_range(.{ .input = sum, .input_low = 0, .input_high = 9, .output_low = 0, .output_high = 1 });
+    const middle = try builder.pick(sum, 1);
+    const scalar_sum = try builder.add(middle, one);
+    const program = builder.finish();
+    try testing.expectEqual(@as(u32, 3), program.nodes[vector.index].extent.components);
+    try testing.expectEqual(@as(u32, 3), program.nodes[doubled.index].extent.components);
+    try testing.expectEqual(@as(u32, 1), program.nodes[middle.index].extent.components);
+    var slab: [32]f64 = undefined;
+    var state = State.init(program, &slab);
+    state.eval(.{ .flicks = 0 });
+    try testing.expectEqualSlices(f64, &.{ 1, 2, 3 }, state.values(vector));
+    try testing.expectEqualSlices(f64, &.{ 2, 4, 6 }, state.values(doubled));
+    try testing.expectEqualSlices(f64, &.{ 3, 6, 9 }, state.values(sum));
+    try testing.expectEqualSlices(f64, &.{ 3.0 / 9.0, 6.0 / 9.0, 1 }, state.values(mapped));
+    try testing.expectEqual(@as(f64, 6), state.value(middle));
+    try testing.expectEqual(@as(f64, 7), state.value(scalar_sum));
+    var ranges: [12]graph_module.Range = undefined;
+    program.ranges(ranges[0..program.nodes.len]);
+    try testing.expectEqual(graph_module.Range{ .low = 1, .high = 3 }, ranges[vector.index]);
+    const picked = try builder_pick_of_pack();
+    try testing.expectEqual(graph_module.Range{ .low = 2, .high = 2 }, picked);
+}
+
+/// The range of a pick of a pack's second input: that input's own, not the pack's hull.
+fn builder_pick_of_pack() !graph_module.Range {
+    var nodes: [4]Node = undefined;
+    var builder = Builder.init(&nodes, .{ .slab_count_max = 8 });
+    const one = try builder.constant(1);
+    const two = try builder.constant(2);
+    const both = try builder.pack(&.{ one, two });
+    _ = try builder.pick(both, 1);
+    const program = builder.finish();
+    var ranges: [4]graph_module.Range = undefined;
+    program.ranges(&ranges);
+    return ranges[3];
+}
+
+// Locks section 15's refusals: two vectors of different sizes, a vector where an op reads one
+// value, a pack of one or of five, a pack of a vector, and a component past the end.
+test "the builder refuses a shape that does not fit" {
+    var nodes: [8]Node = undefined;
+    var builder = Builder.init(&nodes, .{ .slab_count_max = 32 });
+    const one = try builder.constant(1);
+    const two = try builder.pack(&.{ one, one });
+    const three = try builder.pack(&.{ one, one, one });
+    try testing.expectError(error.ShapeMismatch, builder.add(two, three));
+    try testing.expectError(error.ShapeMismatch, builder.multiply(three, two));
+    try testing.expectError(error.ShapeMismatch, builder.pack(&.{one}));
+    try testing.expectError(error.ShapeMismatch, builder.pack(&.{ one, one, one, one, one }));
+    try testing.expectError(error.ShapeMismatch, builder.pack(&.{ one, two }));
+    try testing.expectError(error.ShapeMismatch, builder.pick(two, 2));
+    try testing.expectError(error.ShapeMismatch, builder.chase(.{ .target = two, .from = 0, .time = .{ .flicks = 705_600_000 }, .overshoot = 0 }));
 }

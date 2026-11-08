@@ -1,0 +1,13 @@
+# Play's vectors: a 2D spring through four goals, swaying by two packed noises, and three colours.
+seed 11
+cue c0 = 0s
+cue c1 = 0.8s
+cue c2 = 1.6s
+cue c3 = 2.4s
+
+dot = spring([c0: vec2(0.2, 0.75), c1: vec2(0.8, 0.8), c2: vec2(0.75, 0.25), c3: vec2(0.3, 0.3)], from: vec2(0.5, 0.5), time: 0.7s, overshoot: 0.35)
+sway = vec2(noise(smooth, 0.7hz), noise(smooth, 0.7hz)) * 0.08
+place = dot + sway
+sweep = tween(from: srgb(0.95, 0.35, 0.2), to: srgb(0.2, 0.45, 0.95), at: c0, over: 6s)
+glow = spring([c0: srgb(0.95, 0.8, 0.2), c1: srgb(0.2, 0.8, 0.5), c2: srgb(0.85, 0.2, 0.6), c3: srgb(0.3, 0.5, 0.95)], from: srgb(0.95, 0.8, 0.2), time: 0.5s, overshoot: 0.4)
+drift = oklab(0.72, noise(smooth, 0.2hz) * 0.12, noise(smooth, 0.2hz) * 0.12)
