@@ -110,6 +110,8 @@ pub const Op = enum {
     map,
     spring_mover,
     newtonian_mover,
+    /// A client's noun: checked like the rest, built by the client from `Checked.calls`.
+    client,
 };
 
 pub const Entry = struct {

@@ -235,6 +235,11 @@ const Back = struct {
         const item = checked.calls[call].item;
         const builder = &back.builder;
         switch (entry.op) {
+            .client => {
+                const diagnostic = back.fail(item, .refused, "`{s}` has no back end in Weft", .{entry.name});
+                error_module.hint(diagnostic, "a client builds its own nodes from `Checked.calls`", .{});
+                return error.Refused;
+            },
             .wave => {
                 const source: wave.Wave = .{ .shape = schema.word_value(wave.Shape, v[0].word), .hz = v[1].frequency };
                 return .{ .first = try back.attempt(builder.wave(source), item, call) };

@@ -35,6 +35,9 @@
 //! items are in its own tree. A module may declare the range its output stays in; that is
 //! checked after the build, against the instance's node, for an instance bound to a name.
 //!
+//! A client's nouns (step 14) join the table of primitives through `compile_client`. The checker
+//! accepts them, and the back end refuses them, so the client builds them from `checked`.
+//!
 //! ## 5. Robustness
 //! Any bytes compile to a program or to at least one diagnostic, and never crash: the fuzz test
 //! below feeds random bytes and mutated examples through compile and format, and every limit is
@@ -196,6 +199,13 @@ pub fn Compiled(comptime limits: Limits) type {
         /// Compiles `source`, which may `use` any of `libraries`. A library that does not parse
         /// is an error: `errors` then lists its diagnostics, and `failed_library` names it.
         pub fn compile_with(compiled: *Self, libraries: []const Source, source: []const u8) error{Invalid}!void {
+            return compiled.compile_client(&.{}, libraries, source);
+        }
+
+        /// Compiles `source` with a client's nouns beside the primitives. A client noun is checked
+        /// like a primitive, and the back end refuses it: the client builds it from `checked`, which
+        /// is set even when the back end refuses.
+        pub fn compile_client(compiled: *Self, clients: []const schema.Entry, libraries: []const Source, source: []const u8) error{Invalid}!void {
             compiled.ok = false;
             compiled.failed_library = null;
             assert(libraries.len <= limits.libraries);
@@ -216,6 +226,7 @@ pub fn Compiled(comptime limits: Limits) type {
                 .frames = &compiled.frames,
                 .libraries = compiled.library_list[0..libraries.len],
                 .instances = &compiled.instances,
+                .clients = clients,
                 .bindings = &compiled.bindings,
                 .declarations = &compiled.checked_declarations,
                 .calls = &compiled.calls,

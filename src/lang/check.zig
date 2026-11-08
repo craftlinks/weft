@@ -58,6 +58,8 @@
 //! - An instance's seed base hashes its caller's base, the module's name, and how many instances
 //!   the caller has expanded in this declaration, so section 5 holds inside modules.
 //!
+//! A client's nouns (step 14) are entries looked up after the table of primitives (`lookup`).
+//!
 //! ## 7. TigerStyle Invariants
 //! - Every array is the caller's; a full one is an error naming its limit, and checking stops.
 //! - Names are found by a linear search over at most `Limits.names`, at compile time only.
@@ -195,6 +197,8 @@ pub const Memory = struct {
     frames: []Frame,
     libraries: []const Library = &.{},
     instances: []Instance = &.{},
+    /// A client's nouns, checked after the table of primitives (step 14).
+    clients: []const schema.Entry = &.{},
 };
 
 pub const Checked = struct {
@@ -651,7 +655,7 @@ const Checker = struct {
             .name => return checker.signal_name(index, 0),
             .call => {
                 const name = checker.text(index);
-                if (schema.find(name, .signal)) |entry| {
+                if (checker.lookup(name, .signal)) |entry| {
                     const call = try checker.check_call(entry, index);
                     return checker.push_expr(.{ .tag = .call, .a = call, .item = index });
                 }
@@ -714,7 +718,7 @@ const Checker = struct {
                 error_module.hint(diagnostic, "only a call such as `bounce` has outputs", .{});
                 return error.Checked;
             },
-            .call => schema.find(checker.text(base_index), .signal) orelse {
+            .call => checker.lookup(checker.text(base_index), .signal) orelse {
                 const diagnostic = checker.fail(index, .unknown_output, "a module's call has no outputs until it has a name", .{});
                 error_module.hint(diagnostic, "bind it first, such as `x = {s}(…)`, then `x.{s}`", .{ checker.text(base_index), output_name });
                 return error.Checked;
@@ -890,6 +894,15 @@ const Checker = struct {
         return checker.signal(arg.item);
     }
 
+    /// The entry called `name` in `role`: a primitive, else one of the client's nouns.
+    fn lookup(checker: *const Checker, name: []const u8, role: schema.Role) ?*const Entry {
+        if (schema.find(name, role)) |entry| return entry;
+        for (checker.memory.clients) |*entry| {
+            if (entry.role == role and std.mem.eql(u8, entry.name, name)) return entry;
+        }
+        return null;
+    }
+
     fn find_module(checker: *const Checker, name: []const u8) ?u32 {
         for (checker.memory.modules[0..checker.module_count], 0..) |module, at| {
             if (std.mem.eql(u8, module.name, name)) return @intCast(at);
@@ -908,7 +921,7 @@ const Checker = struct {
                 return error.Checked;
             }
         }
-        if (schema.find(name, .signal) != null or schema.find(name, .mover) != null) {
+        if (checker.lookup(name, .signal) != null or checker.lookup(name, .mover) != null) {
             const diagnostic = checker.fail(report, .reserved_name, "`{s}` is a primitive, not a module's name", .{name});
             error_module.hint(diagnostic, "choose another name, such as `{s}_1`", .{name});
             return error.Checked;
@@ -1147,7 +1160,7 @@ const Checker = struct {
         const it = checker.item(index);
         if (it.tag == .call) {
             const name = checker.text(index);
-            if (schema.find(name, .mover)) |entry| return checker.check_call(entry, index);
+            if (checker.lookup(name, .mover)) |entry| return checker.check_call(entry, index);
             if (checker.find_module(name)) |module| {
                 const frame = try checker.enter_module(module, index);
                 defer checker.frame_count = frame;

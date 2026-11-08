@@ -45,6 +45,42 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = root })).step);
     }
 
+    // The `weft` command (step 14): its commands are a module of their own, so the tests call
+    // the same functions and compare the bytes with the goldens in test/golden/cli.
+    const commands = b.createModule(.{
+        .root_source_file = b.path("cli/commands.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "weft", .module = weft }},
+    });
+    const cli = b.addExecutable(.{
+        .name = "weft",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cli/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "weft", .module = weft },
+                .{ .name = "commands", .module = commands },
+            },
+        }),
+    });
+    b.installArtifact(cli);
+    const cli_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/cli.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "weft", .module = weft },
+                .{ .name = "commands", .module = commands },
+            },
+        }),
+    });
+    const cli_run = b.addRunArtifact(cli_tests);
+    b.step("test-cli", "Compare the weft command's output with its goldens").dependOn(&cli_run.step);
+    test_step.dependOn(&cli_run.step);
+
     const wasm = b.addExecutable(.{
         .name = "weft-regress",
         .root_module = b.createModule(.{
