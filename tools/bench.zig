@@ -13,6 +13,7 @@
 //! events   a bounce and cues, events per 128-frame block        48 kHz blocks over 10 s
 //! write    the chase page with its springs' time from a track,  per frame, at 600 s
 //!          a write of the track at the playhead, then the eval
+//! compile  Play's `signals.weft` (step 12), parse to program      per compile
 //! ```
 //! `write` is what a knob costs when it applies from now on (step 9.5), beside `cold`, which is
 //! what it cost as a rebuild.
@@ -63,6 +64,7 @@ pub fn main(init: std.process.Init) !void {
     cold(io);
     events(io);
     write(io);
+    compile(io);
 }
 
 fn now(io: std.Io) i96 {
@@ -246,6 +248,38 @@ fn write(io: std.Io) void {
 }
 
 /// A builder refusal here is a mistake in the case, named in every build mode.
+/// Play's signal table as text, passed in by `build.zig`.
+const play_signals = @embedFile("play_signals");
+
+var compiled: weft.lang.Compiled(.{
+    .tokens = 1024,
+    .tree = 512,
+    .names = 64,
+    .nodes = 24,
+    .slab = 112,
+    .cues = 6,
+    .goals = 3,
+    .regions = 4,
+    .tracks = 4,
+    .track_samples = 16,
+}) = undefined;
+
+/// Case 6: Play's file compiled from its bytes to its program, per compile.
+fn compile(io: std.Io) void {
+    const count = 2000;
+    var best: i96 = std.math.maxInt(i96);
+    var total: f64 = 0;
+    for (0..repeats) |_| {
+        const start = now(io);
+        for (0..count) |_| {
+            compiled.compile(play_signals) catch |err| fail(err);
+            total += @floatFromInt(compiled.program.nodes.len);
+        }
+        best = @min(best, now(io) - start);
+    }
+    report("compile Play's signals.weft, per compile", best, count, total);
+}
+
 fn fail(err: anyerror) noreturn {
     std.debug.panic("bench: a case failed to build: {t}", .{err});
 }

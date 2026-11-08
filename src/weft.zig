@@ -30,6 +30,7 @@ pub const simulation = @import("core/simulation.zig");
 pub const time = @import("core/time.zig");
 pub const track = @import("core/track.zig");
 pub const wave = @import("core/wave.zig");
+pub const lang = @import("lang/lang.zig");
 
 pub const Cue = cue.Cue;
 pub const Cues = cue.Cues;
@@ -90,4 +91,5 @@ test {
     _ = time;
     _ = track;
     _ = wave;
+    _ = lang;
 }

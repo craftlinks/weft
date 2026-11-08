@@ -25,6 +25,15 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{.{ .name = "weft", .module = weft }},
         }),
+        b.createModule(.{
+            .root_source_file = b.path("test/lang.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "weft", .module = weft },
+                .{ .name = "catalog", .module = catalog },
+            },
+        }),
     };
     for (test_roots) |root| {
         test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = root })).step);
@@ -74,6 +83,9 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{.{ .name = "weft", .module = weft }},
         }),
+    });
+    bench.root_module.addAnonymousImport("play_signals", .{
+        .root_source_file = b.path("play/signals.weft"),
     });
     const bench_run = b.addRunArtifact(bench);
     bench_run.has_side_effects = true;
