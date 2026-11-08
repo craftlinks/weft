@@ -88,18 +88,18 @@
 //! app gets bytes it can draw and never sees OKLab. Then one eval at t gives the dot and the
 //! swatches. The goals cross as points, with the index of the last one whose cue is at or before t.
 //!
-//! ## 9. Swarm
-//! The swarm page reads `Swarm` (`signals.zig`, section 9), forty-eight lanes of a stepped program
-//! on a reader with checkpoints: one eval at t gives every dot's place, ghost, colour, and gate as
-//! lane arrays, the colours through `weft.colour.to_srgb`. It reads no events: a stepped program's
-//! events from `t - 300 ms` restore a checkpoint each frame, which costs about six times a frame.
-//!
 //! ## 8. Lanes
 //! The lanes page reads `Field` (`signals.zig`, section 8), a thousand lanes of one program: one
 //! eval at t gives every dot's size and colour as lane arrays, copied as they are, the colours
 //! through `weft.colour.to_srgb`. Then the events of `(t - 250 ms, t]`, every lane's in one
 //! buffer, give each dot's flash from its last hit at the top wall, by the event's instance,
 //! which is its lane; the count and the drops cross too, so the page can show them.
+//!
+//! ## 9. Swarm
+//! The swarm page reads `Swarm` (`signals.zig`, section 9), forty-eight lanes of a stepped program
+//! on a reader with checkpoints: one eval at t gives every dot's place, ghost, colour, and gate as
+//! lane arrays, the colours through `weft.colour.to_srgb`. It reads no events: a stepped program's
+//! events from `t - 300 ms` restore a checkpoint each frame, which cost about 6 ms a frame.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -199,7 +199,9 @@ pub const Hits = struct {
     dropped: u64,
 };
 
-pub const Report = struct { seekable: bool, stepped: bool, first: ?usize };
+/// No live node, whether a read can cost steps, and what to name as the first stepped node: a
+/// scope row of the running file, or, for a page with a program of its own, a binding's name.
+pub const Report = struct { seekable: bool, stepped: bool, first: ?usize, first_name: []const u8 = "" };
 
 pub const vector_samples = 128;
 pub const colour_count = signals.colour_count;
@@ -327,7 +329,15 @@ pub const Motion = struct {
         const slab_n = signals.swarm_slab_count;
         motion.swarm_reader = .init_with_checkpoints(motion.swarm.program, motion.swarm_memory[0..slab_n], motion.swarm_memory[slab_n..]);
         const swarm_plain = motion.swarm.program.report();
-        motion.swarm_report = .{ .seekable = swarm_plain.seekable, .stepped = swarm_plain.stepped, .first = null };
+        // Its first stepped node is the binding `wander_x` itself, a region of followers.
+        const wander_x = motion.swarm.compiled.signal("wander_x").?;
+        assert(swarm_plain.first_simulated.?.index == wander_x.index);
+        motion.swarm_report = .{
+            .seekable = swarm_plain.seekable,
+            .stepped = swarm_plain.stepped,
+            .first = null,
+            .first_name = "wander_x",
+        };
     }
 
     /// The swarm page at `clock` (section 9).

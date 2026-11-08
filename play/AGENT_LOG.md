@@ -137,3 +137,15 @@ Marks: **guess**, **workaround**, **missing**, **wrong**.
 3. **Play's `Report` and the cost test**: let a page's report name its first stepped node instead of a
    scope row, and have the cost test print the first frame after a seek next to the steady frame (entries 7,
    8). With it, `--only`, `--render`, and an `.old.png` diff in the guide (entry 10).
+
+## The reviewer's fixes
+
+Made by the session that ran this trial, before merging, each where the page broke a rule:
+
+- **Entry 7's workaround** asserted with an exception for one page and named `wander_x` by hand.
+  `glue.Report` now has `first_name`, which a page with a program of its own sets, and the glue
+  checks that the swarm's first stepped node is the binding `wander_x`; the label's assert is
+  whole again.
+- **`app.zig`'s guide** said the page draws the line of its events; it reads none, and its line
+  counts the dots past the gate. One sentence also had a doubled "and".
+- **`glue.zig`'s guide** had section 9 above section 8.

@@ -8,7 +8,7 @@
 //! ## 1. The Three-File Rule
 //! Only `signals.zig`, `glue.zig`, and `language.zig` import `weft`; the last only for its
 //! tokenizer, which colours the editor. This file, `scope.zig`, `patch.zig`,
-//! `shapes.zig`, `bouncers.zig`, `vectors.zig`, and `field.zig`, and `swarm.zig` see time as a `glue.Clock` and everything else as `f32`
+//! `shapes.zig`, `bouncers.zig`, `vectors.zig`, `field.zig`, and `swarm.zig` see time as a `glue.Clock` and everything else as `f32`
 //! arrays and plain structs, so the app is the only glue between Weft and Patchwork, and neither
 //! library knows the other exists. The app reads each row's name, accent, and goal kind from the
 //! signal table through `motion.signals`, and each lane's from `motion.bouncers`, which names no
@@ -32,7 +32,7 @@
 //! lanes      a field of 40 by 25 cells of 25 px at x 140..1140, y 56..681, a dot a lane, and
 //!            the line of its events under it (`field.zig`)
 //! swarm      an arena of 616 px at x 332..948, y 56..672, forty-eight dots each with a ghost
-//!            behind it, and the line of its events under it (`swarm.zig`)
+//!            behind it, and a line under it counting the dots past the gate (`swarm.zig`)
 //! ```
 //! Each scope plot and each lane is a window from `t - 1 s` to `t + 3 s`, so the playhead sits at
 //! a quarter of its width. The shapes page reads only the playhead reader, so it never samples
@@ -1048,9 +1048,8 @@ pub const App = struct {
             else => app.motion.report,
         };
         const seekable = if (report.seekable) "seekable" else "not seekable";
-        // The swarm's own program has no scope row to name; its first stepped node is `wander_x`.
-        const name = if (report.first) |index| app.motion.signals.rows[index].name else if (app.page == .swarm) "wander_x" else "";
-        assert(report.stepped == (report.first != null) or app.page == .swarm);
+        const name = if (report.first) |index| app.motion.signals.rows[index].name else report.first_name;
+        assert(report.stepped == (report.first != null or report.first_name.len > 0));
         const stepped = if (report.stepped) ", stepped from " else "";
         const page = @tagName(app.page);
         const args = .{ page, @divFloor(ms, 1000), @mod(ms, 1000), seekable, stepped, name };
