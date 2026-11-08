@@ -1,0 +1,12 @@
+bad.weft:2:14: error: chase has no parameter `tme`
+    c = chase(n, tme: 1s)
+                 ^^^
+    hint: did you mean `time`?
+bad.weft:3:16: error: `hz` takes a frequency
+    d = wave(sine, 1)
+                   ^
+    hint: write `1hz`
+bad.weft:5:15: error: the module `a` uses itself
+    module b(x) = a(x)
+                  ^^^^
+    hint: the cycle is a -> b -> a; break it with a parameter or a primitive

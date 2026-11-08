@@ -127,6 +127,8 @@ zig build regress                   # sampled signals against the golden, native
 zig build regress -- --bless        # rewrite the golden, if native and wasm agree
 zig build wasm                      # the wasm32-freestanding build
 zig build bench -Doptimize=ReleaseFast   # what reads cost on this machine
+zig build test-cli                  # the weft command's output against its goldens
+./zig-out/bin/weft check play/signals.weft   # after `zig build`; see The weft Command
 ```
 
 ## Layout
@@ -160,11 +162,16 @@ src/
     format.zig        the canonical format
     error.zig         diagnostics and suggestions
     std.weft          the standard library of modules, `weft.lang.std_library`
+cli/
+  main.zig            the weft command: arguments, files, and one write of the output
+  commands.zig        check, describe, sample, and parse, each a call into the library
 test/
   catalog.zig         the sampled signals, rendered as text of hex floats
   lang.zig            the catalog's graphs as text, which compile to its nodes
   modules.zig         modules against the same graphs written by hand
+  cli.zig             the weft command's output against its goldens, and a client's nouns
   golden/signals.txt  the committed samples
+  golden/cli/         the weft command's committed output
 tools/
   bench.zig           times reads and a compile, for zig build bench
   regress.zig         compares native and wasm text with the golden, and blesses
@@ -595,6 +602,35 @@ compiled.compile_with(&.{.{ .name = "std", .text = weft.lang.std_library }}, sou
   elsewhere never reshuffles one.
 - **A declared range**, `in lo..hi`, is checked after the build for an instance bound to a name.
 - **Errors** inside a library's module are reported on the file's call.
+
+## The weft Command
+
+`zig build` installs `zig-out/bin/weft`, the tool an agent uses in place of watching motion. It
+needs no window, no GPU, and no Patchwork, and each command is a thin call into the library:
+
+```bash
+weft check FILE [--use NAME=PATH]...            # diagnostics, or a one-line summary
+weft describe [--use NAME=PATH]...              # primitives and modules, as JSON
+weft sample FILE [--from S] [--to S] [--step S] [--signal NAME]...   # values and events, as JSON
+weft parse FILE --json                          # the flat tree, as JSON
+```
+
+```txt
+$ weft check play/signals.weft
+ok: 21 nodes, 6 cues, 4 tracks, seekable, stepped
+$ weft sample play/signals.weft --to 1 --step 0.5 --signal wave
+{"from":0,"to":705600000,"step":352800000,"signals":[{"name":"wave","range":[-1,1],"values":[0,1,0]}],"events":[{"t":22050000,"source":19,"instance":0},…]}
+```
+
+- **Times** on the command line are seconds; in the output they are flicks, so a grid is exact.
+- **JSON** has its keys in a fixed order and no whitespace, and a value that is not finite, such
+  as an unbounded range, is `null`. The output of every command is locked by a golden in
+  `test/golden/cli`, so a change to it is a reviewed change.
+- **Exit codes**: 0 on success, 1 when the file has errors, 2 for bad arguments or a file that
+  cannot be read.
+- **A client's nouns**: `Compiled.compile_client` takes entries beside the table of primitives.
+  The checker accepts them and Weft's back end refuses them, so the client builds them from
+  `compiled.checked.calls`, and `describe` lists them under `nouns`.
 
 ## Regress
 
