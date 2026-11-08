@@ -12,9 +12,9 @@
 //! in `graph_test/`, one file a topic. A section cited in either is a section of this guide.
 //!
 //! ## 2. The Slab
-//! Every node's output lives in the slab at an offset, as `lanes * components` f64. Each op loops
-//! over that extent, so many values cost no new layout: lanes and components are both 1 today, and
-//! a thousand 2D values would be 2,000 f64 at one offset. f64 is the one value type, because a
+//! Every node's output lives in the slab at an offset, as `lanes * components` f64, lane after
+//! lane. Each op loops over that extent, so many values cost no new layout: a thousand 2D values
+//! are 2,000 f64 at one offset (sections 15 and 16). f64 is the one value type, because a
 //! value and the time it came from must not differ in precision, and because a client converting
 //! to f32 at its boundary pays less than Weft would pay for two kinds of slab.
 //!
@@ -170,6 +170,27 @@
 //! straight line through OKLab. A pack's range is the hull of its inputs', and a pick of a pack
 //! has the picked input's own range. Within a lane, components are consecutive in the slab.
 //!
+//! ## 16. Lanes
+//! One program evaluates many elements as lanes (step 17): each node has its own lane count, and
+//! its values are lane after lane. A client opens a region with `Builder.lanes`, the count of the
+//! family, and lane l of a node built in it is lane `g = lane_first + l` of the family, which
+//! `Extent.laned` marks; `Options.lane_first` lets one program build a slice of a family, so lane
+//! g built alone equals lane g built with the rest, bit for bit. A node has many lanes only when
+//! its values differ by lane:
+//! - Per-lane sources take the region's count: `lane`, each lane's g; a noise, a follower, and a
+//!   shift register, whose lane g has its node's seed hashed with g; a delay; and a wave, tween,
+//!   spring, Newtonian move, or bounce whose `stagger` is not 0, whose lane g reads the time
+//!   `t - g * stagger`, which for a cued op is its cues moved `g * stagger` later.
+//! - Arithmetic, a map, a pack, a pick, a chase, a crossing, an oscillator, and a tween with
+//!   `previous` have the most lanes of their inputs, and an input of one lane is broadcast.
+//! - A parameter from a node takes one lane, since a node has one law, and everything else is one
+//!   lane, so a constant or a knob costs one value however many lanes read it.
+//! Two counts above 1 in one op, or a parameter or a delay's feed of too many, are refused
+//! (`LaneMismatch`), as is a stagger or a `lane` outside a region. A `spread` gives a one-lane node
+//! n equal lanes, so a region's value has its count even where nothing in it varies. An event's
+//! instance is its lane g, so `event.zig`'s order of time, source, then instance holds across
+//! lanes. A staggered motion reads its lanes in time order, so its cursor folds forward.
+//!
 //! ## 13. TigerStyle Invariants
 //! - Capacities come from the caller, and the builder refuses what does not fit, by name.
 //! - `eval` allocates nothing, takes no lock, and is one bounded pass over the node array. A motion
@@ -224,6 +245,9 @@ pub const Id = struct {
 pub const Extent = struct {
     lanes: u32,
     components: u32,
+    /// Its lane l is lane `lane_first + l` of a family (section 16): it was built in a region, or
+    /// reads a node that was.
+    laned: bool = false,
 
     /// The number of f64 in the output. The builder refuses an extent where this overflows.
     pub fn count(extent: Extent) u32 {
@@ -263,6 +287,21 @@ pub const Pick = struct {
     component: u8,
 };
 
+/// The most lanes a node has (section 16).
+pub const lanes_max = 1 << 20;
+
+/// The seed of lane `lane` of a seeded node whose seed is `seed` (section 16).
+pub fn lane_seed(seed: u64, lane: u64) u64 {
+    return noise_hash(seed, lane);
+}
+
+/// The time lane `lane` of a node staggered by `stagger` reads at `time` (section 16).
+pub fn lane_time(time: Time, stagger: Time, lane: u64) Time {
+    // Wrapping, as every time offset is: the builder refused a stagger whose offsets overflow.
+    const offset = @as(i64, @bitCast(lane)) *% stagger.flicks;
+    return .{ .flicks = time.flicks -% offset };
+}
+
 /// Moves from `from` to `to`, over `duration` from the time of the cue `start`.
 pub const Tween = struct {
     from: f64,
@@ -273,6 +312,8 @@ pub const Tween = struct {
     start: Cue,
     /// The signal to follow before `start`, or null to hold `from`.
     previous: ?Id,
+    /// How much later each lane of a region starts (section 16).
+    stagger: Time = .{ .flicks = 0 },
 
     /// The value at or after `start_time`.
     pub fn value_after(tween: *const Tween, time: Time, start_time: Time) f64 {
@@ -387,6 +428,8 @@ pub const Bounce = struct {
     speed: f64,
     /// Before this cue it holds `low`, at rest. From it, it leaves `low` going up.
     start: Cue,
+    /// How much later each lane of a region starts (section 16).
+    stagger: Time = .{ .flicks = 0 },
 };
 
 /// The two nodes of a bounce.
@@ -409,6 +452,7 @@ pub const BounceNode = struct {
     leg_flicks: f64,
     start: Cue,
     output: Output,
+    stagger: Time = .{ .flicks = 0 },
 
     pub const Output = enum { position, velocity };
 
@@ -538,6 +582,10 @@ pub const Op = union(enum) {
     track: TrackId,
     pack: Pack,
     pick: Pick,
+    /// Each lane's index in its family, `lane_first + l` (section 16).
+    lane,
+    /// A node of one lane as the node's lanes, each its value (section 16).
+    spread: Id,
 
     /// The f64 a node of this op keeps in the slab after an output of `output_count` f64, for a
     /// cache or a simulation's state. Section 9 explains the layout of a simulated node.
@@ -547,15 +595,16 @@ pub const Op = union(enum) {
             .motion => motion.cursor_count,
             .chase => |chase| 3 * output_count + law_cache_count(chase.params, true),
             .delay => 2 * output_count,
-            .follow => |follow| 2 * output_count + follower_slots +
+            // Its values at the steps before and after, then each lane's own slots.
+            .follow => |follow| (2 + follower_slots) * output_count +
                 law_cache_count(follow.params, follow.law == .spring),
             // Its values at the steps before and after, then its phase.
             .oscillator => 3 * output_count,
-            .shift => |shift| 2 * output_count + 1 + shift.buckets,
+            .shift => |shift| 2 * output_count + (1 + @as(u64, shift.buckets)) * output_count,
             // The input at the last step, then whether there is one.
             .crossing => output_count + 1,
             .constant, .add, .multiply, .map_range, .wave, .tween, .noise, .bounce, .cues => 0,
-            .input, .recorded, .track, .pack, .pick => 0,
+            .input, .recorded, .track, .pack, .pick, .lane, .spread => 0,
         };
     }
 
@@ -564,7 +613,7 @@ pub const Op = union(enum) {
         return switch (op.*) {
             .chase, .follow, .shift, .delay, .crossing, .oscillator => true,
             .constant, .add, .multiply, .map_range, .wave, .tween, .noise, .motion => false,
-            .bounce, .cues, .input, .recorded, .track, .pack, .pick => false,
+            .bounce, .cues, .input, .recorded, .track, .pack, .pick, .lane, .spread => false,
         };
     }
 
@@ -572,7 +621,7 @@ pub const Op = union(enum) {
     pub fn class(op: *const Op) Class {
         return switch (op.*) {
             .constant, .add, .multiply, .map_range, .wave, .tween, .noise => .pure,
-            .bounce, .cues, .recorded, .track, .pack, .pick => .pure,
+            .bounce, .cues, .recorded, .track, .pack, .pick, .lane, .spread => .pure,
             .motion => .exact,
             .chase, .follow, .shift, .delay, .crossing, .oscillator => .simulated,
             .input => .live,
@@ -602,7 +651,8 @@ pub const Op = union(enum) {
             .crossing => |crossing| .{ crossing.input, null, null, null },
             .oscillator => |oscillator| .{ oscillator.rate, null, null, null },
             .constant, .wave, .noise, .motion, .shift, .bounce, .cues => @splat(null),
-            .input, .recorded, .track => @splat(null),
+            .input, .recorded, .track, .lane => @splat(null),
+            .spread => |input| .{ input, null, null, null },
             .pack => |pack| ids: {
                 var ids: [4]?Id = @splat(null);
                 for (pack.inputs[0..pack.count], 0..) |id, at| ids[at] = id;
@@ -736,16 +786,33 @@ pub const Program = struct {
     /// Whether any node runs on the fixed step, so a read may cost steps.
     simulated: bool,
     slab_count: u32,
+    /// The family index of lane 0 of a node built in a lane region (section 16).
+    lane_first: u32 = 0,
 
     pub fn assert_valid(program: Program) void {
         var offset: u64 = 0;
         var simulated_count: u32 = 0;
         for (program.nodes, 0..) |*node, index| {
             assert(node.offset == offset);
+            assert(node.extent.lanes >= 1 and node.extent.lanes <= lanes_max);
+            if (node.extent.lanes > 1) assert(node.extent.laned);
+            for (node.op.inputs()) |maybe| {
+                const input = maybe orelse continue;
+                // A delay's input can come after it, which `close` checked.
+                if (input.index >= index) continue;
+                const lanes = program.nodes[input.index].extent.lanes;
+                assert(lanes == 1 or lanes == node.extent.lanes);
+            }
             offset += node.extent.count() + node.op.cache_count(node.extent.count());
             if (node.op.simulated()) simulated_count += 1;
             switch (node.op) {
                 .constant, .wave, .noise, .shift => {},
+                .lane => assert(node.extent.laned),
+                .spread => |input| {
+                    assert(input.index < index);
+                    assert(program.nodes[input.index].extent.lanes == 1);
+                    assert(node.extent.laned);
+                },
                 .chase => |op| {
                     assert(op.target.index < index);
                     for (op.params) |id| assert(id == simulation.no_param or id < index);
@@ -980,6 +1047,11 @@ pub const Program = struct {
                 .pack => |pack| result[pack.inputs[op.component].index],
                 else => result[op.input.index],
             },
+            .lane => Range.of(
+                @floatFromInt(program.lane_first),
+                @floatFromInt(@as(u64, program.lane_first) + node.extent.lanes - 1),
+            ),
+            .spread => |input| result[input.index],
         };
     }
 
@@ -1044,9 +1116,11 @@ pub const Builder = struct {
     tracks: *const Tracks,
     start: Cue,
     seed: u64,
-    /// The lanes of every node built, 1 until step 17 gives each node its own. Its components
-    /// are 1: a node's components are its own shape (section 15).
-    extent: Extent,
+    /// The lane region open, as its count, or null outside one (section 16). A client sets it
+    /// between nodes; a per-lane source built while it is set takes this many lanes.
+    lanes: ?u32,
+    /// The family index of a region's lane 0, from `Options.lane_first`.
+    lane_first: u32,
     /// Whether a simulated node has been built.
     simulated: bool,
     /// Delays built and not yet closed, which `finish` requires to be none.
@@ -1066,6 +1140,10 @@ pub const Builder = struct {
         /// of fewer than 2 or more than `components_max` inputs, or a component past the end
         /// (section 15).
         ShapeMismatch,
+        /// Two inputs of different lane counts above 1, a parameter from a node of more than one
+        /// lane, a delay fed more lanes than it has, a spread of a node of many lanes, or a
+        /// stagger or a `lane` outside a lane region (section 16).
+        LaneMismatch,
         /// A map whose input range has no width, or one too wide for a double, a bounce whose low
         /// is not below its high, or an input whose low is above its high or whose initial value
         /// is outside them.
@@ -1133,6 +1211,9 @@ pub const Builder = struct {
         /// Hashed into the seed of every noise, follower, and shift register, as section 7
         /// explains.
         seed: u64 = 0,
+        /// The family index of lane 0 of every lane region, so a program can build a slice of a
+        /// family (section 16).
+        lane_first: u32 = 0,
     };
 
     pub fn init(nodes: []Node, options: Options) Builder {
@@ -1149,7 +1230,8 @@ pub const Builder = struct {
             .tracks = options.tracks,
             .start = options.start,
             .seed = options.seed,
-            .extent = .{ .lanes = 1, .components = 1 },
+            .lanes = null,
+            .lane_first = options.lane_first,
             .simulated = false,
             .delays_open = 0,
             .finished = false,
@@ -1159,6 +1241,18 @@ pub const Builder = struct {
     pub fn constant(builder: *Builder, value: f64) Error!Id {
         if (!std.math.isFinite(value)) return error.NotFinite;
         return builder.push(.{ .constant = value });
+    }
+
+    /// Each lane's index in its family, in the region open (section 16).
+    pub fn lane(builder: *Builder) Error!Id {
+        return builder.push_shaped(.lane, try builder.region_extent());
+    }
+
+    /// The one-lane node `id` as the open region's lanes, each its value (section 16).
+    pub fn spread(builder: *Builder, id: Id) Error!Id {
+        try builder.check_scalar(id);
+        if (builder.nodes[id.index].extent.lanes != 1) return error.LaneMismatch;
+        return builder.push_shaped(.{ .spread = id }, try builder.region_extent());
     }
 
     /// `left + right`, per component; a scalar operand is added to every component of the other
@@ -1178,18 +1272,24 @@ pub const Builder = struct {
     pub fn pack(builder: *Builder, ids: []const Id) Error!Id {
         if (ids.len < 2 or ids.len > components_max) return error.ShapeMismatch;
         var op: Pack = .{ .inputs = undefined, .count = @intCast(ids.len) };
+        var extents: [components_max]Extent = undefined;
         for (ids, 0..) |id, at| {
             try builder.check_scalar(id);
             op.inputs[at] = id;
+            extents[at] = builder.nodes[id.index].extent;
         }
-        return builder.push_shaped(.{ .pack = op }, .{ .lanes = builder.extent.lanes, .components = op.count });
+        var extent = try joined(extents[0..ids.len]);
+        extent.components = op.count;
+        return builder.push_shaped(.{ .pack = op }, extent);
     }
 
     /// Component `component` of `id`, a scalar.
     pub fn pick(builder: *Builder, id: Id, component: u8) Error!Id {
         try builder.check_known(id);
-        if (component >= builder.nodes[id.index].extent.components) return error.ShapeMismatch;
-        return builder.push(.{ .pick = .{ .input = id, .component = component } });
+        const of = builder.nodes[id.index].extent;
+        if (component >= of.components) return error.ShapeMismatch;
+        const extent: Extent = .{ .lanes = of.lanes, .components = 1, .laned = of.laned };
+        return builder.push_shaped(.{ .pick = .{ .input = id, .component = component } }, extent);
     }
 
     /// The shape of a binary op over `left` and `right`: theirs when equal, else the one that
@@ -1199,10 +1299,15 @@ pub const Builder = struct {
         try builder.check_known(right);
         const a = builder.nodes[left.index].extent;
         const b = builder.nodes[right.index].extent;
-        assert(a.lanes == b.lanes);
-        if (a.components == b.components or b.components == 1) return a;
-        if (a.components == 1) return b;
-        return error.ShapeMismatch;
+        var extent = try joined(&.{ a, b });
+        if (a.components == b.components or b.components == 1) {
+            extent.components = a.components;
+        } else if (a.components == 1) {
+            extent.components = b.components;
+        } else {
+            return error.ShapeMismatch;
+        }
+        return extent;
     }
 
     pub fn map_range(builder: *Builder, map: MapRange) Error!Id {
@@ -1218,7 +1323,8 @@ pub const Builder = struct {
 
     pub fn wave(builder: *Builder, source: Wave) Error!Id {
         if (!std.math.isFinite(source.hz)) return error.NotFinite;
-        return builder.push(.{ .wave = source });
+        const extent = try builder.staggered_extent(source.stagger);
+        return builder.push_shaped(.{ .wave = source }, extent);
     }
 
     pub fn tween(builder: *Builder, source: Tween) Error!Id {
@@ -1228,7 +1334,9 @@ pub const Builder = struct {
         if (!std.math.isFinite(source.to)) return error.NotFinite;
         if (source.duration.flicks <= 0) return error.InvalidDuration;
         if (!source.ease.valid()) return error.InvalidEase;
-        return builder.push(.{ .tween = source });
+        var extent = try builder.staggered_extent(source.stagger);
+        if (source.previous) |previous| extent = try joined(&.{ extent, builder.nodes[previous.index].extent });
+        return builder.push_shaped(.{ .tween = source }, extent);
     }
 
     /// A noise whose seed is `source.seed` hashed with the graph's seed.
@@ -1236,29 +1344,33 @@ pub const Builder = struct {
         if (!std.math.isFinite(source.hz)) return error.NotFinite;
         if (source.hz <= 0) return error.InvalidRate;
         if (source.hz > Noise.hz_max) return error.InvalidRate;
-        return builder.push(.{ .noise = source.derive(builder.seed) });
+        return builder.push_shaped(.{ .noise = source.derive(builder.seed) }, builder.source_extent());
     }
 
     /// A spring toward the goals of `source.goals`, as `motion.zig` explains.
     pub fn spring(builder: *Builder, source: motion.Spring) Error!Id {
         try builder.check_goals(source.goals, source.from);
         const law = try spring_law(source.time, source.overshoot);
-        return builder.push(.{ .motion = .{
+        const extent = try builder.staggered_extent(source.stagger);
+        return builder.push_shaped(.{ .motion = .{
             .from = source.from,
             .goals = source.goals,
             .law = .{ .spring = law },
-        } });
+            .stagger = source.stagger,
+        } }, extent);
     }
 
     /// A Newtonian move toward the goals of `source.goals`, as `motion.zig` explains.
     pub fn newtonian(builder: *Builder, source: motion.Newtonian) Error!Id {
         try builder.check_goals(source.goals, source.from);
         const limits = try newtonian_limits(source.speed, source.accel, source.decel);
-        return builder.push(.{ .motion = .{
+        const extent = try builder.staggered_extent(source.stagger);
+        return builder.push_shaped(.{ .motion = .{
             .from = source.from,
             .goals = source.goals,
             .law = .{ .newtonian = limits },
-        } });
+            .stagger = source.stagger,
+        } }, extent);
     }
 
     /// A spring chasing the signal `source.target`, as section 9 explains.
@@ -1268,12 +1380,12 @@ pub const Builder = struct {
         if (!std.math.isFinite(source.from)) return error.NotFinite;
         const law = try spring_law(source.time, source.overshoot);
         const params = try builder.params_of(.{ source.time_from, source.overshoot_from, null });
-        return builder.push(.{ .chase = .{
+        return builder.push_shaped(.{ .chase = .{
             .target = source.target,
             .from = source.from,
             .law = law,
             .params = params,
-        } });
+        } }, builder.nodes[source.target.index].extent);
     }
 
     /// A wave whose rate is the value of `source.rate` at each step, simulated (section 14).
@@ -1282,7 +1394,7 @@ pub const Builder = struct {
         try builder.check_start();
         if (std.math.isNan(source.phase)) return error.NotFinite;
         if (!(source.phase >= 0 and source.phase < 1)) return error.InvalidPhase;
-        return builder.push(.{ .oscillator = source });
+        return builder.push_shaped(.{ .oscillator = source }, builder.nodes[source.rate.index].extent);
     }
 
     /// The value of the track `id` at each time, held forward from each sample (section 14).
@@ -1325,7 +1437,7 @@ pub const Builder = struct {
         if (source.pause_max.flicks < source.pause_min.flicks) return error.InvalidPause;
         const pause_max_steps = steps_rounded_up(source.pause_max);
         if (pause_max_steps > simulation.pause_steps_max) return error.InvalidPause;
-        return builder.push(.{ .follow = .{
+        return builder.push_shaped(.{ .follow = .{
             .from = source.from,
             .tolerance = source.tolerance,
             .seed = noise_hash(builder.seed, source.seed),
@@ -1335,7 +1447,7 @@ pub const Builder = struct {
             .pause_max_steps = @intCast(pause_max_steps),
             .pick = source.pick,
             .params = params,
-        } });
+        } }, builder.source_extent());
     }
 
     /// A shift register, as `simulation.zig` explains, whose seed is `source.seed` hashed with
@@ -1352,7 +1464,7 @@ pub const Builder = struct {
         const period_flicks: u64 = @intCast(source.period.flicks);
         if (period_flicks > simulation.period_flicks_max) return error.InvalidDuration;
         if (period_flicks < source.buckets * step_flicks) return error.InvalidDuration;
-        return builder.push(.{ .shift = .{
+        return builder.push_shaped(.{ .shift = .{
             .low = source.low,
             .high = source.high,
             .odds = source.odds,
@@ -1360,14 +1472,15 @@ pub const Builder = struct {
             .period_flicks = period_flicks,
             .buckets = source.buckets,
             .shape = source.shape,
-        } });
+        } }, builder.source_extent());
     }
 
     /// A delay, open until `close` gives it its input, as section 10 explains.
     pub fn delay(builder: *Builder, initial: f64) Error!Id {
         try builder.check_start();
         if (!std.math.isFinite(initial)) return error.NotFinite;
-        const id = try builder.push(.{ .delay = .{ .input = null, .initial = initial } });
+        const op: Op = .{ .delay = .{ .input = null, .initial = initial } };
+        const id = try builder.push_shaped(op, builder.source_extent());
         builder.delays_open += 1;
         return id;
     }
@@ -1382,6 +1495,8 @@ pub const Builder = struct {
         switch (node.op) {
             .delay => |*op| {
                 if (op.input != null) return error.DelayClosed;
+                const lanes = builder.nodes[input_id.index].extent.lanes;
+                if (lanes != 1 and lanes != node.extent.lanes) return error.LaneMismatch;
                 assert(builder.delays_open > 0);
                 op.input = input_id;
                 builder.delays_open -= 1;
@@ -1403,8 +1518,9 @@ pub const Builder = struct {
         // A leg of at least a flick puts each hit on its own flick. NaN fails both.
         if (!(leg_flicks >= 1)) return error.InvalidDuration;
         if (!(leg_flicks < bounce_flicks_max)) return error.InvalidDuration;
+        const extent = try builder.staggered_extent(source.stagger);
         if (builder.nodes.len - builder.node_count < 2) return error.NodeCapacityExceeded;
-        const output_count = @as(u64, builder.extent.lanes) * builder.extent.components;
+        const output_count: u64 = extent.count();
         if (builder.slab_count + 2 * output_count > builder.slab_count_max) {
             return error.SlabCapacityExceeded;
         }
@@ -1415,10 +1531,11 @@ pub const Builder = struct {
             .leg_flicks = leg_flicks,
             .start = source.start,
             .output = .position,
+            .stagger = source.stagger,
         };
-        const position = builder.push(.{ .bounce = node }) catch unreachable;
+        const position = builder.push_shaped(.{ .bounce = node }, extent) catch unreachable;
         node.output = .velocity;
-        const velocity = builder.push(.{ .bounce = node }) catch unreachable;
+        const velocity = builder.push_shaped(.{ .bounce = node }, extent) catch unreachable;
         assert(velocity.index == position.index + 1);
         return .{ .position = position, .velocity = velocity };
     }
@@ -1429,7 +1546,7 @@ pub const Builder = struct {
         try builder.check_scalar(source.input);
         try builder.check_start();
         if (!std.math.isFinite(source.level)) return error.NotFinite;
-        return builder.push(.{ .crossing = source });
+        return builder.push_shaped(.{ .crossing = source }, builder.nodes[source.input.index].extent);
     }
 
     /// The count of the span's cues at or before the time, which fires an event at each of them.
@@ -1495,6 +1612,7 @@ pub const Builder = struct {
             .start = builder.start,
             .simulated = builder.simulated,
             .slab_count = builder.slab_count,
+            .lane_first = builder.lane_first,
         };
         program.assert_valid();
         return program;
@@ -1519,14 +1637,53 @@ pub const Builder = struct {
         for (&result, ids) |*slot, maybe| {
             const id = maybe orelse continue;
             try builder.check_scalar(id);
+            // A node has one law, so its parameter has one lane (section 16).
+            if (builder.nodes[id.index].extent.lanes != 1) return error.LaneMismatch;
             slot.* = id.index;
         }
         return result;
     }
 
+    /// The extent of a node of one value in the open region's lanes, refused outside one.
+    fn region_extent(builder: *const Builder) Error!Extent {
+        const count = builder.lanes orelse return error.LaneMismatch;
+        assert(count >= 1 and count <= lanes_max);
+        assert(@as(u64, builder.lane_first) + count <= @as(u64, std.math.maxInt(u32)) + 1);
+        return .{ .lanes = count, .components = 1, .laned = true };
+    }
+
+    /// A seeded source's or a delay's extent: the region's lanes, or one lane outside a region.
+    fn source_extent(builder: *const Builder) Extent {
+        if (builder.lanes == null) return one_lane;
+        return builder.region_extent() catch unreachable;
+    }
+
+    /// A staggered source's extent: one lane when it is not staggered, the region's otherwise,
+    /// refusing a stagger whose last lane's offset overflows (section 16).
+    fn staggered_extent(builder: *const Builder, stagger: Time) Error!Extent {
+        if (stagger.flicks == 0) return one_lane;
+        const extent = try builder.region_extent();
+        const last: i64 = @intCast(@as(u64, builder.lane_first) + extent.lanes - 1);
+        _ = std.math.mul(i64, last, stagger.flicks) catch return error.InvalidDuration;
+        return extent;
+    }
+
+    /// The extent of an op that reads nodes of `extents`, one value a lane: the most lanes of
+    /// theirs, refusing two counts above 1 (section 16).
+    fn joined(extents: []const Extent) Error!Extent {
+        var result = one_lane;
+        for (extents) |extent| {
+            result.laned = result.laned or extent.laned;
+            if (extent.lanes == 1) continue;
+            if (result.lanes > 1 and result.lanes != extent.lanes) return error.LaneMismatch;
+            result.lanes = extent.lanes;
+        }
+        return result;
+    }
+
+    /// A node of one value and one lane.
     pub fn push(builder: *Builder, op: Op) Error!Id {
-        assert(builder.extent.components == 1);
-        return builder.push_shaped(op, builder.extent);
+        return builder.push_shaped(op, one_lane);
     }
 
     /// `push` with an output of `extent`.
@@ -1534,6 +1691,8 @@ pub const Builder = struct {
         assert(!builder.finished);
         assert(builder.slab_count <= builder.slab_count_max);
         assert(extent.components >= 1 and extent.components <= components_max);
+        assert(extent.lanes >= 1 and extent.lanes <= lanes_max);
+        if (extent.lanes > 1) assert(extent.laned);
         if (builder.node_count == builder.nodes.len) return error.NodeCapacityExceeded;
         const output_count = @as(u64, extent.lanes) * extent.components;
         const count = output_count + op.cache_count(output_count);
@@ -1553,6 +1712,8 @@ pub const Builder = struct {
         return id;
     }
 };
+
+const one_lane: Extent = .{ .lanes = 1, .components = 1 };
 
 /// The law of a spring with this `time` and `overshoot`, or the refusal of either.
 fn spring_law(time: Time, overshoot: f64) Builder.Error!motion.SpringLaw {
@@ -1661,4 +1822,5 @@ test {
     _ = @import("graph_test/events.zig");
     _ = @import("graph_test/ranges.zig");
     _ = @import("graph_test/tracks.zig");
+    _ = @import("graph_test/lanes.zig");
 }

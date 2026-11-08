@@ -133,15 +133,15 @@ test "the builder refuses a capacity overflow by name" {
     try testing.expectEqual(@as(u32, 2), builder.slab_count);
 
     builder = Builder.init(&nodes, .{ .slab_count_max = 5 });
-    builder.extent = .{ .lanes = 6, .components = 1 };
-    try testing.expectError(error.SlabCapacityExceeded, builder.constant(1));
+    builder.lanes = 6;
+    try testing.expectError(error.SlabCapacityExceeded, builder.lane());
     try testing.expectEqual(@as(u32, 0), builder.node_count);
     try testing.expectEqual(@as(u32, 0), builder.slab_count);
-    builder.extent = .{ .lanes = 5, .components = 1 };
-    _ = try builder.constant(1);
+    builder.lanes = 5;
+    _ = try builder.lane();
     try testing.expectEqual(@as(u32, 5), builder.slab_count);
-    builder.extent = .{ .lanes = std.math.maxInt(u32), .components = 1 };
-    try testing.expectError(error.SlabCapacityExceeded, builder.constant(1));
+    builder.lanes = graph_module.lanes_max;
+    try testing.expectError(error.SlabCapacityExceeded, builder.lane());
 }
 
 // Locks that a cycle cannot be expressed: the only id a node could use to reach itself or a later
@@ -267,17 +267,20 @@ test "eval depends only on the time" {
     try testing.expectEqual(expected, state.value(output));
 }
 
-// Locks the layout of section 2 with lanes above 1, which every op must loop over: 6 lanes is
-// 6 f64 per node, at offsets 0, 6, 12, 18, and 24, and a thousand 2D values, a pack of two
+// Locks the layout of sections 2 and 16 with lanes above 1, which every op must loop over: 6
+// lanes of `lane` at 0, two constants of one lane at 6 and 7, then 6 lanes a node at 8, 14, and
+// 20, each a lane's own value with the constants broadcast. A thousand 2D values, a pack of two
 // scalars over a thousand lanes, is 2,000 f64 at one offset.
 test "each op loops over the extent of its node" {
-    var nodes: [5]Node = undefined;
-    var builder = Builder.init(&nodes, .{ .slab_count_max = 30 });
-    builder.extent = .{ .lanes = 6, .components = 1 };
+    var nodes: [6]Node = undefined;
+    var builder = Builder.init(&nodes, .{ .slab_count_max = 26 });
+    builder.lanes = 6;
+    const index = try builder.lane();
     const two = try builder.constant(2);
     const three = try builder.constant(3);
-    const sum = try builder.add(two, three);
-    const product = try builder.multiply(sum, three);
+    builder.lanes = null;
+    const sum = try builder.add(index, two);
+    const product = try builder.multiply(three, sum);
     const mapped = try builder.map_range(.{
         .input = product,
         .input_low = 0,
@@ -286,21 +289,22 @@ test "each op loops over the extent of its node" {
         .output_high = 1,
     });
     const program = builder.finish();
-    try testing.expectEqual(@as(u32, 30), program.slab_count);
-    try testing.expectEqual(@as(u32, 24), program.nodes[mapped.index].offset);
+    try testing.expectEqual(@as(u32, 26), program.slab_count);
+    try testing.expectEqual(@as(u32, 7), program.nodes[three.index].offset);
+    try testing.expectEqual(@as(u32, 20), program.nodes[mapped.index].offset);
 
-    var slab: [30]f64 = undefined;
+    var slab: [26]f64 = undefined;
     var state = State.init(program, &slab);
     state.eval(.{ .flicks = 0 });
-    try testing.expectEqualSlices(f64, &@as([6]f64, @splat(5)), state.values(sum));
-    try testing.expectEqualSlices(f64, &@as([6]f64, @splat(15)), state.values(product));
-    try testing.expectEqualSlices(f64, &@as([6]f64, @splat(0.5)), state.values(mapped));
+    try testing.expectEqualSlices(f64, &.{ 2, 3, 4, 5, 6, 7 }, state.values(sum));
+    try testing.expectEqualSlices(f64, &.{ 6, 9, 12, 15, 18, 21 }, state.values(product));
+    try testing.expectEqualSlices(f64, &.{ 0.2, 0.3, 0.4, 0.5, 0.6, 0.7 }, state.values(mapped));
 
     var nodes_many: [3]Node = undefined;
     var builder_many = Builder.init(&nodes_many, .{ .slab_count_max = 4000 });
-    builder_many.extent = .{ .lanes = 1000, .components = 1 };
-    const first = try builder_many.wave(carrier);
-    const second = try builder_many.wave(swell);
+    builder_many.lanes = 1000;
+    const first = try builder_many.lane();
+    const second = try builder_many.noise(.{ .shape = .smooth, .hz = 1, .seed = 2 });
     const both = try builder_many.pack(&.{ first, second });
     try testing.expectEqual(@as(u32, 2000), builder_many.nodes[both.index].offset);
     try testing.expectEqual(@as(u32, 4000), builder_many.finish().slab_count);

@@ -70,6 +70,17 @@
 //! `after` a shaped signal, and the call's shape is theirs. A vector path is one run a component.
 //! `.x .y .z` and `.l .a .b` read a component of a name bound to a vector or a colour.
 //!
+//! ## 9. Lanes
+//! `lanes(n, body)` checks its body in a region of n lanes (step 17), and every expression has a
+//! lane count, 1 or the region's. In a region, `lane` is each lane's index; a noise, a follower, a
+//! shift register, and a delay have the region's lanes, each with its own seed; and so do a wave,
+//! a tween, a spring, a Newtonian move, and a bounce given a `stagger:`, a time each lane starts
+//! after the one before. Anything else has the most lanes of the signals it reads, so a constant,
+//! a knob, or a name bound outside the region is one lane, shared. Two counts above 1 meet only
+//! when equal, a parameter a signal sets takes one lane, a region holds only its own count and
+//! one, and regions do not nest; each is `wrong_lanes`, as are `lane` and `stagger:` outside a
+//! region. A module called in a region expands in it, and a region of delays is fed as one delay.
+//!
 //! ## 7. TigerStyle Invariants
 //! - Every array is the caller's; a full one is an error naming its limit, and checking stops.
 //! - Names are found by a linear search over at most `Limits.names`, at compile time only.
@@ -190,6 +201,11 @@ pub const Expr = struct {
     item: u32,
     /// What it evaluates to (section 8).
     shape: Shape = .{},
+    /// How many lanes it has (section 9), 1 outside a region and for anything that does not vary
+    /// by lane.
+    lanes: u32 = 1,
+    /// The count of the lane region it was checked in, or 0 outside one (section 9).
+    region: u32 = 0,
 
     pub const Tag = enum {
         /// a: the call; b: the output.
@@ -204,6 +220,8 @@ pub const Expr = struct {
         track,
         /// a: the expression; b: the component (section 8).
         pick,
+        /// Each lane's index, in a region (section 9).
+        lane,
     };
 };
 
@@ -349,7 +367,10 @@ pub const Instance = struct { binding: u32, low: f64, high: f64, item: u32 };
 /// The most items one path or one list of regions holds, compared before it enters its table.
 pub const run_max = 256;
 
-const reserved = [_][]const u8{ "seed", "start", "cue", "track", "module", "use" };
+const reserved = [_][]const u8{ "seed", "start", "cue", "track", "module", "use", "lane" };
+
+/// The most lanes a region has (section 9), the core's own limit.
+pub const lanes_max = @import("../core/graph.zig").lanes_max;
 
 const Checker = struct {
     tree: *const Tree,
@@ -376,6 +397,11 @@ const Checker = struct {
     instance_count: u32 = 0,
     /// The declared range of the outermost module instance last expanded.
     declared_last: ?[2]f64 = null,
+    /// The count of the lane region being checked, or null outside one (section 9).
+    region: ?u32 = null,
+    /// Delay calls checked so far, so a delay that is not a declaration's whole value, which no
+    /// feed could reach, is refused (section 2).
+    delay_calls: u32 = 0,
     stopped: bool = false,
 
     fn source(checker: *const Checker) []const u8 {
@@ -629,6 +655,7 @@ const Checker = struct {
             return error.Checked;
         }
         checker.declared_last = null;
+        const delays_before = checker.delay_calls;
         const expr = try checker.signal(it.a);
         const declared = checker.declared_last;
         var binding: Binding = .{ .name = name, .item = index, .kind = .signal, .index = expr };
@@ -637,7 +664,14 @@ const Checker = struct {
             const entry = checker.memory.calls[node.a].entry;
             binding.entry = entry;
             binding.delay = entry.op == .delay;
+            // A region of delays is a delay, fed as one (section 9).
+            if (entry.op == .lanes) {
+                const body = checker.memory.exprs[checker.memory.values[checker.memory.calls[node.a].values + 1].signal];
+                binding.delay = body.tag == .call and body.b == 0 and checker.memory.calls[body.a].entry.op == .delay;
+                binding.entry = null;
+            }
         }
+        if (checker.delay_calls - delays_before > @intFromBool(binding.delay)) return checker.unreachable_delay(it.a);
         const at = try checker.declare(index, binding);
         if (declared) |range| if (value.tag == .call and checker.find_module(checker.text(it.a)) != null) {
             if (checker.instance_count == checker.memory.instances.len) {
@@ -668,9 +702,28 @@ const Checker = struct {
             return error.Checked;
         }
         binding.fed = true;
+        const delays_before = checker.delay_calls;
         const expr = try checker.signal(it.a);
+        if (checker.delay_calls != delays_before) return checker.unreachable_delay(it.a);
         try checker.expect_scalar(it.a, expr, name);
+        const delay_lanes = checker.memory.exprs[binding.index].lanes;
+        const lanes = checker.memory.exprs[expr].lanes;
+        if (lanes != 1 and lanes != delay_lanes) {
+            const diagnostic = if (delay_lanes == 1)
+                checker.fail(it.a, .wrong_lanes, "the delay `{s}` has one lane, and this {d}", .{ name, lanes })
+            else
+                checker.fail(it.a, .wrong_lanes, "the delay `{s}` has {d} lanes, and this {d}", .{ name, delay_lanes, lanes });
+            error_module.hint(diagnostic, "feed a delay one lane, or as many lanes as it has", .{});
+            return error.Checked;
+        }
         try checker.push_declaration(index, .{ .feed = .{ .binding = target, .expr = expr, .item = index } });
+    }
+
+    /// A delay inside an expression has no name, so no `<-` can feed it (section 2).
+    fn unreachable_delay(checker: *Checker, index: u32) Fail {
+        const diagnostic = checker.fail(index, .not_a_delay, "a delay is fed by its name, so it is a declaration's whole value", .{});
+        error_module.hint(diagnostic, "declare it alone, such as `fb = delay(0)`, feed it with `fb <- …`, then use `fb`", .{});
+        return error.Checked;
     }
 
     fn push_declaration(checker: *Checker, index: u32, declaration_value: Declaration) Fail!void {
@@ -688,6 +741,12 @@ const Checker = struct {
         const at = checker.expr_count;
         var placed = expr;
         placed.item = checker.site_of(expr.item);
+        placed.region = checker.region orelse 0;
+        if (checker.region) |count| if (placed.lanes != 1 and placed.lanes != count) {
+            const diagnostic = checker.fail(expr.item, .wrong_lanes, "this has {d} lanes, inside `lanes({d}, …)`", .{ placed.lanes, count });
+            error_module.hint(diagnostic, "a region reads signals of one lane, or of its own count", .{});
+            return error.Checked;
+        };
         checker.memory.exprs[at] = placed;
         checker.expr_count += 1;
         return at;
@@ -722,13 +781,22 @@ const Checker = struct {
                 }
                 return checker.constant(try checker.literal_number(index, "a number"), index);
             },
-            .name => return checker.signal_name(index, 0),
+            .name => {
+                if (std.mem.eql(u8, checker.text(index), "lane")) return checker.lane_index(index);
+                return checker.signal_name(index, 0);
+            },
             .call => {
                 const name = checker.text(index);
                 if (checker.lookup(name, .signal)) |entry| {
+                    // `lanes` opens its region when its count is checked, and closes it here.
+                    const region = checker.region;
+                    defer checker.region = region;
                     const call = try checker.check_call(entry, index);
+                    checker.region = region;
+                    if (entry.op == .delay) checker.delay_calls += 1;
                     const shape = try checker.call_shape(call, index);
-                    return checker.push_expr(.{ .tag = .call, .a = call, .item = index, .shape = shape });
+                    const lanes = try checker.call_lanes(call, index);
+                    return checker.push_expr(.{ .tag = .call, .a = call, .item = index, .shape = shape, .lanes = lanes });
                 }
                 if (checker.find_module(name)) |module| return checker.expand_signal(module, index);
                 return checker.unknown_call(index);
@@ -742,7 +810,8 @@ const Checker = struct {
                 };
                 const tag: Expr.Tag = if (it.tag == .add) .add else .multiply;
                 const shape = try checker.combine(index, left, right);
-                return checker.push_expr(.{ .tag = tag, .a = left, .b = right, .item = index, .shape = shape });
+                const lanes = try checker.join_lanes(index, left, right);
+                return checker.push_expr(.{ .tag = tag, .a = left, .b = right, .item = index, .shape = shape, .lanes = lanes });
             },
             .subtract => {
                 const left = try checker.signal(it.a);
@@ -750,18 +819,19 @@ const Checker = struct {
                 if (checker.is_constant(right)) |b| {
                     if (checker.is_constant(left)) |a| return checker.constant(a - b, index);
                     const negative = try checker.constant(-b, it.b);
-                    return checker.push_expr(.{ .tag = .add, .a = left, .b = negative, .item = index, .shape = checker.shape_of(left) });
+                    return checker.push_expr(.{ .tag = .add, .a = left, .b = negative, .item = index, .shape = checker.shape_of(left), .lanes = checker.lanes_of(left) });
                 }
                 const shape = try checker.combine(index, left, right);
+                const lanes = try checker.join_lanes(index, left, right);
                 const minus_one = try checker.constant(-1, index);
-                const negated = try checker.push_expr(.{ .tag = .multiply, .a = right, .b = minus_one, .item = it.b, .shape = checker.shape_of(right) });
-                return checker.push_expr(.{ .tag = .add, .a = left, .b = negated, .item = index, .shape = shape });
+                const negated = try checker.push_expr(.{ .tag = .multiply, .a = right, .b = minus_one, .item = it.b, .shape = checker.shape_of(right), .lanes = checker.lanes_of(right) });
+                return checker.push_expr(.{ .tag = .add, .a = left, .b = negated, .item = index, .shape = shape, .lanes = lanes });
             },
             .negate => {
                 const operand = try checker.signal(it.a);
                 if (checker.is_constant(operand)) |a| return checker.constant(-a, index);
                 const minus_one = try checker.constant(-1, index);
-                return checker.push_expr(.{ .tag = .multiply, .a = operand, .b = minus_one, .item = index, .shape = checker.shape_of(operand) });
+                return checker.push_expr(.{ .tag = .multiply, .a = operand, .b = minus_one, .item = index, .shape = checker.shape_of(operand), .lanes = checker.lanes_of(operand) });
             },
             .output => return checker.output(index, it.a, checker.text(index)),
             .list, .range, .goal, .named, .element => {
@@ -818,7 +888,8 @@ const Checker = struct {
         };
         if (base.tag == .name) return checker.signal_name(base_index, output_slot);
         const call = try checker.check_call(entry, base_index);
-        return checker.push_expr(.{ .tag = .call, .a = call, .b = output_slot, .item = index });
+        const lanes = try checker.call_lanes(call, base_index);
+        return checker.push_expr(.{ .tag = .call, .a = call, .b = output_slot, .item = index, .lanes = lanes });
     }
 
     fn signal_name(checker: *Checker, index: u32, output_index: u32) Fail!u32 {
@@ -828,7 +899,8 @@ const Checker = struct {
         switch (binding.kind) {
             .signal => {
                 const shape = if (output_index == 0) checker.shape_of(binding.index) else Shape.scalar;
-                return checker.push_expr(.{ .tag = .binding, .a = found, .b = output_index, .item = index, .shape = shape });
+                const lanes = checker.lanes_of(binding.index);
+                return checker.push_expr(.{ .tag = .binding, .a = found, .b = output_index, .item = index, .shape = shape, .lanes = lanes });
             },
             .track => return checker.push_expr(.{ .tag = .track, .a = binding.index, .item = index }),
             else => {
@@ -1263,6 +1335,98 @@ const Checker = struct {
         return checker.memory.exprs[expr].shape;
     }
 
+    fn lanes_of(checker: *const Checker, expr: u32) u32 {
+        return checker.memory.exprs[expr].lanes;
+    }
+
+    /// `lanes(n, …)`'s count: opens a region of n lanes for its body (section 9).
+    fn open_region(checker: *Checker, index: u32, number: f64) Fail!void {
+        if (checker.region) |count| {
+            const diagnostic = checker.fail(index, .wrong_lanes, "a region of lanes is inside `lanes({d}, …)`", .{count});
+            error_module.hint(diagnostic, "regions do not nest; give the outer region the lanes of both", .{});
+            return error.Checked;
+        }
+        if (!(number >= 1 and number <= lanes_max)) {
+            const diagnostic = checker.fail(index, .out_of_range, "a region has from 1 to {d} lanes", .{lanes_max});
+            error_module.hint(diagnostic, "for example `lanes(1000, …)`", .{});
+            return error.Checked;
+        }
+        checker.region = @intFromFloat(number);
+    }
+
+    /// `lane`: each lane's index, inside a region (section 9).
+    fn lane_index(checker: *Checker, index: u32) Fail!u32 {
+        const count = checker.region orelse {
+            const diagnostic = checker.fail(index, .wrong_lanes, "`lane` is a lane's index, so it is used inside `lanes(n, …)`", .{});
+            error_module.hint(diagnostic, "wrap the expression in a region, such as `lanes(1000, lane * 0.001)`", .{});
+            return error.Checked;
+        };
+        return checker.push_expr(.{ .tag = .lane, .item = index, .lanes = count });
+    }
+
+    /// The lanes of `left` and `right` together (section 9): one lane is broadcast, and two
+    /// counts above 1 must be equal.
+    fn join_lanes(checker: *Checker, index: u32, left: u32, right: u32) Fail!u32 {
+        return checker.joined(index, checker.lanes_of(left), checker.lanes_of(right));
+    }
+
+    fn joined(checker: *Checker, index: u32, a: u32, b: u32) Fail!u32 {
+        if (a == b or b == 1) return a;
+        if (a == 1) return b;
+        const diagnostic = checker.fail(index, .wrong_lanes, "{d} lanes and {d} lanes do not go together", .{ a, b });
+        error_module.hint(diagnostic, "lanes meet where their counts are equal, or where one side has one lane", .{});
+        return error.Checked;
+    }
+
+    /// Refuses a signal of many lanes where `name` takes one value for every lane (section 9).
+    fn expect_one_lane(checker: *Checker, index: u32, expr: u32, name: []const u8) Fail!void {
+        const lanes = checker.lanes_of(expr);
+        if (lanes == 1) return;
+        const diagnostic = checker.fail(index, .wrong_lanes, "`{s}` takes one value for every lane, found {d} lanes", .{ name, lanes });
+        error_module.hint(diagnostic, "a node has one law; let the lanes differ in what it reads instead", .{});
+        return error.Checked;
+    }
+
+    /// The lanes of a call (section 9): a per-lane source's region, else the most of its signals'.
+    fn call_lanes(checker: *Checker, call: u32, index: u32) Fail!u32 {
+        const entry = checker.memory.calls[call].entry;
+        const first = checker.memory.calls[call].values;
+        const values = checker.memory.values[first..][0..entry.params.len];
+        const items = checker.memory.value_items[first..][0..entry.params.len];
+        for (entry.params, values, items) |param, value, value_item| {
+            if (param.live and value == .signal) try checker.expect_one_lane(value_item, value.signal, param.name);
+        }
+        if (entry.op == .follow) {
+            const mover = values[2].mover;
+            const mover_entry = checker.memory.calls[mover].entry;
+            const mover_first = checker.memory.calls[mover].values;
+            const mover_values = checker.memory.values[mover_first..][0..mover_entry.params.len];
+            const mover_items = checker.memory.value_items[mover_first..][0..mover_entry.params.len];
+            for (mover_entry.params, mover_values, mover_items) |param, value, value_item| {
+                if (value == .signal) try checker.expect_one_lane(value_item, value.signal, param.name);
+            }
+        }
+        var lanes: u32 = 1;
+        switch (entry.op) {
+            .lanes => return @intCast(values[0].integer),
+            .noise, .follow, .shift, .delay => return checker.region orelse 1,
+            .wave, .tween, .spring, .newtonian, .bounce => {
+                const at = entry.param("stagger").?;
+                if (values[at].time != 0) lanes = checker.region orelse {
+                    const diagnostic = checker.fail(items[at], .wrong_lanes, "`stagger:` spreads lanes in time, so it is used inside `lanes(n, …)`", .{});
+                    error_module.hint(diagnostic, "wrap the call in a region, or drop `stagger:`", .{});
+                    return error.Checked;
+                };
+            },
+            else => {},
+        }
+        for (entry.params, values) |param, value| {
+            if (value != .signal or param.live) continue;
+            lanes = try checker.joined(index, lanes, checker.lanes_of(value.signal));
+        }
+        return lanes;
+    }
+
     /// The shape of `left` and `right` together (section 8): theirs when equal, the other's when
     /// one is a number; a colour and a vector, or two vectors of different sizes, are refused.
     fn combine(checker: *Checker, index: u32, left: u32, right: u32) Fail!Shape {
@@ -1322,6 +1486,7 @@ const Checker = struct {
             },
             .chase => return checker.shape_of(values[0].signal),
             .map => return checker.shape_of(values[0].signal),
+            .lanes => return checker.shape_of(values[1].signal),
             else => return Shape.scalar,
         }
     }
@@ -1397,7 +1562,7 @@ const Checker = struct {
         const shape = checker.shape_of(vector);
         for (shape.component_names(), 0..) |name, component| {
             if (!std.mem.eql(u8, name, output_name)) continue;
-            return checker.push_expr(.{ .tag = .pick, .a = vector, .b = @intCast(component), .item = index });
+            return checker.push_expr(.{ .tag = .pick, .a = vector, .b = @intCast(component), .item = index, .lanes = checker.lanes_of(vector) });
         }
         const diagnostic = checker.fail_token(index, .unknown_output, "{s} has no component `{s}`", .{ shape.noun(), output_name });
         const names = shape.component_names();
@@ -1441,6 +1606,7 @@ const Checker = struct {
                     _ = checker.fail(index, .out_of_range, "`{s}` is a whole number from 0 to 2^32", .{param.name});
                     return error.Checked;
                 }
+                if (entry.op == .lanes) try checker.open_region(index, number);
                 return .{ .integer = @intFromFloat(number) };
             },
             .time => {

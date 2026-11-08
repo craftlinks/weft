@@ -1,13 +1,14 @@
 //! Play: Weft's own Modulator Play on Patchwork: a scope of signals around a playhead, a page of
 //! shapes whose parameters any signal can drive, a page of bouncers whose hits are events, a
-//! page where `signals.weft` is edited while it runs, and a page of vectors and colours.
+//! page where `signals.weft` is edited while it runs, a page of vectors and colours, and a page
+//! of a thousand lanes.
 //!
 //! # Deep Architectural Guide for Reviewers:
 //!
 //! ## 1. The Three-File Rule
 //! Only `signals.zig`, `glue.zig`, and `language.zig` import `weft`; the last only for its
 //! tokenizer, which colours the editor. This file, `scope.zig`, `patch.zig`,
-//! `shapes.zig`, `bouncers.zig`, and `vectors.zig` see time as a `glue.Clock` and everything else as `f32`
+//! `shapes.zig`, `bouncers.zig`, `vectors.zig`, and `field.zig` see time as a `glue.Clock` and everything else as `f32`
 //! arrays and plain structs, so the app is the only glue between Weft and Patchwork, and neither
 //! library knows the other exists. The app reads each row's name, accent, and goal kind from the
 //! signal table through `motion.signals`, and each lane's from `motion.bouncers`, which names no
@@ -28,10 +29,12 @@
 //!            x 736 as on the shapes page; the scope's eight rows of 60 px from y 224, x 728..1280
 //! vectors    the plane x 16..656, y 56..712, then three colour strips of 112 px from y 56,
 //!            x 672..1272 (`vectors.zig`)
+//! lanes      a field of 40 by 25 cells of 25 px at x 140..1140, y 56..681, a dot a lane, and
+//!            the line of its events under it (`field.zig`)
 //! ```
 //! Each scope plot and each lane is a window from `t - 1 s` to `t + 3 s`, so the playhead sits at
 //! a quarter of its width. The shapes page reads only the playhead reader, so it never samples
-//! that window, and the bouncers and vectors pages read only their own programs' readers.
+//! that window, and the bouncers, vectors, and lanes pages read only their own programs' readers.
 //!
 //! ## 3. Transport
 //! Time follows frames: the timer is off, `t` advances on the `frame` event by its delta, clamped
@@ -40,7 +43,7 @@
 //! at the end starts again from 0. The slider shows `t / 600 s` each frame, and a press or drag on
 //! it seeks there and pauses. Home goes to 0 and End to 600 s; Left and Right step `step_ms`, and
 //! Page Up and Page Down `page_ms` back and forth, all clamped. The page button cycles the pages
-//! and names the next; the keys 1 to 5 go to each.
+//! and names the next; the keys 1 to 6 go to each.
 //!
 //! ## 4. Knobs Apply From Now On
 //! A knob's value v in [0, 1] maps to a parameter so that 0.5 is the default exactly
@@ -76,6 +79,8 @@
 //! `vectors` steps to 1.2 s, the spring on its way to its second goal and the glow past its
 //! first colour, and `vectors_play` plays the page's first 2.5 s. Its frame costs about 50 us at
 //! any t, which a test prints in ReleaseFast: the program is closed form, so it has no steps.
+//! `lanes` steps to 1.2 s, the field half risen, and `lanes_play` plays its first 2.5 s, the
+//! first dots flashing from 1.67 s; a test prints its frame at 60 s and 600 s too.
 //!
 //! ## 7. Events Are Read, Never Kept
 //! Each frame reads its events as a window around the playhead (`glue.zig`, section 6): the
@@ -125,6 +130,7 @@ const scope = @import("scope.zig");
 const shapes = @import("shapes.zig");
 const bouncers = @import("bouncers.zig");
 const vectors = @import("vectors.zig");
+const field = @import("field.zig");
 const language = @import("language.zig");
 const input = patchwork.input;
 const literal = patchwork.editor.literal;
@@ -165,6 +171,7 @@ comptime {
     assert(glue.vector_samples == vectors.samples_max);
     assert(glue.colour_count == vectors.colour_count);
     assert(glue.vector_goal_count == vectors.goal_count);
+    assert(glue.field_count == field.count);
 }
 const knob_names = [knob_count][]const u8{ "pulse hz", "chase s", "sway os", "glide v" };
 /// Each knob's parameter at its middle, the default: pulse hz, chase s, sway os, glide v.
@@ -185,6 +192,7 @@ pub const Page = enum {
     bouncers,
     text,
     vectors,
+    lanes,
 
     /// The page the page button goes to.
     pub fn next(page: Page) Page {
@@ -193,7 +201,8 @@ pub const Page = enum {
             .shapes => .bouncers,
             .bouncers => .text,
             .text => .vectors,
-            .vectors => .scope,
+            .vectors => .lanes,
+            .lanes => .scope,
         };
     }
 };
@@ -270,6 +279,7 @@ const repoint_width: Step = .{ .click = patchwork.bench.area("source", 1) };
 const right: Step = .{ .key = .{ .key = .right, .text = "" } };
 const page_4: Step = .{ .key = .{ .key = .other, .text = "4" } };
 const page_5: Step = .{ .key = .{ .key = .other, .text = "5" } };
+const page_6: Step = .{ .key = .{ .key = .other, .text = "6" } };
 const line_end: Step = .{ .key = .{ .key = .end, .text = "" } };
 const backspace: Step = .{ .key = .{ .key = .backspace, .text = "" } };
 /// A click on line 21 of `signals.weft`, `wave = wave(sine, 0.5hz)`, which gives the editor focus.
@@ -328,6 +338,8 @@ pub const App = struct {
     hits: glue.Hits,
     /// The vectors page as last read.
     vectors: glue.Vectors,
+    /// The lanes page as last read.
+    field: glue.Field,
     row_dots: [glue.scope_row_count][glue.dots_max][2]f32,
     row_dot_counts: [glue.scope_row_count]u32,
     /// The text page (section 8): `signals.weft` in the editor.
@@ -349,7 +361,7 @@ pub const App = struct {
         .title = "play",
         .timer_period_ms = 0,
         .draw = &.{
-            .{ .type = quads.Box, .cap = 768 },
+            .{ .type = quads.Box, .cap = 2304 },
             .{ .type = quads.Arc, .cap = 16 },
             .{ .type = quads.Fill, .cap = 32 },
             .{ .type = quads.Path, .cap = 1024 },
@@ -479,6 +491,13 @@ pub const App = struct {
             .frames = 1,
         },
         .{ .name = "vectors_play", .setup = &.{ page_5, space }, .cycle = &.{}, .frames = 150 },
+        .{
+            .name = "lanes",
+            .setup = &([_]Step{page_6} ++ @as([12]Step, @splat(right)) ++ [_]Step{.{ .wait = 2 }}),
+            .cycle = &.{.{ .wait = 1 }},
+            .frames = 1,
+        },
+        .{ .name = "lanes_play", .setup = &.{ page_6, space }, .cycle = &.{}, .frames = 150 },
     };
 
     pub fn init(app: *App, textures: *quads.Textures) void {
@@ -584,6 +603,7 @@ pub const App = struct {
                 if (std.mem.eql(u8, typed, "3")) return app.show(cx, .bouncers);
                 if (std.mem.eql(u8, typed, "4")) return app.show(cx, .text);
                 if (std.mem.eql(u8, typed, "5")) return app.show(cx, .vectors);
+                if (std.mem.eql(u8, typed, "6")) return app.show(cx, .lanes);
                 return;
             },
             else => return,
@@ -634,7 +654,21 @@ pub const App = struct {
             .bouncers => app.draw_bouncers(cx, clip),
             .text => app.draw_text(cx, clip),
             .vectors => app.draw_vectors(cx, clip),
+            .lanes => app.draw_lanes(cx, clip),
         }
+    }
+
+    fn draw_lanes(app: *App, cx: *Context, clip: Clip) void {
+        app.motion.sample_field(app.clock, &app.field);
+        const page = &app.field;
+        field.draw(cx, .{
+            .sizes = &page.sizes,
+            .tints = &page.tints,
+            .flashes = &page.flashes,
+            .events = page.events,
+            .dropped = page.dropped,
+            .flash_ms = glue.field_flash_ms,
+        }, clip);
     }
 
     fn draw_vectors(app: *App, cx: *Context, clip: Clip) void {
@@ -977,6 +1011,7 @@ pub const App = struct {
         const report = switch (app.page) {
             .bouncers => app.motion.bouncer_report,
             .vectors => app.motion.vector_report,
+            .lanes => app.motion.field_report,
             else => app.motion.report,
         };
         const seekable = if (report.seekable) "seekable" else "not seekable";
@@ -1111,6 +1146,8 @@ test {
     _ = patch;
     _ = shapes;
     _ = bouncers;
+    _ = vectors;
+    _ = field;
     _ = language;
 }
 
@@ -1387,12 +1424,12 @@ test "the scenarios replay headless" {
     }
 }
 
-// Locks the pages: the page button cycles scope, shapes, bouncers, text, vectors and names the
-// next; 3 goes to the bouncers, whose label reports their own program, seekable with no steps,
-// and which, paused, ask for no frame.
-test "the page button cycles the five pages" {
+// Locks the pages: the page button cycles scope, shapes, bouncers, text, vectors, lanes and names
+// the next; 3 goes to the bouncers, whose label reports their own program, seekable with no
+// steps, and which, paused, ask for no frame.
+test "the page button cycles the six pages" {
     const app = new_app();
-    const order = [_]Page{ .shapes, .bouncers, .text, .vectors, .scope };
+    const order = [_]Page{ .shapes, .bouncers, .text, .vectors, .lanes, .scope };
     for (order) |expected| {
         _ = frame_at(app);
         try std.testing.expectEqualStrings(@tagName(expected), app.page_button.label);
@@ -1606,6 +1643,36 @@ test "the cost of an edit and of a text knob at 60 s and 600 s" {
             @divFloor(edit_ns, 1000),
             @divFloor(step_ns, 1000),
             @divFloor(release_ns, 1000),
+        });
+    }
+}
+
+// Measures, and prints, what a frame of the lanes page costs at 60 s and 600 s: one pass over a
+// thousand lanes, a thousand colours to sRGB, the flash window's events, and the draw of a
+// thousand dots. Only in ReleaseFast.
+test "the cost of a lanes frame at 60 s and 600 s" {
+    if (@import("builtin").mode != .fast) return;
+    const io = std.testing.io;
+    const app = new_app();
+    send(app, key_down(.other, "6"));
+    for ([_]f32{ 0.1, 1 }) |at| {
+        app.clock.seek(at);
+        _ = frame_at(app);
+        var frame_ns: i96 = 0;
+        var read_ns: i96 = 0;
+        for (0..20) |step| {
+            app.clock.step(16 * @as(i64, @intCast(step % 2)));
+            var start = std.Io.Clock.awake.now(io).nanoseconds;
+            _ = frame_at(app);
+            frame_ns = @max(frame_ns, std.Io.Clock.awake.now(io).nanoseconds - start);
+            start = std.Io.Clock.awake.now(io).nanoseconds;
+            app.motion.sample_field(app.clock, &app.field);
+            read_ns = @max(read_ns, std.Io.Clock.awake.now(io).nanoseconds - start);
+        }
+        std.debug.print("lanes at {d} s: frame at most {d} us, read at most {d} us\n", .{
+            @divFloor(app.clock.millis(), 1000),
+            @divFloor(frame_ns, 1000),
+            @divFloor(read_ns, 1000),
         });
     }
 }

@@ -34,6 +34,14 @@
 //! converted to OKLab here, three constants packed. A vector motion records no goal source, so a
 //! client draws no goal for it.
 //!
+//! ## 8. Lanes
+//! Each expression records the count of the region it was checked in (`check.zig`, section 9), and
+//! a call is built with the builder's region set to it, so a per-lane source takes the region's
+//! lanes and everything else takes what the core gives it (`graph.zig`, section 16). `lane` is
+//! the core's `lane`, and a `stagger:` goes to its source as it is. A region whose body has one
+//! lane is spread to its count, a component at a time for a vector, so a binding of
+//! `lanes(n, …)` always has n lanes.
+//!
 //! ## 7. TigerStyle Invariants
 //! - Every table is the caller's and sized by `Limits`; the checker already refused what would
 //!   not fit, except the node array and the slab, whose refusals are errors naming their limit.
@@ -156,6 +164,9 @@ const Back = struct {
         assert(back.memory.expr_ids[expr_index] == null);
         switch (expr.tag) {
             .call => {
+                const saved = back.builder.lanes;
+                defer back.builder.lanes = saved;
+                back.builder.lanes = region_of(expr);
                 const ids = try back.build_call(expr.a);
                 if (expr.b == 0) return .{ .first = ids.first, .second = ids.second };
                 assert(expr.b == 1);
@@ -186,6 +197,12 @@ const Back = struct {
                 back.memory.track_nodes[expr.a] = id;
                 return .{ .first = id };
             },
+            .lane => {
+                const saved = back.builder.lanes;
+                defer back.builder.lanes = saved;
+                back.builder.lanes = region_of(expr);
+                return .{ .first = try back.attempt(back.builder.lane(), expr.item, null) };
+            },
         }
     }
 
@@ -205,7 +222,7 @@ const Back = struct {
                 const b = back.initial_of(expr.b, depth + 1) orelse return null;
                 return if (expr.tag == .add) a + b else a * b;
             },
-            .call, .pick => null,
+            .call, .pick, .lane => null,
         };
     }
 
@@ -276,8 +293,27 @@ const Back = struct {
                 return error.Refused;
             },
             .wave => {
-                const source: wave.Wave = .{ .shape = schema.word_value(wave.Shape, v[0].word), .hz = v[1].frequency };
+                const source: wave.Wave = .{
+                    .shape = schema.word_value(wave.Shape, v[0].word),
+                    .hz = v[1].frequency,
+                    .stagger = .{ .flicks = v[2].time },
+                };
                 return .{ .first = try back.attempt(builder.wave(source), item, call) };
+            },
+            .lanes => {
+                const body = (try back.eval(v[1].signal)).first;
+                const count: u32 = @intCast(v[0].integer);
+                if (builder.nodes[body.index].extent.lanes == count) return .{ .first = body };
+                assert(builder.nodes[body.index].extent.lanes == 1);
+                builder.lanes = count;
+                const components = builder.nodes[body.index].extent.components;
+                if (components == 1) return .{ .first = try back.attempt(builder.spread(body), item, call) };
+                var ids: [graph.components_max]Id = undefined;
+                for (ids[0..components], 0..) |*id, k| {
+                    const one = try back.component(body, @intCast(k), item);
+                    id.* = try back.attempt(builder.spread(one), item, call);
+                }
+                return back.pack(ids[0..components], item, call);
             },
             .noise => {
                 const source: noise.Noise = .{
@@ -319,6 +355,7 @@ const Back = struct {
                                 else => ease_of(v[4].word),
                             },
                             .previous = if (after) |vector| try back.component(vector, @intCast(k), item) else null,
+                            .stagger = .{ .flicks = v[6].time },
                         };
                         id.* = try back.attempt(builder.tween(source), item, call);
                     }
@@ -335,6 +372,7 @@ const Back = struct {
                         else => ease_of(v[4].word),
                     },
                     .previous = previous,
+                    .stagger = .{ .flicks = v[6].time },
                 };
                 return .{ .first = try back.attempt(builder.tween(source), item, call) };
             },
@@ -348,6 +386,7 @@ const Back = struct {
                             .from = v[1].component(k),
                             .time = .{ .flicks = v[2].time },
                             .overshoot = v[3].number,
+                            .stagger = .{ .flicks = v[4].time },
                         };
                         id.* = try back.attempt(builder.spring(source), item, call);
                     }
@@ -359,6 +398,7 @@ const Back = struct {
                     .from = v[1].number,
                     .time = .{ .flicks = v[2].time },
                     .overshoot = v[3].number,
+                    .stagger = .{ .flicks = v[4].time },
                 };
                 back.goal = .{ .path = .{ .path = source.goals, .from = source.from } };
                 return .{ .first = try back.attempt(builder.spring(source), item, call) };
@@ -374,6 +414,7 @@ const Back = struct {
                             .speed = v[2].number,
                             .accel = v[3].number,
                             .decel = v[4].number,
+                            .stagger = .{ .flicks = v[5].time },
                         };
                         id.* = try back.attempt(builder.newtonian(source), item, call);
                     }
@@ -386,6 +427,7 @@ const Back = struct {
                     .speed = v[2].number,
                     .accel = v[3].number,
                     .decel = v[4].number,
+                    .stagger = .{ .flicks = v[5].time },
                 };
                 back.goal = .{ .path = .{ .path = source.goals, .from = source.from } };
                 return .{ .first = try back.attempt(builder.newtonian(source), item, call) };
@@ -485,6 +527,7 @@ const Back = struct {
                     .high = v[0].number_range[1],
                     .speed = v[1].number,
                     .start = .{ .index = v[2].cue },
+                    .stagger = .{ .flicks = v[3].time },
                 };
                 const ids = builder.bounce(source) catch |err| return back.refuse(err, item, call);
                 return .{ .first = ids.position, .second = ids.velocity };
@@ -577,6 +620,7 @@ const Back = struct {
             error.NotFinite => .{ .param = "", .message = "a value is infinite or not a number" },
             error.InvalidEase => .{ .param = "ease", .message = "a cubic ease's x1 and x2 must be in [0, 1]" },
             error.ShapeMismatch => .{ .param = "", .message = "the shapes of its values do not fit together" },
+            error.LaneMismatch => .{ .param = "", .message = "the lanes of its values do not fit together" },
             else => .{ .param = "", .message = "the builder refused this call" },
         };
         const target = if (call) |index| back.param_item(index, at.param) else item;
@@ -598,6 +642,11 @@ const Back = struct {
         return record.item;
     }
 };
+
+/// The builder's region for an expression checked in `expr.region`, or null outside one.
+fn region_of(expr: check_module.Expr) ?u32 {
+    return if (expr.region == 0) null else expr.region;
+}
 
 fn valid_overshoot(value: f64) bool {
     return value >= 0 and value < 1;

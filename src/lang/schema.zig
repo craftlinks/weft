@@ -117,6 +117,8 @@ pub const Op = enum {
     pack,
     /// `srgb`: a colour from three numbers, converted to OKLab at compile time.
     srgb,
+    /// `lanes(n, body)`: its body over a region of n lanes (step 17).
+    lanes,
     /// A client's noun: checked like the rest, built by the client from `Checked.calls`.
     client,
 };
@@ -177,6 +179,7 @@ pub const entries = [_]Entry{
     .{ .name = "wave", .op = .wave, .role = .signal, .summary = "a wave of a shape at a frequency", .params = &.{
         .{ .name = "shape", .kind = .word, .positional = true, .words = wave_words },
         .{ .name = "hz", .kind = .frequency, .positional = true },
+        .{ .name = "stagger", .kind = .time, .default = .{ .time = 0 } },
     } },
     .{ .name = "noise", .op = .noise, .role = .signal, .summary = "seeded noise, smooth or in steps", .params = &.{
         .{ .name = "shape", .kind = .word, .positional = true, .words = noise_words },
@@ -190,12 +193,14 @@ pub const entries = [_]Entry{
         .{ .name = "over", .kind = .time },
         .{ .name = "ease", .kind = .ease, .default = .{ .word = 0 }, .words = ease_words },
         .{ .name = "after", .kind = .signal, .shaped = true, .default = .absent },
+        .{ .name = "stagger", .kind = .time, .default = .{ .time = 0 } },
     } },
     .{ .name = "spring", .op = .spring, .role = .signal, .summary = "a spring toward goals at cues", .params = &.{
         .{ .name = "goals", .kind = .path, .positional = true, .shaped = true },
         .{ .name = "from", .kind = .number, .shaped = true, .default = .{ .number = 0 } },
         .{ .name = "time", .kind = .time },
         .{ .name = "overshoot", .kind = .number, .default = .{ .number = 0 } },
+        .{ .name = "stagger", .kind = .time, .default = .{ .time = 0 } },
     } },
     .{ .name = "newtonian", .op = .newtonian, .role = .signal, .summary = "a Newtonian move toward goals at cues", .params = &.{
         .{ .name = "goals", .kind = .path, .positional = true, .shaped = true },
@@ -203,6 +208,7 @@ pub const entries = [_]Entry{
         .{ .name = "speed", .kind = .number },
         .{ .name = "accel", .kind = .number },
         .{ .name = "decel", .kind = .number },
+        .{ .name = "stagger", .kind = .time, .default = .{ .time = 0 } },
     } },
     .{ .name = "chase", .op = .chase, .role = .signal, .summary = "a spring chasing a signal", .params = &.{
         .{ .name = "target", .kind = .signal, .positional = true, .shaped = true },
@@ -239,6 +245,7 @@ pub const entries = [_]Entry{
         .{ .name = "range", .kind = .number_range, .positional = true },
         .{ .name = "speed", .kind = .number },
         .{ .name = "at", .kind = .cue },
+        .{ .name = "stagger", .kind = .time, .default = .{ .time = 0 } },
     } },
     .{ .name = "crossing", .op = .crossing, .role = .signal, .summary = "a gate on a level, firing at each crossing", .params = &.{
         .{ .name = "input", .kind = .signal, .positional = true },
@@ -276,6 +283,10 @@ pub const entries = [_]Entry{
         .{ .name = "r", .kind = .number, .positional = true },
         .{ .name = "g", .kind = .number, .positional = true },
         .{ .name = "b", .kind = .number, .positional = true },
+    } },
+    .{ .name = "lanes", .op = .lanes, .role = .signal, .summary = "its body over n lanes, each with its own `lane`, seeds, and stagger", .params = &.{
+        .{ .name = "count", .kind = .integer, .positional = true },
+        .{ .name = "body", .kind = .signal, .positional = true, .shaped = true },
     } },
     .{ .name = "spring", .op = .spring_mover, .role = .mover, .summary = "a follower's spring", .params = &.{
         .{ .name = "time", .kind = .time, .live = true },

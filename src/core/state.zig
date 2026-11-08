@@ -41,9 +41,11 @@ const follower_slot_arrived = graph.follower_slot_arrived;
 const follower_slot_arrived_goal = graph.follower_slot_arrived_goal;
 const follower_slots = graph.follower_slots;
 const law_cache_reset = graph.law_cache_reset;
+const lane_seed = graph.lane_seed;
+const lane_time = graph.lane_time;
+const Extent = graph.Extent;
 const newtonian_limits_at = graph.newtonian_limits_at;
 const node_values = graph.node_values;
-const param_value = graph.param_value;
 const spring_law_at = graph.spring_law_at;
 const step_flicks = graph.step_flicks;
 const step_flicks_float = graph.step_flicks_float;
@@ -163,11 +165,18 @@ pub const State = struct {
         return result[0];
     }
 
-    /// All the values of a node, from the last `eval`, lane after lane.
+    /// All the values of a node, from the last `eval`, lane after lane and each lane's
+    /// components in order, which a client copies into an instance buffer as they are.
     pub fn values(state: *const State, id: Id) []const f64 {
         assert(state.evaluated);
         assert(id.index < state.program.nodes.len);
         return node_values(state.program.nodes, state.slab, id);
+    }
+
+    /// The lanes and components of a node's values (`graph.zig`, sections 15 and 16).
+    pub fn extent(state: *const State, id: Id) Extent {
+        assert(id.index < state.program.nodes.len);
+        return state.program.nodes[id.index].extent;
     }
 
     /// Every event with a time in `[t0, t1)`, in order of time, then source index, then lane, as
@@ -186,10 +195,15 @@ pub const State = struct {
             const id: Id = .{ .index = @intCast(index) };
             switch (node.op) {
                 .bounce => |*op| if (op.output == .position) {
-                    events_bounce(&state.program, op, id, &report);
+                    for (0..node.extent.lanes) |lane| {
+                        events_bounce(&state.program, op, id, family_lane(&state.program, node, lane), &report);
+                    }
                 },
                 .cues => |span| events_cues(&state.program, span, id, &report),
-                .motion => |*op| events_motion(&state.program, state.slab, node, op, id, &report),
+                .motion => |*op| for (0..node.extent.lanes) |lane| {
+                    const at = family_lane(&state.program, node, lane);
+                    events_motion(&state.program, state.slab, node, op, id, at, &report);
+                },
                 else => {},
             }
         }
@@ -419,11 +433,12 @@ const Found = struct {
     }
 };
 
-/// The hits of a bounce's position in the range: at each wall, the velocity just before it,
-/// `+speed` at `high` and `-speed` at `low`. Once the buffer is full, it counts the rest.
-fn events_bounce(program: *const Program, op: *const BounceNode, id: Id, report: *Found) void {
+/// The hits of one lane of a bounce's position in the range: at each wall, the velocity just
+/// before it, `+speed` at `high` and `-speed` at `low`. Once the buffer is full, it counts the
+/// rest. Lane g's start is `g * stagger` after the cue (`graph.zig`, section 16).
+fn events_bounce(program: *const Program, op: *const BounceNode, id: Id, lane: u32, report: *Found) void {
     assert(op.output == .position);
-    const start_time = program.cues.at(op.start);
+    const start_time = lane_time(program.cues.at(op.start), negated(op.stagger), lane);
     const first = op.hits_before(report.t0, start_time) + 1;
     const last = op.hits_before(report.t1, start_time);
     var k = first;
@@ -432,7 +447,7 @@ fn events_bounce(program: *const Program, op: *const BounceNode, id: Id, report:
         const event: Event = .{
             .time = .{ .flicks = start_time.flicks +% offset },
             .source = id,
-            .instance = 0,
+            .instance = lane,
             .value = if (k % 2 == 1) op.speed else -op.speed,
         };
         assert(event.time.flicks >= report.t0.flicks);
@@ -466,19 +481,29 @@ fn events_cues(program: *const Program, span: CueSpan, id: Id, report: *Found) v
     }
 }
 
-/// The goals of a motion reached in the range, each with the goal as the value. Only goals whose
-/// stretch, from their cue to the next goal's, meets the range can be reached in it, and the fold
-/// to the first of them starts from the cursor when it can, as `motion.zig` explains.
+/// The goals of one lane of a motion reached in the range, each with the goal as the value. Only
+/// goals whose stretch, from their cue to the next goal's, meets the range can be reached in it,
+/// and the fold to the first of them starts from the cursor when it can, as `motion.zig`
+/// explains. Lane g reads its range `g * stagger` earlier, and moves its events that much later.
 fn events_motion(
     program: *const Program,
     slab: []const f64,
     node: *const Node,
     op: *const Motion,
     id: Id,
-    report: *Found,
+    lane: u32,
+    report_all: *Found,
 ) void {
     const path = program.goals[op.goals.first..][0..op.goals.count];
     const cues = program.cues;
+    const shift = negated(op.stagger);
+    // The range as the unstaggered motion sees it.
+    var shifted: Found = .{
+        .collector = report_all.collector,
+        .t0 = lane_time(report_all.t0, op.stagger, lane),
+        .t1 = lane_time(report_all.t1, op.stagger, lane),
+    };
+    const report = &shifted;
     // The first goal whose stretch ends after t0, and the goals after it whose cue is before t1.
     var first: u32 = 0;
     while (first + 1 < path.len) : (first += 1) {
@@ -500,7 +525,7 @@ fn events_motion(
             report.t0,
             report.t1,
         );
-        if (reached) |time| report.add(time, id, 0, path[index].value);
+        if (reached) |time| report_all.add(lane_time(time, shift, lane), id, lane, path[index].value);
         if (index + 1 == path.len) break;
         const seconds = motion.seconds_between(cue_time, cues.at(path[index + 1].cue));
         kinematics = motion.advance(op.law, kinematics, path[index].value, seconds);
@@ -524,16 +549,20 @@ fn report_step(
         switch (node.op) {
             .crossing => |*op| {
                 const inputs = node_values(program.nodes, slab, op.input);
-                report_crossing(op, cache, inputs, step_time(start, index), id, report);
+                const first = family_lane(program, node, 0);
+                report_crossing(op, cache, inputs, step_time(start, index), id, first, report);
             },
-            .follow => {
-                const own = cache[2 * output_count ..][0..follower_slots];
+            .follow => for (0..output_count) |lane| {
+                const own = follower_own(cache, output_count, lane);
                 if (own[follower_slot_arrived] == 1) {
                     const goal = own[follower_slot_arrived_goal];
-                    report.add(step_time(start, index), id, 0, goal);
+                    report.add(step_time(start, index), id, family_lane(program, node, lane), goal);
                 }
             },
-            .shift => |*op| report_shift(cache[2 * output_count ..], op, start, index, id, report),
+            .shift => |*op| for (0..output_count) |lane| {
+                const own = shift_own(cache, op, output_count, lane);
+                report_shift(own, op, start, index, id, family_lane(program, node, lane), report);
+            },
             else => {},
         }
     }
@@ -541,13 +570,15 @@ fn report_step(
 
 /// A crossing's events at step `index`: per lane, its input at the step before, kept in its slab,
 /// against its input at this step, from the pass. The time is interpolated in the step and
-/// rounded up, never past it nor onto the step before, and the value is the slope.
+/// rounded up, never past it nor onto the step before, and the value is the slope. Lane l's
+/// instance is `first + l`, its lane in its family.
 fn report_crossing(
     op: *const Crossing,
     cache: []const f64,
     inputs: []const f64,
     time: Time,
     id: Id,
+    first: u32,
     report: *Found,
 ) void {
     assert(cache.len == inputs.len + 1);
@@ -563,7 +594,7 @@ fn report_crossing(
         const into = std.math.clamp(@ceil(weight * step_flicks_float), 1, step_flicks_float);
         const offset: i64 = @intFromFloat(into);
         const at: Time = .{ .flicks = step_before.flicks +% offset };
-        report.add(at, id, @intCast(lane), (b - a) * steps_per_second);
+        report.add(at, id, first + @as(u32, @intCast(lane)), (b - a) * steps_per_second);
     }
 }
 
@@ -576,6 +607,7 @@ fn report_shift(
     start: Time,
     index: u64,
     id: Id,
+    lane: u32,
     report: *Found,
 ) void {
     assert(own.len == 1 + op.buckets);
@@ -590,7 +622,40 @@ fn report_shift(
     assert(boundary <= index * step_flicks);
     const time: Time = .{ .flicks = start.flicks +% @as(i64, @bitCast(boundary)) };
     const slot: u32 = @intCast(entered % op.buckets);
-    report.add(time, id, 0, own[1 + slot]);
+    report.add(time, id, lane, own[1 + slot]);
+}
+
+/// The family lane of lane `lane` of `node`: `lane_first + lane` when it is laned, else 0
+/// (`graph.zig`, section 16).
+fn family_lane(program: *const Program, node: *const Node, lane: usize) u32 {
+    assert(lane < node.extent.lanes);
+    if (!node.extent.laned) return 0;
+    return program.lane_first + @as(u32, @intCast(lane));
+}
+
+/// `time` negated, so `lane_time` moves later instead of earlier.
+fn negated(time: Time) Time {
+    return .{ .flicks = 0 -% time.flicks };
+}
+
+/// The slots of lane `lane` of a follower, after its values at the steps before and after.
+fn follower_own(cache: anytype, output_count: usize, lane: usize) @TypeOf(cache[0..follower_slots]) {
+    assert(lane < output_count);
+    return cache[2 * output_count + lane * follower_slots ..][0..follower_slots];
+}
+
+/// The bucket count and buckets of lane `lane` of a shift register.
+fn shift_own(cache: anytype, op: *const simulation.ShiftRegister, output_count: usize, lane: usize) @TypeOf(cache[0..]) {
+    assert(lane < output_count);
+    const size = 1 + @as(usize, op.buckets);
+    return cache[2 * output_count + lane * size ..][0..size];
+}
+
+/// The node `op` of lane `lane` of a seeded node: its seed hashed with the lane when laned.
+fn seeded(comptime T: type, op: *const T, laned: bool, lane: u32) T {
+    var result = op.*;
+    if (laned) result.seed = lane_seed(op.seed, lane);
+    return result;
 }
 
 /// How a pass gives a simulated node's value.
@@ -617,31 +682,58 @@ fn eval_node(
     const nodes = program.nodes;
     const output_count = node.extent.count();
     const out = slab[node.offset..][0..output_count];
+    const first = family_lane(program, node, 0);
     switch (node.op) {
         .constant => |constant| @memset(out, constant),
         .add => |op| {
-            const left = node_values(nodes, slab, op.left);
-            add_into(out, left, node_values(nodes, slab, op.right), node.extent.components);
+            const left = operand_of(nodes, slab, op.left);
+            add_into(out, node.extent, left, operand_of(nodes, slab, op.right));
         },
         .multiply => |op| {
-            const left = node_values(nodes, slab, op.left);
-            multiply_into(out, left, node_values(nodes, slab, op.right), node.extent.components);
+            const left = operand_of(nodes, slab, op.left);
+            multiply_into(out, node.extent, left, operand_of(nodes, slab, op.right));
         },
         .map_range => |*op| map_range_into(out, node_values(nodes, slab, op.input), op),
-        .wave => |wave| @memset(out, wave.sample(time)),
-        .noise => |noise| @memset(out, noise.sample(time)),
+        .wave => |wave| if (node.extent.laned) {
+            for (out, first..) |*value, lane| value.* = wave.sample(lane_time(time, wave.stagger, lane));
+        } else {
+            @memset(out, wave.sample(time));
+        },
+        .noise => |*noise| if (node.extent.laned) {
+            for (out, first..) |*value, lane| {
+                value.* = seeded(@TypeOf(noise.*), noise, true, @intCast(lane)).sample(time);
+            }
+        } else {
+            @memset(out, noise.sample(time));
+        },
         .motion => |*op| {
             const cursor = slab[node.offset + output_count ..][0..motion.cursor_count];
-            @memset(out, motion.sample(op, program.goals, program.cues, cursor, time));
+            if (!node.extent.laned) {
+                @memset(out, motion.sample(op, program.goals, program.cues, cursor, time));
+                return;
+            }
+            // In time order, so the cursor folds forward from lane to lane (section 16).
+            for (0..out.len) |at| {
+                const lane = if (op.stagger.flicks > 0) out.len - 1 - at else at;
+                const lane_at = lane_time(time, op.stagger, first + lane);
+                out[lane] = motion.sample(op, program.goals, program.cues, cursor, lane_at);
+            }
         },
         .tween => |*tween| {
-            const start_time = program.cues.at(tween.start);
-            if (time.flicks >= start_time.flicks) {
-                @memset(out, tween.value_after(time, start_time));
-            } else if (tween.previous) |previous| {
-                @memcpy(out, node_values(nodes, slab, previous));
-            } else {
-                @memset(out, tween.from);
+            const previous: ?[]const f64 = if (tween.previous) |id| node_values(nodes, slab, id) else null;
+            const cue_time = program.cues.at(tween.start);
+            for (out, 0..) |*value, lane| {
+                const start_time = if (tween.stagger.flicks == 0)
+                    cue_time
+                else
+                    lane_time(cue_time, negated(tween.stagger), first + lane);
+                if (time.flicks >= start_time.flicks) {
+                    value.* = tween.value_after(time, start_time);
+                } else if (previous) |values| {
+                    value.* = values[if (values.len == 1) 0 else lane];
+                } else {
+                    value.* = tween.from;
+                }
             }
         },
         .chase, .follow, .shift, .delay, .oscillator => {
@@ -649,7 +741,16 @@ fn eval_node(
             sample_into(out, cache[0..output_count], cache[output_count..], sampling);
         },
         .track => |id| @memset(out, program.tracks.value(id, time)),
-        .bounce => |*op| @memset(out, op.sample(time, program.cues.at(op.start))),
+        .bounce => |*op| {
+            const cue_time = program.cues.at(op.start);
+            if (!node.extent.laned) {
+                @memset(out, op.sample(time, cue_time));
+                return;
+            }
+            for (out, first..) |*value, lane| {
+                value.* = op.sample(time, lane_time(cue_time, negated(op.stagger), lane));
+            }
+        },
         .crossing => |*op| {
             const inputs = node_values(nodes, slab, op.input);
             assert(inputs.len == out.len);
@@ -662,7 +763,10 @@ fn eval_node(
         // Set by `State.set_input`, which a pass leaves as it is.
         .input => {},
         .pack => |op| for (op.inputs[0..op.count], 0..) |id, component| {
-            for (node_values(nodes, slab, id), 0..) |value, lane| out[lane * op.count + component] = value;
+            const values = node_values(nodes, slab, id);
+            for (0..node.extent.lanes) |lane| {
+                out[lane * op.count + component] = values[if (values.len == 1) 0 else lane];
+            }
         },
         .pick => |op| {
             const values = node_values(nodes, slab, op.input);
@@ -673,6 +777,10 @@ fn eval_node(
             const clip = program.samples[op.clip.first..][0..op.clip.count];
             @memset(out, recording_module.play(clip, time));
         },
+        .lane => for (out, first..) |*value, lane| {
+            value.* = @floatFromInt(lane);
+        },
+        .spread => |input| @memset(out, node_values(nodes, slab, input)[0]),
     }
 }
 
@@ -779,35 +887,42 @@ fn update_node(program: *const Program, slab: []f64, node: *const Node, index: u
         },
         .delay => |op| if (op.input) |input| {
             const values = node_values(program.nodes, slab, input);
-            assert(values.len == output_count);
-            @memcpy(after, values);
+            // A one-lane feed is broadcast (`graph.zig`, section 16).
+            if (values.len == 1) @memset(after, values[0]) else @memcpy(after, values);
         },
         .follow => |*op| {
             const law: motion.Law = switch (op.law) {
                 .spring => |fixed| .{ .spring = if (any_param(op.params))
-                    spring_law_at(program, slab, op.params, fixed, own[follower_slots..])
+                    spring_law_at(program, slab, op.params, fixed, own[follower_slots * output_count ..])
                 else
                     fixed },
                 .newtonian => |fixed| .{
                     .newtonian = newtonian_limits_at(program, slab, op.params, fixed),
                 },
             };
-            const kept = own[0..follower_slots];
-            const state = follower_unpack(after[0], kept);
-            const next = simulation.follower_step(op, program.regions, law, state);
-            follower_pack(next.state, after, kept);
-            own[follower_slot_arrived] = @floatFromInt(@intFromBool(next.arrived));
-            if (next.arrived) own[follower_slot_arrived_goal] = state.goal;
+            for (after, 0..) |*position, lane| {
+                const kept = follower_own(cache, output_count, lane);
+                const lane_op = seeded(simulation.Follower, op, node.extent.laned, family_lane(program, node, lane));
+                const state = follower_unpack(position.*, kept);
+                const next = simulation.follower_step(&lane_op, program.regions, law, state);
+                follower_pack(next.state, position, kept);
+                kept[follower_slot_arrived] = @floatFromInt(@intFromBool(next.arrived));
+                if (next.arrived) kept[follower_slot_arrived_goal] = state.goal;
+            }
         },
-        .shift => |*op| {
-            const bucket: u64 = @intFromFloat(own[0]);
-            const next = simulation.shift_step(op, own[1..], bucket, index);
-            own[0] = @floatFromInt(next.bucket);
-            @memset(after, next.value);
+        .shift => |*op| for (after, 0..) |*value, lane| {
+            const kept = shift_own(cache, op, output_count, lane);
+            const lane_op = seeded(simulation.ShiftRegister, op, node.extent.laned, family_lane(program, node, lane));
+            const bucket: u64 = @intFromFloat(kept[0]);
+            const next = simulation.shift_step(&lane_op, kept[1..], bucket, index);
+            kept[0] = @floatFromInt(next.bucket);
+            value.* = next.value;
         },
         .oscillator => |*op| {
-            const rate = param_value(program, slab, op.rate);
-            for (after, own[0..output_count]) |*value, *phase| {
+            const rates = node_values(program.nodes, slab, op.rate);
+            assert(rates.len == output_count);
+            for (after, own[0..output_count], rates) |*value, *phase, rate| {
+                assert(std.math.isFinite(rate));
                 const turned = phase.* + rate * simulation.step_seconds;
                 phase.* = turned - @floor(turned);
                 // A sum one ulp below a whole turn can round up to 1 after the floor.
@@ -816,7 +931,7 @@ fn update_node(program: *const Program, slab: []f64, node: *const Node, index: u
             }
         },
         .constant, .add, .multiply, .map_range, .wave, .tween, .noise, .motion => unreachable,
-        .bounce, .cues, .crossing, .input, .recorded, .track, .pack, .pick => unreachable,
+        .bounce, .cues, .crossing, .input, .recorded, .track, .pack, .pick, .lane, .spread => unreachable,
     }
     for (after) |value| assert(std.math.isFinite(value));
 }
@@ -844,24 +959,29 @@ fn reset_node(program: *const Program, slab: []f64, node: *const Node) void {
         },
         .delay => |op| @memset(after, op.initial),
         .follow => |*op| {
-            const kept = own[0..follower_slots];
-            follower_pack(simulation.follower_start(op, program.regions), after, kept);
-            kept[follower_slot_arrived] = 0;
-            kept[follower_slot_arrived_goal] = op.from;
-            if (own.len > follower_slots) law_cache_reset(own[follower_slots..]);
+            for (after, 0..) |*position, lane| {
+                const kept = follower_own(cache, output_count, lane);
+                const lane_op = seeded(simulation.Follower, op, node.extent.laned, family_lane(program, node, lane));
+                follower_pack(simulation.follower_start(&lane_op, program.regions), position, kept);
+                kept[follower_slot_arrived] = 0;
+                kept[follower_slot_arrived_goal] = op.from;
+            }
+            if (own.len > follower_slots * output_count) law_cache_reset(own[follower_slots * output_count ..]);
         },
         .oscillator => |op| {
             @memset(own, op.phase);
             @memset(after, op.shape.at(op.phase));
         },
-        .shift => |*op| {
-            simulation.shift_fill(op, own[1..]);
-            own[0] = 0;
-            const position = simulation.shift_position(op, 0);
-            @memset(after, simulation.shift_value(op, own[1..], position));
+        .shift => |*op| for (after, 0..) |*value, lane| {
+            const kept = shift_own(cache, op, output_count, lane);
+            const lane_op = seeded(simulation.ShiftRegister, op, node.extent.laned, family_lane(program, node, lane));
+            simulation.shift_fill(&lane_op, kept[1..]);
+            kept[0] = 0;
+            const position = simulation.shift_position(&lane_op, 0);
+            value.* = simulation.shift_value(&lane_op, kept[1..], position);
         },
         .constant, .add, .multiply, .map_range, .wave, .tween, .noise, .motion => unreachable,
-        .bounce, .cues, .crossing, .input, .recorded, .track, .pack, .pick => unreachable,
+        .bounce, .cues, .crossing, .input, .recorded, .track, .pack, .pick, .lane, .spread => unreachable,
     }
     @memcpy(before, after);
 }
@@ -878,32 +998,55 @@ fn follower_unpack(position: f64, own: []const f64) simulation.FollowerState {
     };
 }
 
-fn follower_pack(state: simulation.FollowerState, after: []f64, own: []f64) void {
+fn follower_pack(state: simulation.FollowerState, position: *f64, own: []f64) void {
     assert(own.len == follower_slots);
     // Counters below 2^53, which section 6 of `simulation.zig` promises, are exact in an f64.
     assert(state.drawn < 1 << 53);
-    @memset(after, state.kinematics.position);
+    position.* = state.kinematics.position;
     own[0] = state.kinematics.velocity;
     own[1] = state.goal;
     own[2] = @floatFromInt(state.drawn);
     own[3] = @floatFromInt(state.pause_left);
 }
 
-/// `left + right` per component of `components`, an operand of one component broadcast across
-/// the components of its lane (`graph.zig`, section 15).
-fn add_into(out: []f64, left: []const f64, right: []const f64, components: u32) void {
-    for (out, 0..) |*value, at| value.* = operand(left, out.len, components, at) + operand(right, out.len, components, at);
+/// A node's values read as an operand, with its extent, for a broadcast.
+const Operand = struct {
+    values: []const f64,
+    extent: Extent,
+
+    /// Its value at `lane` and `component` of a larger extent: one lane or one component is
+    /// broadcast (`graph.zig`, sections 15 and 16).
+    fn at(operand: Operand, lane: usize, component: usize) f64 {
+        const row = if (operand.extent.lanes == 1) 0 else lane;
+        const column = if (operand.extent.components == 1) 0 else component;
+        return operand.values[row * operand.extent.components + column];
+    }
+};
+
+fn operand_of(nodes: []const Node, slab: []const f64, id: Id) Operand {
+    return .{ .values = node_values(nodes, slab, id), .extent = nodes[id.index].extent };
 }
 
-fn multiply_into(out: []f64, left: []const f64, right: []const f64, components: u32) void {
-    for (out, 0..) |*value, at| value.* = operand(left, out.len, components, at) * operand(right, out.len, components, at);
+/// `left + right` per lane and component, an operand of one lane or one component broadcast.
+fn add_into(out: []f64, extent: Extent, left: Operand, right: Operand) void {
+    // Operands of the output's own extent, the common case, as one loop.
+    if (left.values.len == out.len and right.values.len == out.len) {
+        for (out, left.values, right.values) |*value, a, b| value.* = a + b;
+        return;
+    }
+    for (0..extent.lanes) |lane| for (0..extent.components) |component| {
+        out[lane * extent.components + component] = left.at(lane, component) + right.at(lane, component);
+    };
 }
 
-/// Value `at` of an output of `count` f64 and `components` a lane, from an operand of the same
-/// shape or of one component a lane.
-fn operand(values: []const f64, count: usize, components: u32, at: usize) f64 {
-    assert(values.len == count or values.len * components == count);
-    return if (values.len == count) values[at] else values[at / components];
+fn multiply_into(out: []f64, extent: Extent, left: Operand, right: Operand) void {
+    if (left.values.len == out.len and right.values.len == out.len) {
+        for (out, left.values, right.values) |*value, a, b| value.* = a * b;
+        return;
+    }
+    for (0..extent.lanes) |lane| for (0..extent.components) |component| {
+        out[lane * extent.components + component] = left.at(lane, component) * right.at(lane, component);
+    };
 }
 
 fn map_range_into(out: []f64, input: []const f64, map: *const MapRange) void {

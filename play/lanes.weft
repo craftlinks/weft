@@ -1,0 +1,10 @@
+# Play's lanes: a thousand dots of one program, a lane each. Each dot rises 3 ms after the one
+# before, to a height of its own noise, in a colour of its own two noises, and flashes when its
+# bounce, 5 ms behind the one before, reaches the top wall.
+seed 17
+cue c0 = 0s
+rise = lanes(1000, tween(from: 0, to: 1, at: c0, over: 0.8s, ease: out, stagger: 3ms))
+height = lanes(1000, map(noise(smooth, 0.2hz), -1..1, to: 0.3..1))
+size = rise * height
+tint = lanes(1000, oklab(0.74, noise(smooth, 0.1hz) * 0.13, noise(smooth, 0.1hz) * 0.13))
+hop = lanes(1000, bounce(0..1, speed: 0.6, at: c0, stagger: 5ms))

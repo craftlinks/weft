@@ -34,8 +34,8 @@ pub const Event = struct {
     time: Time,
     /// The node that fired it.
     source: Id,
-    /// The lane. Sources that set one value across the lanes fire on lane 0 only, until step 17
-    /// gives lanes their own seeds.
+    /// The lane in its family, `lane_first + l` (`graph.zig`, section 16), or 0 for a source
+    /// outside a lane region.
     instance: u32,
     /// What the source's events carry, by op:
     /// - `bounce` position: the velocity just before the hit, `+speed` at `high`, `-speed` at

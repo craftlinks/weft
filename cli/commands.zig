@@ -13,11 +13,14 @@
 //! a number that is not finite (an unbounded range) as `null`, since JSON has no infinity.
 //!
 //! ## 3. Sampling
-//! `sample` evaluates one reader at each time of the window once, in order, and keeps every
-//! signal's value at that time, so a simulated program steps forwards once and never seeks back.
-//! Events in the window come from the same reader afterwards. A vector or a colour (step 16) has
-//! `"components"` and each value is an array of them, OKLab for a colour; a number has neither,
-//! so a file of numbers samples as it did before vectors.
+//! `sample` reads each signal from a fresh reader at each time of the window, in order, and writes
+//! its values as it goes, so a simulated program steps forwards and never seeks back, and a
+//! signal of a thousand lanes needs no buffer. A reader cannot tell a fresh state from one that
+//! read the other signals too, so the values are the ones one reader gives. Events in the window
+//! come from one more fresh reader. A vector or a colour (step 16) has `"components"` and each
+//! value is an array of them, OKLab for a colour; a signal of many lanes (step 17) has `"lanes"`
+//! and each value is an array of its lanes. A number has none of these, so a file of numbers
+//! samples as it did before vectors.
 //!
 //! ## 4. TigerStyle Invariants
 //! - No allocation: every buffer is a file-scope variable, sized by the constants below.
@@ -34,7 +37,7 @@ pub const limits: lang.Limits = .{
     .tree = 16384,
     .names = 512,
     .nodes = 1024,
-    .slab = 16384,
+    .slab = 1 << 18,
     .cues = 512,
     .goals = 256,
     .regions = 64,
@@ -76,7 +79,6 @@ pub const Window = struct {
 };
 
 var scratch: Syntax = undefined;
-var sampled: [signals_max][samples_max][weft.graph.components_max]f64 = undefined;
 var slab: [limits.slab]f64 = undefined;
 var ranges: [limits.nodes]weft.Range = undefined;
 var events: [events_max]weft.Event = undefined;
@@ -269,45 +271,39 @@ pub fn sample(
     }
     const program = compiled.program;
     program.ranges(ranges[0..program.nodes.len]);
-    var state = weft.State.init(program, slab[0..program.slab_count]);
     const count = window.count();
-    for (0..count) |index| {
-        state.eval(.{ .flicks = window.from + @as(i64, @intCast(index)) * window.step });
-        for (ids[0..list.len], 0..) |id, at| {
-            const read = state.values(id);
-            assert(read.len <= weft.graph.components_max);
-            @memcpy(sampled[at][index][0..read.len], read);
-        }
-    }
 
     try writer.print("{{\"from\":{d},\"to\":{d},\"step\":{d},\"signals\":[", .{ window.from, window.to, window.step });
     for (list, ids[0..list.len], 0..) |name, id, at| {
         if (at > 0) try writer.writeAll(",");
         try writer.writeAll("{\"name\":");
         try json_string(writer, name);
-        const components = program.nodes[id.index].extent.components;
-        if (components > 1) try writer.print(",\"components\":{d}", .{components});
+        const extent = program.nodes[id.index].extent;
+        if (extent.lanes > 1) try writer.print(",\"lanes\":{d}", .{extent.lanes});
+        if (extent.components > 1) try writer.print(",\"components\":{d}", .{extent.components});
         try writer.writeAll(",\"range\":[");
         try json_number(writer, ranges[id.index].low);
         try writer.writeAll(",");
         try json_number(writer, ranges[id.index].high);
         try writer.writeAll("],\"values\":[");
-        for (sampled[at][0..count], 0..) |value, index| {
+        // Each signal reads the window from a fresh state, which a read cannot tell apart from one
+        // that read the others too, so no lane array needs keeping.
+        var state = weft.State.init(program, slab[0..program.slab_count]);
+        for (0..count) |index| {
             if (index > 0) try writer.writeAll(",");
-            if (components == 1) {
-                try json_number(writer, value[0]);
-                continue;
+            state.eval(.{ .flicks = window.from + @as(i64, @intCast(index)) * window.step });
+            const read = state.values(id);
+            if (extent.lanes > 1) try writer.writeAll("[");
+            for (0..extent.lanes) |lane| {
+                if (lane > 0) try writer.writeAll(",");
+                try json_value(writer, read[lane * extent.components ..][0..extent.components]);
             }
-            try writer.writeAll("[");
-            for (value[0..components], 0..) |component, k| {
-                if (k > 0) try writer.writeAll(",");
-                try json_number(writer, component);
-            }
-            try writer.writeAll("]");
+            if (extent.lanes > 1) try writer.writeAll("]");
         }
         try writer.writeAll("]}");
     }
     try writer.writeAll("],\"events\":[");
+    var state = weft.State.init(program, slab[0..program.slab_count]);
     const found = state.events(.{ .flicks = window.from }, .{ .flicks = window.to }, &events);
     for (events[0..found.count], 0..) |event, at| {
         if (at > 0) try writer.writeAll(",");
@@ -330,6 +326,18 @@ fn default_signals(compiled: *const Compiled, buffer: *[signals_max][]const u8) 
         count += 1;
     }
     return buffer[0..count];
+}
+
+/// One lane's value: a number, or an array of its components.
+fn json_value(writer: *std.Io.Writer, components: []const f64) !void {
+    assert(components.len >= 1 and components.len <= weft.graph.components_max);
+    if (components.len == 1) return json_number(writer, components[0]);
+    try writer.writeAll("[");
+    for (components, 0..) |component, k| {
+        if (k > 0) try writer.writeAll(",");
+        try json_number(writer, component);
+    }
+    try writer.writeAll("]");
 }
 
 /// A JSON number, or `null` for an infinity or NaN (section 2).
