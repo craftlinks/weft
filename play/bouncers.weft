@@ -1,0 +1,11 @@
+# Play's bouncers: seven bounces between 0 and 1 from the first bar, and the bars as events.
+cue bar = 0s..600s every 2s
+
+lane_0_7 = bounce(0..1, speed: 0.7, at: bar[0])
+lane_1 = bounce(0..1, speed: 1, at: bar[0])
+lane_1_5 = bounce(0..1, speed: 1.5, at: bar[0])
+lane_2 = bounce(0..1, speed: 2, at: bar[0])
+lane_2_5 = bounce(0..1, speed: 2.5, at: bar[0])
+lane_3 = bounce(0..1, speed: 3, at: bar[0])
+lane_3_5 = bounce(0..1, speed: 3.5, at: bar[0])
+bars = cues(bar)

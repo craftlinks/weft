@@ -1,0 +1,51 @@
+# Play's signals: the scope's eight rows, then the shapes page's eight sources.
+seed 7
+
+cue c0 = 0s
+cue c1 = 2s
+cue c2 = 4s
+cue c3 = 6s
+cue c4 = 8s
+cue c5 = 10s
+
+# The knobs: each one's value before a turn, then its bounds.
+track pulse_hz = 0.3 in 0.075..1.2
+track chase_s = 0.5 in 0.125..2
+track sway_os = 0.45 in 0..0.9
+track glide_v = 1 in 0.25..4
+
+# The goals the spring and the Newtonian move share.
+moves = [c1: 1, c3: -0.5, c4: 0.25]
+
+# The scope.
+wave = wave(sine, 0.5hz)
+noise = noise(smooth, 1hz, seed: 1)
+rise = tween(from: 0, to: 1, at: c1, over: 1s, ease: in_out)
+tween = tween(from: 1, to: -0.5, at: c3, over: 1s, ease: in_out, after: rise)
+spring = spring(moves, time: 0.5s, overshoot: 0.2)
+newtonian = newtonian(moves, speed: 2, accel: 8, decel: 4)
+chase = chase(noise, time: chase_s, overshoot: 0.1)
+follow = follow([-1..-0.5, 0.5..1], by: spring(time: 0.25s), pause: 100ms..500ms, seed: 2)
+shift = shift(-1..1, buckets: 8, period: 2s, odds: 0.25, shape: smooth, seed: 3)
+
+# The shapes page's sources.
+sway = follow([-1..1], by: spring(time: 0.8s, overshoot: sway_os), pause: 0s..1s, seed: 4)
+pulse = oscillator(sine, rate: pulse_hz)
+drift = noise(smooth, 0.25hz, seed: 5)
+soft = follow([0..1], from: 0.5, by: spring(time: 1s), pause: 0s..1s, seed: 6)
+snappy = follow([0..1], from: 0.5, by: spring(time: 0.3s, overshoot: 0.1), pause: 0s..1s, seed: 7)
+bouncy = follow([0..1], from: 0.5, by: spring(time: 0.6s, overshoot: 0.5), pause: 0s..1s, seed: 8)
+glide_a = follow(
+    [0..1],
+    from: 0.5,
+    by: newtonian(speed: glide_v, accel: 16, decel: 16),
+    pause: 0s..500ms,
+    seed: 9,
+)
+glide_b = follow(
+    [0..1],
+    from: 0.5,
+    by: newtonian(speed: glide_v, accel: 16, decel: 16),
+    pause: 0s..500ms,
+    seed: 10,
+)

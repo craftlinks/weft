@@ -635,6 +635,20 @@ fn graph_build(graph: Graph, builder: *weft.Builder) weft.Builder.Error!weft.Id 
     }
 }
 
+/// The nodes of the graph `name` at epoch zero, and its output, for the language's test, which
+/// writes each graph as text and checks it builds these nodes (`test/lang.zig`).
+pub fn graph_nodes(name: []const u8, nodes: *[Graph.nodes_count_max]weft.Node) ?struct { count: usize, output: weft.Id } {
+    const graph = std.meta.stringToEnum(Graph, name) orelse return null;
+    var tables: Tables = undefined;
+    tables.init(&epochs[0]);
+    var builder = tables.builder(nodes, Graph.slab_count_max);
+    const output = graph_build(graph, &builder) catch unreachable;
+    const program = builder.finish();
+    return .{ .count = program.nodes.len, .output = output };
+}
+
+pub const graph_nodes_max = Graph.nodes_count_max;
+
 /// The three tweens of `sequence`, a second each, one on each cue, with an overshoot in the middle.
 fn build_sequence(builder: *weft.Builder) weft.Builder.Error!weft.Id {
     const second: weft.Time = .{ .flicks = weft.time.flicks_per_second };
