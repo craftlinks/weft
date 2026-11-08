@@ -859,5 +859,8 @@ own package still has no dependencies.
 **The two-file rule.** Only `play/signals.zig`, the signal table, and `play/glue.zig` import
 `weft`. Everything else in Play (`app.zig`, `scope.zig`, `patch.zig`, `shapes.zig`,
 `bouncers.zig`, `vectors.zig`, `field.zig`, `swarm.zig`) draws plain numbers: the glue hands time over as a `Clock`, and the samples,
-events, ranges, classes, and report as `f32` arrays and plain structs. The glue has a budget of
-60 lines of code; growing past it says the boundary or Weft's API is wrong.
+events, ranges, classes, and report as `f32` arrays and plain structs. The glue was given a
+budget of 60 lines of code at step 9; at step 18 it is about 500, most of them one function a page
+that reads its program at t and copies the numbers out, and a recompile with its carry. The review
+after step 18 reads that as the shape of the bridge a second client would share, not as a wrong
+API.

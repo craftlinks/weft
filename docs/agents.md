@@ -26,11 +26,18 @@ zig-out/bin/weft sample FILE --signal NAME               # one signal
   one's kind (`number`, `time`, `frequency`, `signal`, `cue`, `path`, …), its default, whether a
   signal may set it (`live`), and whether it takes a vector or a colour (`shaped`). Then every
   module of the standard library, with its body. Read it before writing a call.
-- **`check`** prints `ok:` with the node count and whether the program is seekable, or each error
-  with a line, a column, and a hint. The hint is usually the fix.
+- **`check`** prints `ok:` with every count a `Limits` must hold (nodes, the slab, cues, goals,
+  regions, tracks) and whether the program is seekable and stepped, or each error with a line, a
+  column, and a hint. The hint is usually the fix.
 - **`sample`** is how you see motion you cannot watch: each signal's range, its value at each time,
   and the events in the window. A signal of many lanes prints `"lanes"` and each value as an
   array of lanes; a vector prints `"components"`. Sample a short window first: `--to 2 --step 0.1`.
+  The output's times are flicks (705,600,000 a second), and each event has its source node, its
+  `instance` (the lane), the `name` bound to its source, and its `value`.
+- **Which calls take lanes**: in `lanes(n, …)`, `noise`, `follow`, `shift`, and `delay` have the
+  region's lanes, and so do `wave`, `tween`, `spring`, `newtonian`, and `bounce` given a
+  `stagger:`. Every other call, `chase`, `crossing`, `map`, `oscillator` and the arithmetic
+  among them, has the most lanes of the signals it reads.
 
 ## 2. Write a File
 
@@ -92,18 +99,29 @@ smallest complete one to copy:
 1. **The file**, `play/NAME.weft`, embedded with `@embedFile`.
 2. **The program**, in `signals.zig`: a struct holding a `weft.lang.Compiled` sized by `Limits`, the
    ids it reads by name, and a `build` that compiles and asserts the node and slab counts. The
-   counts are exact: compile once with `weft check`, then assert what it prints; a test then
-   locks a few values.
+   counts are exact: `weft check` prints every one a `Limits` needs, so size it from that and
+   assert the node and slab counts; a test then locks a few values. A `Limits` too small makes
+   `compile` fail with `error.Invalid`, and `compiled.errors()` says which limit to raise, so
+   render them while you are sizing it.
 3. **The glue**, in `glue.zig`: a plain struct of what a frame draws (`f32` arrays, counts), and a
    `Motion.sample_NAME(clock, out)` that evals the page's own reader at `clock.t`, copies values
    out (colours through `weft.colour.to_srgb`), and reads events with `reader.events(t0, t1, buf)`.
-   Its reader and slab are `Motion` fields, set up in `Motion.build`, with a `Report` for the label.
+   Its reader and slab are `Motion` fields, set up in `Motion.build`, with a `Report` for the label;
+   a stepped program of its own sets `first_name` to the binding of its first stepped node.
 4. **The drawing**, `play/NAME.zig`, which does not import `weft`, and the app's wiring in
    `app.zig`: the `Page` enum and `next`, the number key, `draw`'s switch, the label's report, a
    field for the frame, the `test {}` list, two regress scenarios (`NAME`, still at a time, and
    `NAME_play`, playing), the page cycle test, and a ReleaseFast test that prints the frame's cost
    at 60 s and 600 s. Raise a draw pool's `cap` in `App.config` if the page draws many quads;
    the tests fail on any refused draw.
+
+**A stepped page** (one with `follow`, `chase`, `shift`, `delay`, `crossing`, or `oscillator`)
+costs what its steps cost, so plan for three things. Its reader needs checkpoint memory,
+`(1 + seconds) * slab` f64, given to `State.init_with_checkpoints`. Its first read at a time it
+has not reached runs every step from the start: about 1.5 s at 600 s for 48 lanes of followers
+and chases, once, while the checkpoints fill. And a window of events behind the playhead, as the
+lanes page reads, restores a checkpoint and steps again every frame, so read a stepped page's
+values, or its events from the last frame's time to this one, not a window behind it.
 
 Then, in `play/`:
 
@@ -115,7 +133,10 @@ zig build regress                               # every scenario against the gol
 ```
 
 Look at `zig-out/regress/play/NAME-high-on.new.png` before blessing: it is the frame the golden
-will lock. Each scenario's image is drawn on the regress clock, 1/60 s a frame.
+will lock. Each scenario's image is drawn on the regress clock, 1/60 s a frame. The goldens are
+hashes, so to see what changed in an old scenario, render it from the tree before your change with
+`./zig-out/bin/play --render NAME --out DIR` and compare the two images; `--regress --only NAME`
+runs one scenario.
 
 ## 4. Add a Primitive
 
