@@ -62,6 +62,16 @@ pub fn build(b: *std.Build) void {
     for (test_roots) |root| {
         test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = root })).step);
     }
+    // The tree's rules read its files from the root of the repository, at every run, since a
+    // file can change without changing the test (`test/rules.zig`).
+    const rules = b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("test/rules.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) }));
+    rules.setCwd(b.path("."));
+    rules.has_side_effects = true;
+    test_step.dependOn(&rules.step);
 
     // The `weft` command (step 14): its commands are a module of their own, so the tests call
     // the same functions and compare the bytes with the goldens in test/golden/cli.
@@ -146,6 +156,9 @@ pub fn build(b: *std.Build) void {
     });
     bench.root_module.addAnonymousImport("play_signals", .{
         .root_source_file = b.path("play/signals.weft"),
+    });
+    bench.root_module.addAnonymousImport("play_lanes", .{
+        .root_source_file = b.path("play/lanes.weft"),
     });
     const bench_run = b.addRunArtifact(bench);
     bench_run.has_side_effects = true;
