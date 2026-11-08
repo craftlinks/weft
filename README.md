@@ -139,12 +139,14 @@ src/
     ease.zig          Ease: cubic Bezier curves, with a bounded solver
     elementary.zig    sine and cosine in turns, exp, and log, the same bits on every target
     event.zig         Event, and the bounded, sorted buffer that collects them
-    graph.zig         Program, Builder, and State: a flat node array and one slab per reader
+    graph.zig         Program and Builder: a flat, sorted node array
+    graph_test/       the graph's tests, one file a topic
     motion.zig        Goals, springs, and Newtonian moves, solved exactly between goal changes
     noise.zig         Noise: smooth and stepped, pure functions of a seed and time
     range.zig         Range and Class: conservative bounds, and how a reader reaches a time
     recording.zig     Samples and Recording: live input written down and played back
     simulation.zig    the fixed step, seeded draws, the goal follower, and the shift register
+    state.zig         State: one slab per reader, the pass, steps, checkpoints, and events
     time.zig          Time and Rate: an integer count of flicks
     track.zig         Tracks: timed values a client writes, read as signals, latched from a time
     wave.zig          Wave: sine, triangle, saw, and square, pure functions of time
