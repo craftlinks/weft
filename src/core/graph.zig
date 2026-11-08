@@ -158,6 +158,18 @@
 //! or a follower whose spring time does, has no bound, since a spring whose stiffness changes as it
 //! moves can be pumped, so its range is unbounded.
 //!
+//! ## 15. Shapes: Vectors and Colour
+//! A node's output is its own shape: 1 to `components_max` components a lane (step 16). Two pure
+//! ops carry shapes and no op's maths changes: `pack` makes a value of 2 to 4 components from as
+//! many scalar nodes, and `pick` takes one component out. `add` and `multiply` work per component
+//! on equal shapes, or broadcast a scalar operand across the other's components; `map_range` maps
+//! each component. Every other op reads and makes one value, so the builder refuses a vector
+//! where it reads one (`ShapeMismatch`), and a moving vector is one scalar node per component,
+//! packed: each component of a spring is independent, and a front end builds them. A colour is
+//! three components in OKLab (`colour.zig`), so a tween or a spring between two colours is a
+//! straight line through OKLab. A pack's range is the hull of its inputs', and a pick of a pack
+//! has the picked input's own range. Within a lane, components are consecutive in the slab.
+//!
 //! ## 13. TigerStyle Invariants
 //! - Capacities come from the caller, and the builder refuses what does not fit, by name.
 //! - `eval` allocates nothing, takes no lock, and is one bounded pass over the node array. A motion
@@ -234,6 +246,21 @@ pub const MapRange = struct {
     input_high: f64,
     output_low: f64,
     output_high: f64,
+};
+
+/// The components most a value has: a 2D or 3D vector, an OKLab colour, and room for one more.
+pub const components_max = 4;
+
+/// A value of 2 to `components_max` components from as many scalar nodes, in order (section 15).
+pub const Pack = struct {
+    inputs: [components_max]Id,
+    count: u8,
+};
+
+/// Component `component` of `input`, a scalar (section 15).
+pub const Pick = struct {
+    input: Id,
+    component: u8,
 };
 
 /// Moves from `from` to `to`, over `duration` from the time of the cue `start`.
@@ -509,6 +536,8 @@ pub const Op = union(enum) {
     recorded: Recorded,
     oscillator: Oscillator,
     track: TrackId,
+    pack: Pack,
+    pick: Pick,
 
     /// The f64 a node of this op keeps in the slab after an output of `output_count` f64, for a
     /// cache or a simulation's state. Section 9 explains the layout of a simulated node.
@@ -526,7 +555,7 @@ pub const Op = union(enum) {
             // The input at the last step, then whether there is one.
             .crossing => output_count + 1,
             .constant, .add, .multiply, .map_range, .wave, .tween, .noise, .bounce, .cues => 0,
-            .input, .recorded, .track => 0,
+            .input, .recorded, .track, .pack, .pick => 0,
         };
     }
 
@@ -535,7 +564,7 @@ pub const Op = union(enum) {
         return switch (op.*) {
             .chase, .follow, .shift, .delay, .crossing, .oscillator => true,
             .constant, .add, .multiply, .map_range, .wave, .tween, .noise, .motion => false,
-            .bounce, .cues, .input, .recorded, .track => false,
+            .bounce, .cues, .input, .recorded, .track, .pack, .pick => false,
         };
     }
 
@@ -543,7 +572,7 @@ pub const Op = union(enum) {
     pub fn class(op: *const Op) Class {
         return switch (op.*) {
             .constant, .add, .multiply, .map_range, .wave, .tween, .noise => .pure,
-            .bounce, .cues, .recorded, .track => .pure,
+            .bounce, .cues, .recorded, .track, .pack, .pick => .pure,
             .motion => .exact,
             .chase, .follow, .shift, .delay, .crossing, .oscillator => .simulated,
             .input => .live,
@@ -574,6 +603,12 @@ pub const Op = union(enum) {
             .oscillator => |oscillator| .{ oscillator.rate, null, null, null },
             .constant, .wave, .noise, .motion, .shift, .bounce, .cues => @splat(null),
             .input, .recorded, .track => @splat(null),
+            .pack => |pack| ids: {
+                var ids: [4]?Id = @splat(null);
+                for (pack.inputs[0..pack.count], 0..) |id, at| ids[at] = id;
+                break :ids ids;
+            },
+            .pick => |pick| .{ pick.input, null, null, null },
         };
     }
 };
@@ -731,6 +766,19 @@ pub const Program = struct {
                     assert(op.right.index < index);
                 },
                 .map_range => |op| assert(op.input.index < index),
+                .pack => |op| {
+                    assert(op.count >= 2 and op.count <= components_max);
+                    assert(node.extent.components == op.count);
+                    for (op.inputs[0..op.count]) |id| {
+                        assert(id.index < index);
+                        assert(program.nodes[id.index].extent.components == 1);
+                    }
+                },
+                .pick => |op| {
+                    assert(op.input.index < index);
+                    assert(op.component < program.nodes[op.input.index].extent.components);
+                    assert(node.extent.components == 1);
+                },
                 .tween => |op| {
                     assert(op.start.index < program.cues.count);
                     if (op.previous) |previous| assert(previous.index < index);
@@ -923,6 +971,15 @@ pub const Program = struct {
             .cues => |span| .{ .low = 0, .high = @floatFromInt(span.count) },
             .input => |op| .{ .low = op.low, .high = op.high },
             .recorded => |op| .{ .low = op.low, .high = op.high },
+            .pack => |op| hull: {
+                var hull = result[op.inputs[0].index];
+                for (op.inputs[1..op.count]) |id| hull = hull.hull(result[id.index]);
+                break :hull hull;
+            },
+            .pick => |op| switch (program.nodes[op.input.index].op) {
+                .pack => |pack| result[pack.inputs[op.component].index],
+                else => result[op.input.index],
+            },
         };
     }
 
@@ -987,7 +1044,8 @@ pub const Builder = struct {
     tracks: *const Tracks,
     start: Cue,
     seed: u64,
-    /// The extent of every node built, 1 by 1 until a later step gives each node its own.
+    /// The lanes of every node built, 1 until step 17 gives each node its own. Its components
+    /// are 1: a node's components are its own shape (section 15).
     extent: Extent,
     /// Whether a simulated node has been built.
     simulated: bool,
@@ -1004,6 +1062,10 @@ pub const Builder = struct {
         UnknownNode,
         /// A constant or a parameter that is infinite or NaN, or an input end that is NaN.
         NotFinite,
+        /// Two vectors of different sizes in one op, a vector where an op reads one value, a pack
+        /// of fewer than 2 or more than `components_max` inputs, or a component past the end
+        /// (section 15).
+        ShapeMismatch,
         /// A map whose input range has no width, or one too wide for a double, a bounce whose low
         /// is not below its high, or an input whose low is above its high or whose initial value
         /// is outside them.
@@ -1099,26 +1161,59 @@ pub const Builder = struct {
         return builder.push(.{ .constant = value });
     }
 
+    /// `left + right`, per component; a scalar operand is added to every component of the other
+    /// (section 15).
     pub fn add(builder: *Builder, left: Id, right: Id) Error!Id {
-        try builder.check_known(left);
-        try builder.check_known(right);
-        return builder.push(.{ .add = .{ .left = left, .right = right } });
+        const extent = try builder.binary_extent(left, right);
+        return builder.push_shaped(.{ .add = .{ .left = left, .right = right } }, extent);
     }
 
+    /// `left * right`, per component, with a scalar broadcast as `add` does.
     pub fn multiply(builder: *Builder, left: Id, right: Id) Error!Id {
+        const extent = try builder.binary_extent(left, right);
+        return builder.push_shaped(.{ .multiply = .{ .left = left, .right = right } }, extent);
+    }
+
+    /// A value whose components are `ids`, each a scalar, 2 to `components_max` of them.
+    pub fn pack(builder: *Builder, ids: []const Id) Error!Id {
+        if (ids.len < 2 or ids.len > components_max) return error.ShapeMismatch;
+        var op: Pack = .{ .inputs = undefined, .count = @intCast(ids.len) };
+        for (ids, 0..) |id, at| {
+            try builder.check_scalar(id);
+            op.inputs[at] = id;
+        }
+        return builder.push_shaped(.{ .pack = op }, .{ .lanes = builder.extent.lanes, .components = op.count });
+    }
+
+    /// Component `component` of `id`, a scalar.
+    pub fn pick(builder: *Builder, id: Id, component: u8) Error!Id {
+        try builder.check_known(id);
+        if (component >= builder.nodes[id.index].extent.components) return error.ShapeMismatch;
+        return builder.push(.{ .pick = .{ .input = id, .component = component } });
+    }
+
+    /// The shape of a binary op over `left` and `right`: theirs when equal, else the one that
+    /// is not a scalar; two different vectors are refused.
+    fn binary_extent(builder: *const Builder, left: Id, right: Id) Error!Extent {
         try builder.check_known(left);
         try builder.check_known(right);
-        return builder.push(.{ .multiply = .{ .left = left, .right = right } });
+        const a = builder.nodes[left.index].extent;
+        const b = builder.nodes[right.index].extent;
+        assert(a.lanes == b.lanes);
+        if (a.components == b.components or b.components == 1) return a;
+        if (a.components == 1) return b;
+        return error.ShapeMismatch;
     }
 
     pub fn map_range(builder: *Builder, map: MapRange) Error!Id {
         try builder.check_known(map.input);
+        const extent = builder.nodes[map.input.index].extent;
         if (!std.math.isFinite(map.output_low)) return error.NotFinite;
         if (!std.math.isFinite(map.output_high)) return error.NotFinite;
         const input_width = map.input_high - map.input_low;
         if (input_width == 0) return error.InvalidRange;
         if (!std.math.isFinite(input_width)) return error.InvalidRange;
-        return builder.push(.{ .map_range = map });
+        return builder.push_shaped(.{ .map_range = map }, extent);
     }
 
     pub fn wave(builder: *Builder, source: Wave) Error!Id {
@@ -1127,7 +1222,7 @@ pub const Builder = struct {
     }
 
     pub fn tween(builder: *Builder, source: Tween) Error!Id {
-        if (source.previous) |previous| try builder.check_known(previous);
+        if (source.previous) |previous| try builder.check_scalar(previous);
         if (source.start.index >= builder.cue_table.count) return error.UnknownCue;
         if (!std.math.isFinite(source.from)) return error.NotFinite;
         if (!std.math.isFinite(source.to)) return error.NotFinite;
@@ -1168,7 +1263,7 @@ pub const Builder = struct {
 
     /// A spring chasing the signal `source.target`, as section 9 explains.
     pub fn chase(builder: *Builder, source: Chase) Error!Id {
-        try builder.check_known(source.target);
+        try builder.check_scalar(source.target);
         try builder.check_start();
         if (!std.math.isFinite(source.from)) return error.NotFinite;
         const law = try spring_law(source.time, source.overshoot);
@@ -1183,7 +1278,7 @@ pub const Builder = struct {
 
     /// A wave whose rate is the value of `source.rate` at each step, simulated (section 14).
     pub fn oscillator(builder: *Builder, source: Oscillator) Error!Id {
-        try builder.check_known(source.rate);
+        try builder.check_scalar(source.rate);
         try builder.check_start();
         if (std.math.isNan(source.phase)) return error.NotFinite;
         if (!(source.phase >= 0 and source.phase < 1)) return error.InvalidPhase;
@@ -1282,7 +1377,7 @@ pub const Builder = struct {
     pub fn close(builder: *Builder, delay_id: Id, input_id: Id) Error!void {
         assert(!builder.finished);
         try builder.check_known(delay_id);
-        try builder.check_known(input_id);
+        try builder.check_scalar(input_id);
         const node = &builder.nodes[delay_id.index];
         switch (node.op) {
             .delay => |*op| {
@@ -1331,7 +1426,7 @@ pub const Builder = struct {
     /// A gate on `source.input` at `source.level`, which fires an event at each crossing, as
     /// section 11 explains. It runs on the fixed step, so it needs the start cue.
     pub fn crossing(builder: *Builder, source: Crossing) Error!Id {
-        try builder.check_known(source.input);
+        try builder.check_scalar(source.input);
         try builder.check_start();
         if (!std.math.isFinite(source.level)) return error.NotFinite;
         return builder.push(.{ .crossing = source });
@@ -1410,23 +1505,37 @@ pub const Builder = struct {
         if (id.index >= builder.node_count) return error.UnknownNode;
     }
 
+    /// A node built so far whose output is one value, as every op but arithmetic, `map_range`,
+    /// and `pick` reads (section 15).
+    fn check_scalar(builder: *const Builder, id: Id) Error!void {
+        try builder.check_known(id);
+        if (builder.nodes[id.index].extent.components != 1) return error.ShapeMismatch;
+    }
+
     /// The parameter slots of a node whose parameters may come from `ids`, each a node built
     /// already, as section 14 explains.
     fn params_of(builder: *const Builder, ids: [3]?Id) Error![3]u32 {
         var result: [3]u32 = @splat(simulation.no_param);
         for (&result, ids) |*slot, maybe| {
             const id = maybe orelse continue;
-            try builder.check_known(id);
+            try builder.check_scalar(id);
             slot.* = id.index;
         }
         return result;
     }
 
     pub fn push(builder: *Builder, op: Op) Error!Id {
+        assert(builder.extent.components == 1);
+        return builder.push_shaped(op, builder.extent);
+    }
+
+    /// `push` with an output of `extent`.
+    fn push_shaped(builder: *Builder, op: Op, extent: Extent) Error!Id {
         assert(!builder.finished);
         assert(builder.slab_count <= builder.slab_count_max);
+        assert(extent.components >= 1 and extent.components <= components_max);
         if (builder.node_count == builder.nodes.len) return error.NodeCapacityExceeded;
-        const output_count = @as(u64, builder.extent.lanes) * builder.extent.components;
+        const output_count = @as(u64, extent.lanes) * extent.components;
         const count = output_count + op.cache_count(output_count);
         assert(count > 0);
         if (builder.slab_count + count > builder.slab_count_max) {
@@ -1436,7 +1545,7 @@ pub const Builder = struct {
         builder.nodes[id.index] = .{
             .op = op,
             .offset = builder.slab_count,
-            .extent = builder.extent,
+            .extent = extent,
         };
         builder.node_count += 1;
         builder.slab_count += @intCast(count);

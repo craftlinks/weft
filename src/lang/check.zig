@@ -60,6 +60,16 @@
 //!
 //! A client's nouns (step 14) are entries looked up after the table of primitives (`lookup`).
 //!
+//! ## 8. Shapes
+//! Every expression has a shape (step 16): a number, a vec2, a vec3, or a colour, three
+//! components in OKLab. `vec2`, `vec3`, and `oklab` pack scalar signals; `srgb` is a colour of
+//! numbers, converted at compile time. Arithmetic takes two equal shapes or one scalar, which it
+//! broadcasts; a colour and a vector never mix. A parameter takes one value unless the table marks
+//! it `shaped`: then `tween`'s ends, a path's goals and a motion's `from` may be a vector or a
+//! colour written in numbers (`Vector`), and `chase`'s target, `map`'s input, and a tween's
+//! `after` a shaped signal, and the call's shape is theirs. A vector path is one run a component.
+//! `.x .y .z` and `.l .a .b` read a component of a name bound to a vector or a colour.
+//!
 //! ## 7. TigerStyle Invariants
 //! - Every array is the caller's; a full one is an error naming its limit, and checking stops.
 //! - Names are found by a linear search over at most `Limits.names`, at compile time only.
@@ -81,10 +91,46 @@ const Diagnostics = error_module.List;
 const Code = error_module.Code;
 const time_module = @import("../core/time.zig");
 const noise_module = @import("../core/noise.zig");
+const colour_module = @import("../core/colour.zig");
 
 const flicks_per_second = time_module.flicks_per_second;
 
 pub const Span = struct { first: u32, count: u32 };
+
+/// A value's shape (section 8): 1 to 4 components, and whether it is a colour.
+pub const Shape = struct {
+    components: u8 = 1,
+    colour: bool = false,
+
+    pub const scalar: Shape = .{};
+
+    pub fn eql(a: Shape, b: Shape) bool {
+        return a.components == b.components and a.colour == b.colour;
+    }
+
+    /// The shape in a message: "a number", "a vec2", "a vec3", "a vec4", or "a colour".
+    pub fn noun(shape: Shape) []const u8 {
+        if (shape.colour) return "a colour";
+        return switch (shape.components) {
+            1 => "a number",
+            2 => "a vec2",
+            3 => "a vec3",
+            else => "a vec4",
+        };
+    }
+
+    /// The names of the components, as a vector's or a colour's outputs read them.
+    pub fn component_names(shape: Shape) []const []const u8 {
+        if (shape.colour) return &.{ "l", "a", "b" };
+        return (&[_][]const u8{ "x", "y", "z", "w" })[0..shape.components];
+    }
+};
+
+/// A vector or colour written as numbers, known at compile time: `vec2(0, 1)`, `srgb(1, 0.5, 0)`.
+pub const Vector = struct {
+    values: [4]f64,
+    shape: Shape,
+};
 
 pub const Value = union(enum) {
     absent,
@@ -111,6 +157,22 @@ pub const Value = union(enum) {
     /// An index into `Checked.calls`.
     mover: u32,
     seed: u64,
+    /// A vector or a colour of numbers, where a shaped parameter takes one (section 8).
+    vector: Vector,
+
+    /// The shape of a value: a vector's own, else one value.
+    pub fn shape(value: Value) Shape {
+        return if (value == .vector) value.vector.shape else Shape.scalar;
+    }
+
+    /// Component `k` of a value: a vector's, or a number broadcast.
+    pub fn component(value: Value, k: usize) f64 {
+        return switch (value) {
+            .vector => |vector| vector.values[k],
+            .number => |number| number,
+            else => unreachable,
+        };
+    }
 };
 
 pub const Call = struct {
@@ -126,6 +188,8 @@ pub const Expr = struct {
     b: u32 = 0,
     number: f64 = 0,
     item: u32,
+    /// What it evaluates to (section 8).
+    shape: Shape = .{},
 
     pub const Tag = enum {
         /// a: the call; b: the output.
@@ -138,6 +202,8 @@ pub const Expr = struct {
         binding,
         /// a: the track.
         track,
+        /// a: the expression; b: the component (section 8).
+        pick,
     };
 };
 
@@ -150,6 +216,9 @@ pub const Run = struct {
     first: u32,
     count: u32,
     declared: bool,
+    /// A path of vectors is one run a component, in order, and its first run holds the shape;
+    /// the others are scalar (section 8).
+    shape: Shape = .{},
 };
 
 pub const Track = struct {
@@ -600,6 +669,7 @@ const Checker = struct {
         }
         binding.fed = true;
         const expr = try checker.signal(it.a);
+        try checker.expect_scalar(it.a, expr, name);
         try checker.push_declaration(index, .{ .feed = .{ .binding = target, .expr = expr, .item = index } });
     }
 
@@ -657,7 +727,8 @@ const Checker = struct {
                 const name = checker.text(index);
                 if (checker.lookup(name, .signal)) |entry| {
                     const call = try checker.check_call(entry, index);
-                    return checker.push_expr(.{ .tag = .call, .a = call, .item = index });
+                    const shape = try checker.call_shape(call, index);
+                    return checker.push_expr(.{ .tag = .call, .a = call, .item = index, .shape = shape });
                 }
                 if (checker.find_module(name)) |module| return checker.expand_signal(module, index);
                 return checker.unknown_call(index);
@@ -670,7 +741,8 @@ const Checker = struct {
                     return checker.constant(if (it.tag == .add) a + b else a * b, index);
                 };
                 const tag: Expr.Tag = if (it.tag == .add) .add else .multiply;
-                return checker.push_expr(.{ .tag = tag, .a = left, .b = right, .item = index });
+                const shape = try checker.combine(index, left, right);
+                return checker.push_expr(.{ .tag = tag, .a = left, .b = right, .item = index, .shape = shape });
             },
             .subtract => {
                 const left = try checker.signal(it.a);
@@ -678,17 +750,18 @@ const Checker = struct {
                 if (checker.is_constant(right)) |b| {
                     if (checker.is_constant(left)) |a| return checker.constant(a - b, index);
                     const negative = try checker.constant(-b, it.b);
-                    return checker.push_expr(.{ .tag = .add, .a = left, .b = negative, .item = index });
+                    return checker.push_expr(.{ .tag = .add, .a = left, .b = negative, .item = index, .shape = checker.shape_of(left) });
                 }
+                const shape = try checker.combine(index, left, right);
                 const minus_one = try checker.constant(-1, index);
-                const negated = try checker.push_expr(.{ .tag = .multiply, .a = right, .b = minus_one, .item = it.b });
-                return checker.push_expr(.{ .tag = .add, .a = left, .b = negated, .item = index });
+                const negated = try checker.push_expr(.{ .tag = .multiply, .a = right, .b = minus_one, .item = it.b, .shape = checker.shape_of(right) });
+                return checker.push_expr(.{ .tag = .add, .a = left, .b = negated, .item = index, .shape = shape });
             },
             .negate => {
                 const operand = try checker.signal(it.a);
                 if (checker.is_constant(operand)) |a| return checker.constant(-a, index);
                 const minus_one = try checker.constant(-1, index);
-                return checker.push_expr(.{ .tag = .multiply, .a = operand, .b = minus_one, .item = index });
+                return checker.push_expr(.{ .tag = .multiply, .a = operand, .b = minus_one, .item = index, .shape = checker.shape_of(operand) });
             },
             .output => return checker.output(index, it.a, checker.text(index)),
             .list, .range, .goal, .named, .element => {
@@ -713,6 +786,10 @@ const Checker = struct {
             .name => entry: {
                 const base_name = checker.text(base_index);
                 const found = checker.find(base_name) orelse return checker.unknown_name(base_index, base_name);
+                const bound_to = checker.memory.bindings[found];
+                if (bound_to.kind == .signal and checker.shape_of(bound_to.index).components > 1) {
+                    return checker.component_of(index, try checker.signal_name(base_index, 0), output_name);
+                }
                 if (checker.memory.bindings[found].entry) |entry| break :entry entry;
                 const diagnostic = checker.fail_token(index, .unknown_output, "`{s}` has no output `{s}`", .{ base_name, output_name });
                 error_module.hint(diagnostic, "only a call such as `bounce` has outputs", .{});
@@ -729,6 +806,10 @@ const Checker = struct {
             },
         };
         const output_slot = entry.output(output_name) orelse {
+            if (base.tag == .call and entry.outputs.len == 0) {
+                const vector = try checker.signal(base_index);
+                if (checker.shape_of(vector).components > 1) return checker.component_of(index, vector, output_name);
+            }
             const diagnostic = checker.fail_token(index, .unknown_output, "{s} has no output `{s}`", .{ entry.name, output_name });
             if (entry.outputs.len > 0) {
                 error_module.hint(diagnostic, "its outputs are `position` and `{s}`", .{entry.outputs[0]});
@@ -745,7 +826,10 @@ const Checker = struct {
         const found = checker.find(name) orelse return checker.unknown_name(index, name);
         const binding = checker.memory.bindings[found];
         switch (binding.kind) {
-            .signal => return checker.push_expr(.{ .tag = .binding, .a = found, .b = output_index, .item = index }),
+            .signal => {
+                const shape = if (output_index == 0) checker.shape_of(binding.index) else Shape.scalar;
+                return checker.push_expr(.{ .tag = .binding, .a = found, .b = output_index, .item = index, .shape = shape });
+            },
             .track => return checker.push_expr(.{ .tag = .track, .a = binding.index, .item = index }),
             else => {
                 _ = checker.fail(index, .wrong_type, "`{s}` is a {s}, not a signal", .{ name, kind_name(binding.kind) });
@@ -1175,6 +1259,156 @@ const Checker = struct {
         return error.Checked;
     }
 
+    fn shape_of(checker: *const Checker, expr: u32) Shape {
+        return checker.memory.exprs[expr].shape;
+    }
+
+    /// The shape of `left` and `right` together (section 8): theirs when equal, the other's when
+    /// one is a number; a colour and a vector, or two vectors of different sizes, are refused.
+    fn combine(checker: *Checker, index: u32, left: u32, right: u32) Fail!Shape {
+        const a = checker.shape_of(left);
+        const b = checker.shape_of(right);
+        if (a.eql(b) or b.eql(Shape.scalar)) return a;
+        if (a.eql(Shape.scalar)) return b;
+        const diagnostic = checker.fail(index, .wrong_shape, "{s} and {s} do not go together", .{ a.noun(), b.noun() });
+        if (a.colour or b.colour) {
+            error_module.hint(diagnostic, "a colour's components are `.l .a .b`; take one to mix it with a vector", .{});
+        } else {
+            error_module.hint(diagnostic, "make them one size, or take a component such as `.x`", .{});
+        }
+        return error.Checked;
+    }
+
+    /// Refuses a vector or a colour where `name` takes one value (section 8).
+    fn expect_scalar(checker: *Checker, index: u32, expr: u32, name: []const u8) Fail!void {
+        const shape = checker.shape_of(expr);
+        if (shape.eql(Shape.scalar)) return;
+        const diagnostic = checker.fail(index, .wrong_shape, "`{s}` takes one value, found {s}", .{ name, shape.noun() });
+        error_module.hint(diagnostic, "take a component, such as `.{s}`", .{shape.component_names()[0]});
+        return error.Checked;
+    }
+
+    /// The shape of a call (section 8): what its shaped parameters hold, checked to agree.
+    fn call_shape(checker: *Checker, call: u32, index: u32) Fail!Shape {
+        const entry = checker.memory.calls[call].entry;
+        const values = checker.memory.values[checker.memory.calls[call].values..][0..entry.params.len];
+        switch (entry.op) {
+            .pack => return .{
+                .components = @intCast(entry.params.len),
+                .colour = std.mem.eql(u8, entry.name, "oklab"),
+            },
+            .srgb => return .{ .components = 3, .colour = true },
+            .tween => {
+                const shape = try checker.agree(index, values[0].shape(), values[1].shape(), "`from` and `to`");
+                if (values[5] == .signal) {
+                    const after = checker.shape_of(values[5].signal);
+                    if (!after.eql(shape)) {
+                        _ = checker.fail(index, .wrong_shape, "`after` is {s}, and this tween {s}", .{ after.noun(), shape.noun() });
+                        return error.Checked;
+                    }
+                }
+                return shape;
+            },
+            .spring, .newtonian => {
+                const path = checker.memory.paths[values[0].path].shape;
+                const from = values[1].shape();
+                // A path of numbers is one run, so a `from` with components has nowhere to go.
+                if (path.eql(Shape.scalar) and !from.eql(Shape.scalar)) {
+                    const diagnostic = checker.fail(index, .wrong_shape, "the goals are numbers, and `from` {s}", .{from.noun()});
+                    error_module.hint(diagnostic, "write the goals as {s}s too, or `from` as a number", .{from.noun()[2..]});
+                    return error.Checked;
+                }
+                return checker.agree(index, path, from, "the goals and `from`");
+            },
+            .chase => return checker.shape_of(values[0].signal),
+            .map => return checker.shape_of(values[0].signal),
+            else => return Shape.scalar,
+        }
+    }
+
+    /// Two shapes that must agree, a number broadcast to the other.
+    fn agree(checker: *Checker, index: u32, a: Shape, b: Shape, what: []const u8) Fail!Shape {
+        if (a.eql(b) or b.eql(Shape.scalar)) return a;
+        if (a.eql(Shape.scalar)) return b;
+        _ = checker.fail(index, .wrong_shape, "{s} differ: {s} and {s}", .{ what, a.noun(), b.noun() });
+        return error.Checked;
+    }
+
+    /// A vector or a colour written as numbers (section 8), or null for anything else: a call of
+    /// `vec2`, `vec3`, `oklab`, or `srgb` whose arguments are all number literals.
+    fn constant_vector(checker: *Checker, index: u32) Fail!?Vector {
+        if (checker.bound(index)) |arg| {
+            const saved = checker.frame;
+            checker.focus(arg.frame);
+            defer checker.focus(saved);
+            return checker.constant_vector(arg.item);
+        }
+        const it = checker.item(index);
+        if (it.tag != .call) return null;
+        const entry = checker.lookup(checker.text(index), .signal) orelse return null;
+        if (entry.op != .pack and entry.op != .srgb) return null;
+        const children = checker.tree.children(index);
+        if (children.len != entry.params.len) return null;
+        for (children) |child| if (checker.item(child).tag != .literal) return null;
+        var vector: Vector = .{ .values = @splat(0), .shape = .{
+            .components = @intCast(entry.params.len),
+            .colour = entry.op == .srgb or std.mem.eql(u8, entry.name, "oklab"),
+        } };
+        for (children, 0..) |child, at| vector.values[at] = try checker.literal_number(child, "a component");
+        if (entry.op == .srgb) {
+            for (vector.values[0..3]) |channel| if (!(channel >= 0 and channel <= 1)) {
+                const diagnostic = checker.fail(index, .out_of_range, "an sRGB channel is in [0, 1]", .{});
+                error_module.hint(diagnostic, "write each of r, g, and b from 0 to 1", .{});
+                return error.Checked;
+            };
+            const lab = colour_module.from_srgb(vector.values[0..3].*);
+            vector.values = .{ lab[0], lab[1], lab[2], 0 };
+        }
+        return vector;
+    }
+
+    /// A path of vectors (section 8): one run a component, in order, never shared.
+    fn vector_path(checker: *Checker, index: u32, goals: []const Goal, values: []const [4]f64, shape: Shape, declared: bool) Fail!u32 {
+        const count = shape.components;
+        if (goals.len * count > checker.memory.goals.len - checker.goal_count) {
+            return checker.limit(index, "goals", checker.memory.goals.len);
+        }
+        if (checker.path_count + count > checker.memory.paths.len) return checker.limit(index, "paths", checker.memory.paths.len);
+        const first_path = checker.path_count;
+        for (0..count) |k| {
+            const first = checker.goal_count;
+            for (goals, values, 0..) |goal, value, at| {
+                checker.memory.goals[first + at] = .{ .cue = goal.cue, .value = value[k] };
+            }
+            checker.goal_count += @intCast(goals.len);
+            checker.memory.paths[checker.path_count] = .{
+                .first = first,
+                .count = @intCast(goals.len),
+                .declared = declared,
+                .shape = if (k == 0) shape else Shape.scalar,
+            };
+            checker.path_count += 1;
+        }
+        return first_path;
+    }
+
+    /// `base.x`: a component of `vector`, a name or a call of a vector or a colour (section 8).
+    fn component_of(checker: *Checker, index: u32, vector: u32, output_name: []const u8) Fail!u32 {
+        const shape = checker.shape_of(vector);
+        for (shape.component_names(), 0..) |name, component| {
+            if (!std.mem.eql(u8, name, output_name)) continue;
+            return checker.push_expr(.{ .tag = .pick, .a = vector, .b = @intCast(component), .item = index });
+        }
+        const diagnostic = checker.fail_token(index, .unknown_output, "{s} has no component `{s}`", .{ shape.noun(), output_name });
+        const names = shape.component_names();
+        if (names.len == 2) {
+            error_module.hint(diagnostic, "its components are `.{s}` and `.{s}`", .{ names[0], names[1] });
+        } else {
+            error_module.hint(diagnostic, "its components are `.{s}`, `.{s}`, and `.{s}`", .{ names[0], names[1], names[2] });
+        }
+        return error.Checked;
+    }
+
     /// The seed of section 5, for the next seeded call of this declaration.
     fn derived_seed(checker: *Checker) u64 {
         const frame = &checker.memory.frames[checker.frame];
@@ -1195,8 +1429,11 @@ const Checker = struct {
         switch (param.kind) {
             .number => {
                 if (it.tag == .literal) return .{ .number = try checker.literal_number(index, "a number") };
+                if (param.shaped) if (try checker.constant_vector(index)) |vector| return .{ .vector = vector };
                 if (!param.live) return checker.not_live(entry, param, index);
-                return .{ .signal = try checker.signal(index) };
+                const expr = try checker.signal(index);
+                try checker.expect_scalar(index, expr, param.name);
+                return .{ .signal = expr };
             },
             .integer => {
                 const number = try checker.literal_number(index, "a whole number");
@@ -1209,7 +1446,9 @@ const Checker = struct {
             .time => {
                 if (it.tag == .literal) return .{ .time = try checker.literal_time(index) };
                 if (!param.live) return checker.not_live(entry, param, index);
-                return .{ .signal = try checker.signal(index) };
+                const expr = try checker.signal(index);
+                try checker.expect_scalar(index, expr, param.name);
+                return .{ .signal = expr };
             },
             .frequency => {
                 if (it.tag != .literal or checker.tree.tokens[it.token].tag != .frequency) {
@@ -1221,7 +1460,11 @@ const Checker = struct {
                 const number = parse_float(digits) orelse return checker.bad_number(index);
                 return .{ .frequency = if (it.a == 1) -number else number };
             },
-            .signal => return .{ .signal = try checker.signal(index) },
+            .signal => {
+                const expr = try checker.signal(index);
+                if (!param.shaped) try checker.expect_scalar(index, expr, param.name);
+                return .{ .signal = expr };
+            },
             .cue => return .{ .cue = try checker.cue_of(index) },
             .cues => {
                 if (it.tag == .name) {
@@ -1233,8 +1476,12 @@ const Checker = struct {
                 return .{ .span = .{ .first = try checker.cue_of(index), .count = 1 } };
             },
             .path => {
-                if (it.tag == .list) return .{ .path = try checker.path_of(index, false) };
-                return .{ .path = try checker.named_of(index, .path) };
+                const path = if (it.tag == .list) try checker.path_of(index, false) else try checker.named_of(index, .path);
+                if (!param.shaped and !checker.memory.paths[path].shape.eql(Shape.scalar)) {
+                    _ = checker.fail(index, .wrong_shape, "`{s}` takes a path of numbers, found one of {s}s", .{ param.name, checker.memory.paths[path].shape.noun()[2..] });
+                    return error.Checked;
+                }
+                return .{ .path = path };
             },
             .regions => {
                 if (it.tag == .list) return .{ .regions = try checker.region_list(index, false) };
@@ -1371,7 +1618,9 @@ const Checker = struct {
         }
         if (children.len > run_max) return checker.limit(index, "goals in one path", run_max);
         var buffer: [run_max]Goal = undefined;
+        var values: [run_max][4]f64 = undefined;
         const fresh = buffer[0..children.len];
+        var shape: ?Shape = null;
         for (children, fresh, 0..) |child, *goal, at| {
             const it = checker.item(child);
             if (it.tag != .goal) {
@@ -1380,16 +1629,31 @@ const Checker = struct {
                 return error.Checked;
             }
             const cue_index = try checker.cue_of(it.a);
-            const goal_value = try checker.literal_number(it.b, "a goal's value");
+            var goal_shape = Shape.scalar;
+            if (try checker.constant_vector(it.b)) |vector| {
+                values[at] = vector.values;
+                goal_shape = vector.shape;
+            } else {
+                values[at][0] = try checker.literal_number(it.b, "a goal's value");
+            }
+            if (shape) |first| if (!first.eql(goal_shape)) {
+                _ = checker.fail(it.b, .wrong_shape, "this goal is {s}, and the path's first goal {s}", .{ goal_shape.noun(), first.noun() });
+                return error.Checked;
+            };
+            shape = goal_shape;
             if (at > 0 and cue_index <= fresh[at - 1].cue) {
                 const diagnostic = checker.fail(child, .cue_out_of_order, "a path's goals are in cue order, each at a later cue", .{});
                 error_module.hint(diagnostic, "move this goal before the goals at later cues", .{});
                 return error.Checked;
             }
-            goal.* = .{ .cue = cue_index, .value = goal_value };
+            goal.* = .{ .cue = cue_index, .value = values[at][0] };
         }
+        const path_shape = shape.?;
+        if (path_shape.components > 1) return checker.vector_path(index, fresh, values[0..fresh.len], path_shape, declared);
         if (!declared) {
             for (checker.memory.paths[0..checker.path_count], 0..) |run, at| {
+                // A vector path's first run holds its shape, so it is never a path of numbers.
+                if (!run.shape.eql(Shape.scalar)) continue;
                 if (same_goals(checker.memory.goals[run.first..][0..run.count], fresh)) return @intCast(at);
             }
         }

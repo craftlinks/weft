@@ -137,6 +137,7 @@ zig build test-cli                  # the weft command's output against its gold
 src/
   weft.zig            the library root
   core/
+    colour.zig        OKLab and sRGB, both ways, and a gamut map for drawing
     cue.zig           Cues: a sorted, bounded table of times
     ease.zig          Ease: cubic Bezier curves, with a bounded solver
     elementary.zig    sine and cosine in turns, exp, and log, the same bits on every target
@@ -170,6 +171,7 @@ test/
   lang.zig            the catalog's graphs as text, which compile to its nodes
   modules.zig         modules against the same graphs written by hand
   carry.zig           a recompile's carried reader against a fresh one, bit for bit
+  vectors.zig         vectors and colours against the scalar files they stand for
   cli.zig             the weft command's output against its goldens, and a client's nouns
   golden/signals.txt  the committed samples
   golden/cli/         the weft command's committed output
@@ -604,6 +606,37 @@ compiled.compile_with(&.{.{ .name = "std", .text = weft.lang.std_library }}, sou
 - **A declared range**, `in lo..hi`, is checked after the build for an instance bound to a name.
 - **Errors** inside a library's module are reported on the file's call.
 
+## Vectors and Colour
+
+A value has a shape: a number, a `vec2`, a `vec3`, or a colour, three components in OKLab. Two
+pure ops carry shapes through the graph, `pack`, scalars into one value, and `pick`, one component
+out, and arithmetic and `map` work per component, a number broadcast across the others:
+
+```txt
+cue c0 = 0s
+cue c1 = 2s
+path = [c0: vec2(0.2, 0.8), c1: vec2(0.9, 0.3)]
+dot = spring(path, from: vec2(0, 0), time: 0.6s, overshoot: 0.3)
+sway = vec2(noise(smooth, 0.5hz), noise(smooth, 0.5hz)) * 0.1
+place = dot + sway                       # a vec2
+height = place.y                         # a number
+sweep = tween(from: srgb(0.95, 0.35, 0.2), to: srgb(0.2, 0.45, 0.95), at: c0, over: 4s)
+light = sweep.l * 2                      # a colour's components are .l .a .b
+```
+
+- **A moving vector** is one scalar node a component, then a pack: a `vec2` spring reads exactly
+  what two scalar springs read, bit for bit, and no motion op knows about vectors. `tween`'s ends,
+  a path's goals and `from`, and `chase`'s target take a vector or a colour of one shape.
+- **Colour** is OKLab, converted only at the two edges: `srgb(r, g, b)` at compile time, and a
+  client's read, through `weft.colour.to_srgb`, which keeps the lightness and hue and lowers the
+  chroma until the colour fits the sRGB gamut. So a tween between two colours is a straight line
+  through OKLab, which neither darkens nor greys in the middle, and a spring that overshoots still
+  draws.
+- **Shapes are checked** where they are used: a parameter that takes a number takes a number,
+  arithmetic takes equal shapes or a number, and a colour and a vector never mix, each with an
+  error that says so (`wrong_shape`). `describe` marks the parameters that take a shape, and
+  `sample` writes a vector's value as an array of its components.
+
 ## The weft Command
 
 `zig build` installs `zig-out/bin/weft`, the tool an agent uses in place of watching motion. It
@@ -661,9 +694,9 @@ numbers depend on the machine, so it has no thresholds and is not part of `test`
 
 ## Play
 
-Play is Weft's first client: a Patchwork app with four pages on one 600 s clock. Its signals are
-text, `play/signals.weft` and `play/bouncers.weft`, compiled at start, and the first can be
-edited while it runs.
+Play is Weft's first client: a Patchwork app with five pages on one 600 s clock. Its signals are
+text, `play/signals.weft`, `play/bouncers.weft`, and `play/vectors.weft`, compiled at start, and
+the first can be edited while it runs.
 
 - **scope** plots eight signals, one or more of each class but live, over a window from one second
   before the playhead to three after it, with each signal's range, its goal where it has one, the
@@ -693,8 +726,12 @@ edited while it runs.
   knob is dragged, its value is a preview from the playhead on, under a millisecond a step; the
   release rewrites the history once, which runs a simulated program's steps again: about 10 ms
   at 60 s, 90 ms at 600 s.
+- **vectors** runs a pure program of its own: a `vec2` spring through four goals, swaying by two
+  packed noises, drawn on a plane with its trail over the window, and three colours as strips over
+  the window: a colour tween, a colour spring whose overshoot leaves the sRGB gamut and is mapped
+  back, and an OKLab colour whose a and b are noises. The dot takes the colour spring's colour.
 
-Space or the play button plays and pauses, the page button cycles the pages and 1 to 4 go to
+Space or the play button plays and pauses, the page button cycles the pages and 1 to 5 go to
 each, the slider scrubs, Home and End go to the ends, Left and Right step 100 ms, and Page Up and
 Page Down 10 s.
 
@@ -716,6 +753,6 @@ own package still has no dependencies.
 
 **The two-file rule.** Only `play/signals.zig`, the signal table, and `play/glue.zig` import
 `weft`. Everything else in Play (`app.zig`, `scope.zig`, `patch.zig`, `shapes.zig`,
-`bouncers.zig`) draws plain numbers: the glue hands time over as a `Clock`, and the samples,
+`bouncers.zig`, `vectors.zig`) draws plain numbers: the glue hands time over as a `Clock`, and the samples,
 events, ranges, classes, and report as `f32` arrays and plain structs. The glue has a budget of
 60 lines of code; growing past it says the boundary or Weft's API is wrong.

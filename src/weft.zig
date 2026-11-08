@@ -17,6 +17,7 @@
 //! - Everything here is realtime-safe: no allocation, no locks, no unbounded work.
 //! - A sampled signal has the same bits on native and wasm, which `zig build regress` enforces.
 
+pub const colour = @import("core/colour.zig");
 pub const cue = @import("core/cue.zig");
 pub const ease = @import("core/ease.zig");
 pub const elementary = @import("core/elementary.zig");
@@ -36,6 +37,8 @@ pub const Cue = cue.Cue;
 pub const Cues = cue.Cues;
 pub const Ease = ease.Ease;
 pub const Builder = graph.Builder;
+pub const Pack = graph.Pack;
+pub const Pick = graph.Pick;
 pub const Bounce = graph.Bounce;
 pub const Chase = graph.Chase;
 pub const Class = range.Class;
@@ -78,6 +81,7 @@ pub const Shape = wave.Shape;
 pub const Wave = wave.Wave;
 
 test {
+    _ = colour;
     _ = cue;
     _ = ease;
     _ = elementary;

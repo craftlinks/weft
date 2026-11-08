@@ -148,7 +148,7 @@ test "the builder refuses a noise it cannot evaluate" {
 test "a noise loops over the extent of its node" {
     var nodes: [1]Node = undefined;
     var builder = Builder.init(&nodes, .{ .slab_count_max = 6 });
-    builder.extent = .{ .lanes = 3, .components = 2 };
+    builder.extent = .{ .lanes = 6, .components = 1 };
     const source: Noise = .{ .shape = .smooth, .hz = 2, .seed = 4 };
     const noise = try builder.noise(source);
     var slab: [6]f64 = undefined;

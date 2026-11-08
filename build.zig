@@ -38,6 +38,12 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "weft", .module = weft }},
         }),
         b.createModule(.{
+            .root_source_file = b.path("test/vectors.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "weft", .module = weft }},
+        }),
+        b.createModule(.{
             .root_source_file = b.path("test/lang.zig"),
             .target = target,
             .optimize = optimize,

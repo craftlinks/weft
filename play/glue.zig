@@ -80,6 +80,13 @@
 //! at t give each lane's ends and its ball, so a lane is a polyline from its start through a
 //! corner at each hit to its end, which is the signal, since a bounce is linear between hits.
 //! Nothing is stored between frames, so a scrub re-derives every hit from the graph.
+//!
+//! ## 7. Vectors and Colours
+//! The vectors page reads `Vectors` (`signals.zig`, section 7), pure and closed form, on a reader
+//! with no checkpoints: `vector_samples` evals over the scope's window, each giving the place, a
+//! vec2, and the three colours, OKLab, which cross as sRGB through `weft.colour.to_srgb`, so the
+//! app gets bytes it can draw and never sees OKLab. Then one eval at t gives the dot and the
+//! swatches. The goals cross as points, with the index of the last one whose cue is at or before t.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -181,6 +188,24 @@ pub const Hits = struct {
 
 pub const Report = struct { seekable: bool, stepped: bool, first: ?usize };
 
+pub const vector_samples = 128;
+pub const colour_count = signals.colour_count;
+pub const colour_names = signals.colour_names;
+pub const vector_goal_count = signals.vector_goal_count;
+
+/// The vectors page at one time (section 7), in sRGB and plain points.
+pub const Vectors = struct {
+    /// The place over the window, then at t.
+    trail: [vector_samples][2]f32,
+    head: [2]f32,
+    /// Each colour over the window, then at t.
+    colours: [colour_count][vector_samples][3]f32,
+    swatches: [colour_count][3]f32,
+    goals: [vector_goal_count][2]f32,
+    /// The last goal whose cue is at or before t, or null before the first.
+    goal: ?usize,
+};
+
 /// What a recompile did (section 3b).
 pub const Outcome = enum { invalid, fresh, carried };
 
@@ -211,6 +236,10 @@ pub const Motion = struct {
     bouncer_slab: [signals.bouncer_node_count]f64,
     bouncer_reader: weft.State,
     bouncer_report: Report,
+    vectors: signals.Vectors,
+    vector_slab: [signals.vector_slab_count]f64,
+    vector_reader: weft.State,
+    vector_report: Report,
 
     /// Builds the program and starts both readers fresh (section 3a).
     pub fn build(motion: *Motion) void {
@@ -235,6 +264,35 @@ pub const Motion = struct {
             .stepped = plain.stepped,
             .first = null,
         };
+        motion.vectors.build();
+        motion.vector_reader = .init(motion.vectors.program, &motion.vector_slab);
+        const vector_plain = motion.vectors.program.report();
+        motion.vector_report = .{ .seekable = vector_plain.seekable, .stepped = vector_plain.stepped, .first = null };
+    }
+
+    /// The vectors page at `clock` (section 7).
+    pub fn sample_vectors(motion: *Motion, clock: Clock, out: *Vectors) void {
+        const reader = &motion.vector_reader;
+        const vectors = &motion.vectors;
+        const start = clock.t.flicks - signals.ms(before_ms).flicks;
+        const span = signals.ms(before_ms + after_ms).flicks;
+        for (0..vector_samples + 1) |i| {
+            const offset = @divFloor(span * @as(i64, @intCast(i)), vector_samples - 1);
+            reader.eval(.{ .flicks = if (i == vector_samples) clock.t.flicks else start + offset });
+            const place = reader.values(vectors.place);
+            const point = if (i == vector_samples) &out.head else &out.trail[i];
+            point.* = .{ @floatCast(place[0]), @floatCast(place[1]) };
+            for (vectors.colours, 0..) |id, c| {
+                const srgb = weft.colour.to_srgb(reader.values(id)[0..3].*);
+                const colour = if (i == vector_samples) &out.swatches[c] else &out.colours[c][i];
+                for (colour, srgb) |*channel, value| channel.* = @floatCast(value);
+            }
+        }
+        out.goal = null;
+        for (vectors.goals, vectors.goal_times, &out.goals, 0..) |goal, time, *point, index| {
+            point.* = .{ @floatCast(goal[0]), @floatCast(goal[1]) };
+            if (time.flicks <= clock.t.flicks) out.goal = index;
+        }
     }
 
     /// Compiles `text` into the spare file and, if it compiles, runs it from `clock` on: its

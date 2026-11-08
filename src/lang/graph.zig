@@ -25,7 +25,16 @@
 //! A builder error becomes a diagnostic on the argument it is about, with the parameter's domain,
 //! and stops the back end, since later nodes may read the one refused.
 //!
-//! ## 5. TigerStyle Invariants
+//! ## 6. Vectors
+//! The core's vector nodes are only `pack` and `pick`, and its per-component arithmetic and map
+//! (`graph.zig`, section 15). So a vector tween, spring, Newtonian move, or chase is built as one
+//! scalar node a component, each from that component's ends, goals, or target, then packed: two
+//! scalar springs side by side read exactly what a `vec2` spring reads. A component of a vector
+//! is the pack's own input where the vector is a pack, and a `pick` otherwise. An `srgb` colour is
+//! converted to OKLab here, three constants packed. A vector motion records no goal source, so a
+//! client draws no goal for it.
+//!
+//! ## 7. TigerStyle Invariants
 //! - Every table is the caller's and sized by `Limits`; the checker already refused what would
 //!   not fit, except the node array and the slab, whose refusals are errors naming their limit.
 //! - The recursion over expressions follows the tree, whose depth the parser bounds.
@@ -55,6 +64,7 @@ const Sample = @import("../core/recording.zig").Sample;
 const wave = @import("../core/wave.zig");
 const noise = @import("../core/noise.zig");
 const Ease = @import("../core/ease.zig").Ease;
+const colour = @import("../core/colour.zig");
 
 const flicks_per_second = time_module.flicks_per_second;
 
@@ -166,6 +176,10 @@ const Back = struct {
                 if (expr.b == 0) return ids;
                 return .{ .first = ids.second.? };
             },
+            .pick => {
+                const vector = (try back.eval(expr.a)).first;
+                return .{ .first = try back.component(vector, @intCast(expr.b), expr.item) };
+            },
             .track => {
                 if (back.memory.track_nodes[expr.a]) |id| return .{ .first = id };
                 const id = try back.attempt(back.builder.track(.{ .index = expr.a }), expr.item, null);
@@ -191,8 +205,24 @@ const Back = struct {
                 const b = back.initial_of(expr.b, depth + 1) orelse return null;
                 return if (expr.tag == .add) a + b else a * b;
             },
-            .call => null,
+            .call, .pick => null,
         };
+    }
+
+    /// Component `k` of a vector node: a pack's own input, or a pick (section 6).
+    fn component(back: *Back, id: Id, k: u8, item: u32) Fail!Id {
+        switch (back.builder.nodes[id.index].op) {
+            .pack => |packed_ids| {
+                assert(k < packed_ids.count);
+                return packed_ids.inputs[k];
+            },
+            else => return back.attempt(back.builder.pick(id, k), item, null),
+        }
+    }
+
+    /// Packs one node a component, built by `each`, into a vector (section 6).
+    fn pack(back: *Back, ids: []const Id, item: u32, call: u32) Fail!Ids {
+        return .{ .first = try back.attempt(back.builder.pack(ids), item, call) };
     }
 
     const Param = struct { fixed: f64, from: ?Id };
@@ -257,7 +287,43 @@ const Back = struct {
                 };
                 return .{ .first = try back.attempt(builder.noise(source), item, call) };
             },
+            .pack => {
+                var ids: [graph.components_max]Id = undefined;
+                for (v[0..entry.params.len], ids[0..entry.params.len]) |value, *id| id.* = try back.signal_id(value);
+                return back.pack(ids[0..entry.params.len], item, call);
+            },
+            .srgb => {
+                for (v[0..3], 0..) |value, at| if (!(value.number >= 0 and value.number <= 1)) {
+                    const diagnostic = back.fail(checked.call_value_items(call)[at], .out_of_range, "an sRGB channel is in [0, 1]", .{});
+                    error_module.hint(diagnostic, "write each of r, g, and b from 0 to 1", .{});
+                    return error.Refused;
+                };
+                const lab = colour.from_srgb(.{ v[0].number, v[1].number, v[2].number });
+                var ids: [3]Id = undefined;
+                for (&ids, lab) |*id, value| id.* = try back.attempt(builder.constant(value), item, call);
+                return back.pack(&ids, item, call);
+            },
             .tween => {
+                const components = @max(v[0].shape().components, v[1].shape().components);
+                if (components > 1) {
+                    const after: ?Id = if (v[5] == .signal) try back.signal_id(v[5]) else null;
+                    var ids: [graph.components_max]Id = undefined;
+                    for (ids[0..components], 0..) |*id, k| {
+                        const source: graph.Tween = .{
+                            .from = v[0].component(k),
+                            .to = v[1].component(k),
+                            .start = .{ .index = v[2].cue },
+                            .duration = .{ .flicks = v[3].time },
+                            .ease = switch (v[4]) {
+                                .cubic => |points| .{ .x1 = points[0], .y1 = points[1], .x2 = points[2], .y2 = points[3] },
+                                else => ease_of(v[4].word),
+                            },
+                            .previous = if (after) |vector| try back.component(vector, @intCast(k), item) else null,
+                        };
+                        id.* = try back.attempt(builder.tween(source), item, call);
+                    }
+                    return back.pack(ids[0..components], item, call);
+                }
                 const previous: ?Id = if (v[5] == .signal) try back.signal_id(v[5]) else null;
                 const source: graph.Tween = .{
                     .from = v[0].number,
@@ -273,6 +339,21 @@ const Back = struct {
                 return .{ .first = try back.attempt(builder.tween(source), item, call) };
             },
             .spring => {
+                const components = checked.paths[v[0].path].shape.components;
+                if (components > 1) {
+                    var ids: [graph.components_max]Id = undefined;
+                    for (ids[0..components], 0..) |*id, k| {
+                        const source: motion.Spring = .{
+                            .goals = back.memory.paths[v[0].path + k],
+                            .from = v[1].component(k),
+                            .time = .{ .flicks = v[2].time },
+                            .overshoot = v[3].number,
+                        };
+                        id.* = try back.attempt(builder.spring(source), item, call);
+                    }
+                    back.goal = .none;
+                    return back.pack(ids[0..components], item, call);
+                }
                 const source: motion.Spring = .{
                     .goals = back.memory.paths[v[0].path],
                     .from = v[1].number,
@@ -283,6 +364,22 @@ const Back = struct {
                 return .{ .first = try back.attempt(builder.spring(source), item, call) };
             },
             .newtonian => {
+                const components = checked.paths[v[0].path].shape.components;
+                if (components > 1) {
+                    var ids: [graph.components_max]Id = undefined;
+                    for (ids[0..components], 0..) |*id, k| {
+                        const source: motion.Newtonian = .{
+                            .goals = back.memory.paths[v[0].path + k],
+                            .from = v[1].component(k),
+                            .speed = v[2].number,
+                            .accel = v[3].number,
+                            .decel = v[4].number,
+                        };
+                        id.* = try back.attempt(builder.newtonian(source), item, call);
+                    }
+                    back.goal = .none;
+                    return back.pack(ids[0..components], item, call);
+                }
                 const source: motion.Newtonian = .{
                     .goals = back.memory.paths[v[0].path],
                     .from = v[1].number,
@@ -297,6 +394,23 @@ const Back = struct {
                 const target = try back.signal_id(v[0]);
                 const time = try back.live_time(v[2]);
                 const overshoot = try back.live_number(v[3], 0, valid_overshoot);
+                const components = builder.nodes[target.index].extent.components;
+                if (components > 1) {
+                    var ids: [graph.components_max]Id = undefined;
+                    for (ids[0..components], 0..) |*id, k| {
+                        const source: graph.Chase = .{
+                            .target = try back.component(target, @intCast(k), item),
+                            .from = v[1].number,
+                            .time = time.fixed,
+                            .overshoot = overshoot.fixed,
+                            .time_from = time.from,
+                            .overshoot_from = overshoot.from,
+                        };
+                        id.* = try back.attempt(builder.chase(source), item, call);
+                    }
+                    back.goal = .none;
+                    return back.pack(ids[0..components], item, call);
+                }
                 const source: graph.Chase = .{
                     .target = target,
                     .from = v[1].number,
@@ -462,6 +576,7 @@ const Back = struct {
                 .{ .param = "", .message = "this runs on the fixed step from a start cue, and the file has no cue", .hint = "declare one, such as `cue c0 = 0s`" },
             error.NotFinite => .{ .param = "", .message = "a value is infinite or not a number" },
             error.InvalidEase => .{ .param = "ease", .message = "a cubic ease's x1 and x2 must be in [0, 1]" },
+            error.ShapeMismatch => .{ .param = "", .message = "the shapes of its values do not fit together" },
             else => .{ .param = "", .message = "the builder refused this call" },
         };
         const target = if (call) |index| back.param_item(index, at.param) else item;
