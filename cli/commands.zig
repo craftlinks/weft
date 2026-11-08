@@ -20,7 +20,8 @@
 //! come from one more fresh reader. A vector or a colour (step 16) has `"components"` and each
 //! value is an array of them, OKLab for a colour; a signal of many lanes (step 17) has `"lanes"`
 //! and each value is an array of its lanes. A number has none of these, so a file of numbers
-//! samples as it did before vectors.
+//! samples as it did before vectors. Each event has its time in flicks, its source node, and its
+//! instance, the lane, then the name bound to its source, where one is, and its value (step 18).
 //!
 //! ## 4. TigerStyle Invariants
 //! - No allocation: every buffer is a file-scope variable, sized by the constants below.
@@ -91,9 +92,13 @@ pub fn check(compiled: *Compiled, writer: *std.Io.Writer, source: Source, librar
     };
     const program = compiled.program;
     const report = program.report();
-    try writer.print("ok: {d} nodes, {d} cues, {d} tracks, {s}, {s}\n", .{
+    // Every count a client's `Limits` must hold, beside the nodes (step 18).
+    try writer.print("ok: {d} nodes, a slab of {d}, {d} cues, {d} goals, {d} regions, {d} tracks, {s}, {s}\n", .{
         program.nodes.len,
+        program.slab_count,
         compiled.checked.cue_times.len,
+        compiled.checked.goals.len,
+        compiled.checked.regions.len,
         compiled.checked.tracks.len,
         if (report.seekable) "seekable" else "live",
         if (report.stepped) "stepped" else "closed form",
@@ -307,14 +312,30 @@ pub fn sample(
     const found = state.events(.{ .flicks = window.from }, .{ .flicks = window.to }, &events);
     for (events[0..found.count], 0..) |event, at| {
         if (at > 0) try writer.writeAll(",");
-        try writer.print("{{\"t\":{d},\"source\":{d},\"instance\":{d}}}", .{
+        try writer.print("{{\"t\":{d},\"source\":{d},\"instance\":{d}", .{
             event.time.flicks,
             event.source.index,
             event.instance,
         });
+        if (source_name(compiled, event.source)) |name| {
+            try writer.writeAll(",\"name\":");
+            try json_string(writer, name);
+        }
+        try writer.writeAll(",\"value\":");
+        try json_number(writer, event.value);
+        try writer.writeAll("}");
     }
     try writer.writeAll("]}\n");
     return true;
+}
+
+/// The name of the signal whose node fired an event, if a name is bound to it (step 18).
+fn source_name(compiled: *const Compiled, source: weft.Id) ?[]const u8 {
+    for (compiled.checked.bindings, 0..) |binding, index| {
+        if (binding.kind != .signal) continue;
+        if (compiled.ids[index].first.index == source.index) return binding.name;
+    }
+    return null;
 }
 
 /// The top-level signals of the file, in text order.

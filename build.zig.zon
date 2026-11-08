@@ -1,6 +1,6 @@
 .{
     .name = .weft,
-    .version = "0.0.1",
+    .version = "0.1.0",
     .fingerprint = 0xfd7f37f63839ab34,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{},

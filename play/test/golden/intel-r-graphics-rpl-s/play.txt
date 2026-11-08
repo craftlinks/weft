@@ -9,8 +9,8 @@ bouncers_590   2135385fc7557807
 bouncers_play  b5543272e83344f1
 knob           0d81e2258de9d489
 knob_600       4e7912e181048932
-lanes          05778a1aebb96072
-lanes_play     4ea8e605ed5daeff
+lanes          abb18fda48b5cdf1
+lanes_play     75a2990db8be5842
 play           621dfa8a554fe42a
 play_590       69045c337b3086a4
 repoint        3249658ce9b5af8c
@@ -19,6 +19,8 @@ scrub_back     4f01998debf6b2e7
 shapes         171d1ad281a43485
 shapes_play    00b35977db4fd287
 still          1140d082224616d1
+swarm          9d5da36921e31b07
+swarm_play     40f084b896dd4316
 text           4711ecc915874f09
 text_600       8ca36e9df63343eb
 text_edit      6ed0abf0ac952092

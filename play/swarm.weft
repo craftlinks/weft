@@ -1,0 +1,10 @@
+# Play's swarm: forty-eight dots wander a square, each a follower of its own x and y, each trailed by
+# a ghost that chases it a beat behind, and a ring lights on each while its x is past the gate line.
+seed 29
+cue c0 = 0s
+wander_x = lanes(48, follow([-1..1], by: spring(time: 0.7s, overshoot: 0.2), pause: 0s..800ms))
+wander_y = lanes(48, follow([-1..1], by: spring(time: 0.7s, overshoot: 0.2), pause: 0s..800ms))
+place = vec2(wander_x, wander_y)
+ghost = vec2(chase(wander_x, time: 0.4s), chase(wander_y, time: 0.4s))
+tint = lanes(48, oklab(0.74, noise(smooth, 0.1hz) * 0.13, noise(smooth, 0.1hz) * 0.13))
+gate = crossing(wander_x, level: 0.25, direction: rising)

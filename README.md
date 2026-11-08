@@ -105,9 +105,29 @@ always gives the same answer.
 
 ## Where to Read Next
 
-Every source file opens with a guide for reviewers. Start with `src/weft.zig`, then the guide at
-the top of `src/core/graph.zig`, which holds the graph's layout and most of the rules above. The
-sections below show each part in use.
+Every source file opens with a guide for reviewers, which `test/rules.zig` checks. Start with
+`src/weft.zig`, then the guide at the top of `src/core/graph.zig`, which holds the graph's layout
+and most of the rules above. The sections below show each part in use. An agent new to Weft
+starts with [`docs/agents.md`](docs/agents.md): how to learn the toolbox from `weft describe`,
+the language on one page, how a Play page is put together, and how to add a primitive.
+
+## What v0.1 Promises
+
+v0.1 means a client can depend on these, not that Weft is finished. Within 0.1, a change to any of
+them is a bug or a new minor version, named in this README:
+
+- **The library's exports**, `src/weft.zig`: `Builder` and its calls, `Program`, `State` and its
+  `eval`, `events`, `values`, `extent`, `set_input`, `record`, and `adopt`, the op structs, `Cues`,
+  `Goals`, `Regions`, `Tracks`, `Time`, `Rate`, `Event`, and `weft.colour`.
+- **The language**: every call and parameter `weft describe` lists, the syntax, the canonical
+  format, and the seeds a file's names derive, so a file samples the same values in every 0.1.
+- **The command line's JSON**: the fields of `describe`, `sample`, and `parse --json`. A new field
+  may appear; none is renamed or removed.
+- **The rules**: every frame a function of t, no allocation, lock, or I/O in `src/core` and
+  `src/lang`, and the same bits on native and wasm.
+
+Not promised: anything a file of `src/core` or `src/lang` does not export, the layout of the slab
+and the node array, `Limits`' defaults, diagnostics' wording, Play, and the bench's numbers.
 
 ## Requirements
 
@@ -173,6 +193,7 @@ test/
   carry.zig           a recompile's carried reader against a fresh one, bit for bit
   vectors.zig         vectors and colours against the scalar files they stand for
   lanes.zig           lanes in the language against the builder's region, and the lane errors
+  rules.zig           every file's guide, and no allocator, thread, lock, or I/O in the library
   cli.zig             the weft command's output against its goldens, and a client's nouns
   golden/signals.txt  the committed samples
   golden/cli/         the weft command's committed output
@@ -182,6 +203,8 @@ tools/
   regress_wasm.zig    the catalog on wasm32-freestanding
   regress_wasm.mjs    runs that module under Node and prints its text
 play/                 a package of its own: the Play app, on Weft and Patchwork
+docs/
+  agents.md           for an agent new to Weft: the toolbox, the language, a Play page, a primitive
 ```
 
 Every file starts with a guide for reviewers: `//! … # Deep Architectural Guide for Reviewers:`.
@@ -730,13 +753,42 @@ frame; that graph from a fresh state, the first eval at 60 s and at 600 s; a bou
 frame's eval, which is what a knob costs from now on; a compile of Play's `signals.weft`; a
 compile of modules nested 8 deep, 511 instances; and a region of a noise, a staggered tween, a
 map, a product, and a staggered bounce at 1,000 and 100,000 lanes, an eval and a frame's events
-per frame. It is native only and needs no GPU. Its numbers depend on the machine, so it has no
-thresholds and is not part of `test` or `regress`.
+per frame; each op's cost a node, 64 nodes of it playing at 60 Hz; a seek back from 600 s with
+checkpoints; a pure edit of Play's file at 600 s, compiled, carried, and read; and a reader on its
+own thread at audio pace, a block's events and an eval every 2.667 ms for 5 s, for Play's file
+and the lanes page, with its worst block and the blocks over budget. It is native only and needs
+no GPU. Its numbers depend on the machine, so it has no thresholds and is not part of `test` or
+`regress`; the Costs section records them at step 18.
+
+## Costs
+
+Measured with `zig build bench -Doptimize=ReleaseFast` on an i5-13600K, at step 18. A frame at
+60 Hz has 16.7 ms; an audio block of 128 frames at 48 kHz has 2.667 ms.
+
+| What | Cost |
+| --- | --- |
+| A node a frame at 60 Hz, pure: constant, track, cues, map, add, multiply | 2 to 3 ns |
+| … wave, tween, Newtonian move, spring, noise, bounce | 6, 10, 14, 22, 20, and 27 ns |
+| … simulated, with its 8 steps a frame: crossing, delay, shift, oscillator, chase, follower | 41, 52, 94, 105, 181, and 235 ns |
+| A lane, in a region of a noise, a staggered tween, a map, a product, and a bounce | 25 to 44 ns a frame |
+| 1,000 and 100,000 such lanes, an eval | 44 µs and 2.5 ms |
+| Play's simulated file (21 nodes) from cold, the first eval at 60 s and at 600 s | 3.4 ms and 34 ms |
+| The same reader, checkpoints filled, a seek back from 600 s to 300.99 s | 151 µs |
+| A compile of that file, text to program | 15 µs |
+| A pure edit of it at 600 s: the compile, the carry, and the first eval | 74 µs |
+| A reader on its own thread at audio pace, the worst block of 1,875: Play's file, 1,000 lanes | 262 µs and 346 µs, none over 2.667 ms |
+
+So a reader on an audio thread plays forwards, at a few percent of its budget. A seek costs at
+most a second of steps once checkpoints cover the time, 151 µs here, but a cold seek runs every
+step from the start, 34 ms at 600 s, so a client warms an audio reader on another thread, or
+starts it at the playhead and keeps it there. `test/rules.zig` holds the other half of the
+realtime claim: no file of the core or the language names an allocator, a thread, a lock, a file,
+or a clock.
 
 ## Play
 
-Play is Weft's first client: a Patchwork app with six pages on one 600 s clock. Its signals are
-text, `play/signals.weft`, `play/bouncers.weft`, `play/vectors.weft`, and `play/lanes.weft`,
+Play is Weft's first client: a Patchwork app with seven pages on one 600 s clock. Its signals are
+text, `play/signals.weft`, `play/bouncers.weft`, `play/vectors.weft`, `play/lanes.weft`, and `play/swarm.weft`,
 compiled at start, and the first can be edited while it runs.
 
 - **scope** plots eight signals, one or more of each class but live, over a window from one second
@@ -776,8 +828,15 @@ compiled at start, and the first can be edited while it runs.
   its bounce, 5 ms behind the one before, reaches the top wall. The flashes are every lane's
   events of the last quarter second, read in one buffer each frame, whose count and drops show
   under the field. A frame costs under 0.2 ms at any time.
+- **swarm** runs forty-eight lanes of one stepped program: each dot is a follower of its own x and
+  y wandering a square, trailed by a ghost, a chase 0.4 s behind it, joined to it by a thread whose
+  length is the lag, and ringed while a `crossing` gate on its x reads 1. Its steps run from the
+  start, so a scrub to 600 s costs a second or more the first time, which fills the reader's
+  checkpoints; playing on costs under 0.1 ms a frame at any time, and a jump to anywhere after
+  that costs at most 479 steps. It reads no events, since a window behind the playhead restores a
+  checkpoint every frame on a stepped program.
 
-Space or the play button plays and pauses, the page button cycles the pages and 1 to 6 go to
+Space or the play button plays and pauses, the page button cycles the pages and 1 to 7 go to
 each, the slider scrubs, Home and End go to the ends, Left and Right step 100 ms, and Page Up and
 Page Down 10 s.
 
@@ -799,6 +858,9 @@ own package still has no dependencies.
 
 **The two-file rule.** Only `play/signals.zig`, the signal table, and `play/glue.zig` import
 `weft`. Everything else in Play (`app.zig`, `scope.zig`, `patch.zig`, `shapes.zig`,
-`bouncers.zig`, `vectors.zig`, `field.zig`) draws plain numbers: the glue hands time over as a `Clock`, and the samples,
-events, ranges, classes, and report as `f32` arrays and plain structs. The glue has a budget of
-60 lines of code; growing past it says the boundary or Weft's API is wrong.
+`bouncers.zig`, `vectors.zig`, `field.zig`, `swarm.zig`) draws plain numbers: the glue hands time over as a `Clock`, and the samples,
+events, ranges, classes, and report as `f32` arrays and plain structs. The glue was given a
+budget of 60 lines of code at step 9; at step 18 it is about 500, most of them one function a page
+that reads its program at t and copies the numbers out, and a recompile with its carry. The review
+after step 18 reads that as the shape of the bridge a second client would share, not as a wrong
+API.

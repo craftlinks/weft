@@ -1,5 +1,8 @@
 //! `zig build regress [-- --bless]`: the sampled signals against the committed golden.
 //!
+//! # Deep Architectural Guide for Reviewers:
+//!
+//! ## 1. What It Compares
 //! Renders the catalog natively and compares that text and the wasm build's text with
 //! `test/golden/signals.txt`, reporting the first sample that differs. `--bless` rewrites the
 //! golden from the native text, and refuses if native and wasm disagree, since a golden that one

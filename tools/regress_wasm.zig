@@ -1,6 +1,11 @@
-//! The regress catalog on `wasm32-freestanding`. `regress_wasm.mjs` loads this module, calls
-//! `regress_render`, and prints the text, which `regress.zig` compares with the golden. A browser
-//! runs the same wasm, so this is the arithmetic a web client gets.
+//! The regress catalog on `wasm32-freestanding`.
+//!
+//! # Deep Architectural Guide for Reviewers:
+//!
+//! ## 1. The Second Target
+//! `regress_wasm.mjs` loads this module, calls `regress_render`, and prints the text, which
+//! `regress.zig` compares with the golden. A browser runs the same wasm, so this is the arithmetic
+//! a web client gets.
 
 const std = @import("std");
 const assert = std.debug.assert;

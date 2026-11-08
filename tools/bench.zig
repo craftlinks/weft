@@ -17,7 +17,17 @@
 //! modules  a patch of modules nested 8 deep, 511 instances           per compile
 //! lanes    a noise, a staggered tween, a map, a product, and a      per frame, at 1,000 and
 //!          staggered bounce over n lanes: an eval, then the events  100,000 lanes
+//! node     64 nodes of one op playing forwards at 60 Hz             per node, per frame
+//! seek     Play's file read at 600 s, then at 300.99 s              the read at 300.99 s
+//! recomp   Play's file with a pure line edited at 600 s: compile,   per recompile
+//!          carry, and the first eval
+//! audio    a reader on its own thread at audio pace, a 128-frame    the worst block, over 5 s
+//!          block at 48 kHz every 2.667 ms: events, then an eval     of wall time each
 //! ```
+//! `audio` is the realtime check of step 18: Play's simulated file and the lanes page's thousand
+//! lanes, each block's work timed and the reader asleep until the next block is due, as an audio
+//! callback would be. It prints the worst block, how many blocks went over the 2.667 ms budget,
+//! and the worst block per node.
 //! `write` is what a knob costs when it applies from now on (step 9.5), beside `cold`, which is
 //! what it cost as a rebuild.
 //!
@@ -74,6 +84,11 @@ pub fn main(init: std.process.Init) !void {
     modules(io);
     lanes(io, 1_000);
     lanes(io, 100_000);
+    per_node(io);
+    seek(io);
+    recompile(io);
+    audio(io, "signals.weft", play_signals);
+    audio(io, "lanes.weft", play_lanes);
 }
 
 fn now(io: std.Io) i96 {
@@ -389,6 +404,228 @@ fn lanes(io: std.Io, count: u32) void {
     report(eval_label, best_eval, frames, total);
     const events_label = std.fmt.bufPrint(&label_buffer, "lanes   {d} lanes, events per frame", .{count}) catch unreachable;
     report(events_label, best_events, frames, found_total);
+}
+
+/// The ops of case 9, each 64 nodes of a program of its own.
+const Kind = enum { constant, add, multiply, map, wave, noise, tween, spring, newtonian, bounce, cues, track, chase, follow, shift, delay, crossing, oscillator };
+
+var kind_goal_entries: [2]weft.Goal = undefined;
+var kind_region_entries: [1]weft.Region = undefined;
+var kind_cue_times: [2]weft.Time = undefined;
+var kind_slab: [64 * 16]f64 = undefined;
+var kind_checkpoints: [16 * 64 * 16]f64 = undefined;
+var kind_nodes: [160]weft.Node = undefined;
+
+/// The program of `kind`: a wave as the input where the op reads one, then 64 of the op.
+fn kind_program(kind: Kind) weft.Program {
+    var cues = &start_cues;
+    cues.* = weft.Cues.init(&kind_cue_times);
+    const c0 = cues.add(.{ .flicks = 0 }) catch |err| fail(err);
+    const c1 = cues.add(seconds(2)) catch |err| fail(err);
+    var goals = weft.Goals.init(&kind_goal_entries);
+    const path = goals.add(&.{ .{ .cue = c0, .value = 1 }, .{ .cue = c1, .value = -1 } }) catch |err| fail(err);
+    var regions = weft.Regions.init(&kind_region_entries);
+    const span = regions.add(&.{.{ .low = 0, .high = 1 }}) catch |err| fail(err);
+    tracks = weft.Tracks.init(&track_entries);
+    const track_id = tracks.add(&track_samples, 0, 1, 0.5) catch |err| fail(err);
+    var builder = weft.Builder.init(&kind_nodes, .{
+        .slab_count_max = kind_slab.len,
+        .cues = cues,
+        .goals = goals.table(),
+        .regions = regions.table(),
+        .tracks = &tracks,
+    });
+    const input = builder.wave(.{ .shape = .sine, .hz = 0.5 }) catch |err| fail(err);
+    const ms: i64 = @divExact(flicks_per_second, 1000);
+    for (0..64) |index| {
+        const seed: u64 = index;
+        _ = switch (kind) {
+            .constant => builder.constant(@floatFromInt(index)),
+            .add => builder.add(input, input),
+            .multiply => builder.multiply(input, input),
+            .map => builder.map_range(.{ .input = input, .input_low = -1, .input_high = 1, .output_low = 0, .output_high = 1 }),
+            .wave => builder.wave(.{ .shape = .triangle, .hz = 1 + 0.1 * @as(f64, @floatFromInt(index)) }),
+            .noise => builder.noise(.{ .shape = .smooth, .hz = 1, .seed = seed }),
+            .tween => builder.tween(.{ .from = 0, .to = 1, .duration = seconds(3), .ease = weft.Ease.in_out, .start = c0, .previous = null }),
+            .spring => builder.spring(.{ .from = 0, .goals = path, .time = .{ .flicks = 500 * ms }, .overshoot = 0.2 }),
+            .newtonian => builder.newtonian(.{ .from = 0, .goals = path, .speed = 2, .accel = 8, .decel = 4 }),
+            .bounce => (builder.bounce(.{ .low = 0, .high = 1, .speed = 0.7, .start = c0 }) catch |err| fail(err)).position,
+            .cues => builder.cues(.{ .first = c0, .count = 2 }),
+            .track => builder.track(track_id),
+            .chase => builder.chase(.{ .target = input, .from = 0, .time = .{ .flicks = 300 * ms }, .overshoot = 0.1 }),
+            .follow => builder.follow(.{
+                .from = 0,
+                .regions = span,
+                .pick = .random,
+                .mover = .{ .spring = .{ .time = .{ .flicks = 300 * ms }, .overshoot = 0.1 } },
+                .tolerance = 0.01,
+                .pause_min = .{ .flicks = 0 },
+                .pause_max = .{ .flicks = 200 * ms },
+                .seed = seed,
+            }),
+            .shift => builder.shift(.{ .buckets = 8, .period = seconds(2), .low = -1, .high = 1, .odds = 0.25, .shape = .smooth, .seed = seed }),
+            .delay => delay: {
+                const id = builder.delay(0) catch |err| fail(err);
+                builder.close(id, input) catch |err| fail(err);
+                break :delay id;
+            },
+            .crossing => builder.crossing(.{ .input = input, .level = 0.25, .direction = .both }),
+            .oscillator => builder.oscillator(.{ .shape = .sine, .rate = input }),
+        } catch |err| fail(err);
+    }
+    return builder.finish();
+}
+
+/// Case 9: each op's cost a node, 64 nodes of it playing forwards at 60 Hz for 10 s, less a
+/// program of only the input wave. A simulated op's cost includes its eight steps a frame.
+fn per_node(io: std.Io) void {
+    const rate = weft.Rate.from_hz(60).?;
+    const frames = 600;
+    for (std.enums.values(Kind)) |kind| {
+        const program = kind_program(kind);
+        var best: i96 = std.math.maxInt(i96);
+        var total: f64 = 0;
+        for (0..repeats) |_| {
+            var state = weft.State.init_with_checkpoints(program, kind_slab[0..program.slab_count], &kind_checkpoints);
+            const start = now(io);
+            for (0..frames) |frame| {
+                state.eval(weft.Time.from_ticks(@intCast(frame), rate).?);
+                total += state.slab[program.slab_count - 1];
+            }
+            best = @min(best, now(io) - start);
+        }
+        var label_buffer: [64]u8 = undefined;
+        const label = std.fmt.bufPrint(&label_buffer, "node    {t}, per node a frame", .{kind}) catch unreachable;
+        report(label, best, frames * 64, total);
+    }
+}
+
+var seek_compiled: @TypeOf(compiled) = undefined;
+var seek_slab: [112]f64 = undefined;
+var seek_checkpoints: [610 * 112]f64 = undefined;
+
+/// Case 10: Play's file on a reader with checkpoints, read at 600 s, then at 300.99 s: a restore
+/// and the second of steps after it, a seek's worst case.
+fn seek(io: std.Io) void {
+    seek_compiled.compile(play_signals) catch |err| fail(err);
+    const program = seek_compiled.program;
+    var best: i96 = std.math.maxInt(i96);
+    var total: f64 = 0;
+    for (0..repeats) |_| {
+        var state = weft.State.init_with_checkpoints(program, seek_slab[0..program.slab_count], &seek_checkpoints);
+        state.eval(seconds(600));
+        const start = now(io);
+        // Just before 301 s: the checkpoint at 300 s, then 475 steps, the most a seek runs.
+        state.eval(.{ .flicks = 300 * flicks_per_second + @divExact(99 * flicks_per_second, 100) });
+        best = @min(best, now(io) - start);
+        total += state.slab[0];
+    }
+    report("seek    600 s back to 300.99 s, per read", best, 1, total);
+}
+
+var recompiled: @TypeOf(compiled) = undefined;
+var recompiled_slab: [112]f64 = undefined;
+var recompiled_checkpoints: [610 * 112]f64 = undefined;
+var edited: [8192]u8 = undefined;
+
+/// Case 11: Play's file at 600 s, then the same file with the first tween's `over` changed, a
+/// pure line no simulated node reads: the compile, the carry of the reader, and the first eval.
+fn recompile(io: std.Io) void {
+    const from = "rise = tween(from: 0, to: 1, at: c1, over: 1s,";
+    const to = "rise = tween(from: 0, to: 1, at: c1, over: 2s,";
+    const at = std.mem.indexOf(u8, play_signals, from) orelse fail(error.EditNotFound);
+    @memcpy(edited[0..play_signals.len], play_signals);
+    @memcpy(edited[at..][0..to.len], to);
+    const text = edited[0..play_signals.len];
+    var best: i96 = std.math.maxInt(i96);
+    var total: f64 = 0;
+    for (0..repeats) |_| {
+        seek_compiled.compile(play_signals) catch |err| fail(err);
+        var old_state = weft.State.init_with_checkpoints(seek_compiled.program, seek_slab[0..seek_compiled.program.slab_count], &seek_checkpoints);
+        old_state.eval(seconds(600));
+        const start = now(io);
+        recompiled.compile(text) catch |err| fail(err);
+        const program = recompiled.program;
+        var state = weft.State.init_with_checkpoints(program, recompiled_slab[0..program.slab_count], &recompiled_checkpoints);
+        if (!recompiled.carry(&state, &seek_compiled, &old_state)) fail(error.NotCarried);
+        state.eval(.{ .flicks = 600 * flicks_per_second + 11_760_000 });
+        best = @min(best, now(io) - start);
+        total += state.slab[0];
+    }
+    report("recomp  a pure edit at 600 s, carried", best, 1, total);
+}
+
+/// Play's lanes page as text, passed in by `build.zig`.
+const play_lanes = @embedFile("play_lanes");
+
+var audio_compiled: weft.lang.Compiled(.{
+    .tokens = 1024,
+    .tree = 512,
+    .names = 64,
+    .nodes = 24,
+    .slab = 16384,
+    .cues = 6,
+    .goals = 3,
+    .regions = 4,
+    .tracks = 4,
+    .track_samples = 16,
+}) = undefined;
+var audio_slab: [16384]f64 = undefined;
+var audio_checkpoints: [16 * 112]f64 = undefined;
+var audio_events: [1024]weft.Event = undefined;
+
+const Audio = struct {
+    program: weft.Program,
+    io: std.Io,
+    worst: i96 = 0,
+    over: u32 = 0,
+    blocks: u32 = 0,
+    total: f64 = 0,
+};
+
+/// One block of 128 frames at 48 kHz, exactly 1,881,600 flicks and 8/3 ms.
+const block_flicks: i64 = 1_881_600;
+const block_ns: i96 = 8_000_000 / 3;
+
+/// The audio thread: from a fresh reader, a block's events and an eval at its end every
+/// `block_ns` of wall time for 5 s, each block's work timed and the thread asleep until the next
+/// is due. A block that ends past its deadline is over budget.
+fn audio_thread(run: *Audio) void {
+    var state = weft.State.init_with_checkpoints(run.program, audio_slab[0..run.program.slab_count], audio_checkpoints[0..if (run.program.simulated) audio_checkpoints.len else 0]);
+    const begin = now(run.io);
+    var t0: i64 = 0;
+    while (run.blocks < 1875) : (run.blocks += 1) {
+        const due = begin + @as(i96, run.blocks) * block_ns;
+        const wait = due - now(run.io);
+        if (wait > 0) run.io.sleep(.fromNanoseconds(wait), .awake) catch {};
+        const start = now(run.io);
+        const found = state.events(.{ .flicks = t0 }, .{ .flicks = t0 + block_flicks }, &audio_events);
+        state.eval(.{ .flicks = t0 + block_flicks });
+        const spent = now(run.io) - start;
+        run.worst = @max(run.worst, spent);
+        if (spent > block_ns) run.over += 1;
+        run.total += @floatFromInt(found.count + found.dropped);
+        run.total += state.slab[0];
+        t0 += block_flicks;
+    }
+}
+
+/// Case 12: `audio_thread` over `text`, compiled here, on a thread of its own.
+fn audio(io: std.Io, name: []const u8, text: []const u8) void {
+    audio_compiled.compile(text) catch |err| fail(err);
+    var run: Audio = .{ .program = audio_compiled.program, .io = io };
+    const thread = std.Thread.spawn(.{}, audio_thread, .{&run}) catch |err| fail(err);
+    thread.join();
+    var label_buffer: [64]u8 = undefined;
+    const label = std.fmt.bufPrint(&label_buffer, "audio   {s}, worst block", .{name}) catch unreachable;
+    report(label, run.worst, 1, run.total);
+    const per_node_ns = @divFloor(run.worst, @as(i96, @intCast(run.program.nodes.len)));
+    std.debug.print("        {d} blocks, {d} over 2.667 ms, worst {d} ns a node of {d}\n", .{
+        run.blocks,
+        run.over,
+        per_node_ns,
+        run.program.nodes.len,
+    });
 }
 
 fn fail(err: anyerror) noreturn {

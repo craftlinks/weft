@@ -94,6 +94,12 @@
 //! through `weft.colour.to_srgb`. Then the events of `(t - 250 ms, t]`, every lane's in one
 //! buffer, give each dot's flash from its last hit at the top wall, by the event's instance,
 //! which is its lane; the count and the drops cross too, so the page can show them.
+//!
+//! ## 9. Swarm
+//! The swarm page reads `Swarm` (`signals.zig`, section 9), forty-eight lanes of a stepped program
+//! on a reader with checkpoints: one eval at t gives every dot's place, ghost, colour, and gate as
+//! lane arrays, the colours through `weft.colour.to_srgb`. It reads no events: a stepped program's
+//! events from `t - 300 ms` restore a checkpoint each frame, which cost about 6 ms a frame.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -193,7 +199,9 @@ pub const Hits = struct {
     dropped: u64,
 };
 
-pub const Report = struct { seekable: bool, stepped: bool, first: ?usize };
+/// No live node, whether a read can cost steps, and what to name as the first stepped node: a
+/// scope row of the running file, or, for a page with a program of its own, a binding's name.
+pub const Report = struct { seekable: bool, stepped: bool, first: ?usize, first_name: []const u8 = "" };
 
 pub const vector_samples = 128;
 pub const colour_count = signals.colour_count;
@@ -228,6 +236,19 @@ pub const Field = struct {
     /// Events in the flash window, every lane's, and those the buffer dropped.
     events: u32,
     dropped: u64,
+};
+
+pub const swarm_count = signals.swarm_count;
+/// The gate line's x in the program's -1..1, where the page draws its line.
+pub const swarm_gate: f32 = 0.25;
+
+/// The swarm page at one time (section 9). Places and ghosts are in the program's -1..1.
+pub const Swarm = struct {
+    places: [swarm_count][2]f32,
+    ghosts: [swarm_count][2]f32,
+    tints: [swarm_count][3]f32,
+    /// 1 for a dot at or past the gate line, else 0.
+    lit: [swarm_count]f32,
 };
 
 /// What a recompile did (section 3b).
@@ -268,6 +289,10 @@ pub const Motion = struct {
     field_slab: [signals.field_slab_count]f64,
     field_reader: weft.State,
     field_report: Report,
+    swarm: signals.Swarm,
+    swarm_memory: [(1 + signals.swarm_checkpoint_seconds) * signals.swarm_slab_count]f64,
+    swarm_reader: weft.State,
+    swarm_report: Report,
 
     /// Builds the program and starts both readers fresh (section 3a).
     pub fn build(motion: *Motion) void {
@@ -300,6 +325,32 @@ pub const Motion = struct {
         motion.field_reader = .init(motion.field.program, &motion.field_slab);
         const field_plain = motion.field.program.report();
         motion.field_report = .{ .seekable = field_plain.seekable, .stepped = field_plain.stepped, .first = null };
+        motion.swarm.build();
+        const slab_n = signals.swarm_slab_count;
+        motion.swarm_reader = .init_with_checkpoints(motion.swarm.program, motion.swarm_memory[0..slab_n], motion.swarm_memory[slab_n..]);
+        const swarm_plain = motion.swarm.program.report();
+        // Its first stepped node is the binding `wander_x` itself, a region of followers.
+        const wander_x = motion.swarm.compiled.signal("wander_x").?;
+        assert(swarm_plain.first_simulated.?.index == wander_x.index);
+        motion.swarm_report = .{
+            .seekable = swarm_plain.seekable,
+            .stepped = swarm_plain.stepped,
+            .first = null,
+            .first_name = "wander_x",
+        };
+    }
+
+    /// The swarm page at `clock` (section 9).
+    pub fn sample_swarm(motion: *Motion, clock: Clock, out: *Swarm) void {
+        const reader = &motion.swarm_reader;
+        reader.eval(clock.t);
+        for (&out.places, &out.ghosts, 0..) |*place, *ghost, lane| {
+            for (place, reader.values(motion.swarm.place)[2 * lane ..][0..2]) |*c, v| c.* = @floatCast(v);
+            for (ghost, reader.values(motion.swarm.ghost)[2 * lane ..][0..2]) |*c, v| c.* = @floatCast(v);
+            const srgb = weft.colour.to_srgb(reader.values(motion.swarm.tint)[3 * lane ..][0..3].*);
+            for (&out.tints[lane], srgb) |*c, v| c.* = @floatCast(v);
+        }
+        for (&out.lit, reader.values(motion.swarm.gate)) |*lit, value| lit.* = @floatCast(value);
     }
 
     /// The lanes page at `clock` (section 8).

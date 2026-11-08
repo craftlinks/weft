@@ -1,1 +1,1 @@
-ok: 8 nodes, 2 cues, 0 tracks, seekable, stepped
+ok: 8 nodes, a slab of 20, 2 cues, 1 goals, 1 regions, 0 tracks, seekable, stepped

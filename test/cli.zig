@@ -74,7 +74,8 @@ test "check reports each error with its line and hint" {
     try testing.expectEqualStrings(check_golden, writer.buffered());
 }
 
-// Locks the summary of a file that compiles, with a library: its nodes, cues, tracks, and
+// Locks the summary of a file that compiles, with a library: its nodes, its slab, cues, goals,
+// regions, and tracks, and
 // whether it is seekable and stepped.
 test "check summarises a file that compiles" {
     var writer: std.Io.Writer = .fixed(&output);
