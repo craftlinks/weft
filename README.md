@@ -159,9 +159,11 @@ src/
     graph.zig         the back end: checked declarations to a Program
     format.zig        the canonical format
     error.zig         diagnostics and suggestions
+    std.weft          the standard library of modules, `weft.lang.std_library`
 test/
   catalog.zig         the sampled signals, rendered as text of hex floats
   lang.zig            the catalog's graphs as text, which compile to its nodes
+  modules.zig         modules against the same graphs written by hand
   golden/signals.txt  the committed samples
 tools/
   bench.zig           times reads and a compile, for zig build bench
@@ -558,6 +560,42 @@ There is one canonical format, which `lang.Syntax` writes: one declaration a lin
 named arguments in the table's order, and a call written one argument a line exactly when its last
 argument has a trailing comma, as `zig fmt` does. `src/lang/lang.zig` explains the stages.
 
+## Modules
+
+A module is a named graph with parameters. It expands where it is used, like a macro with types,
+into the nodes the same graph written out would make, so a program never contains a module:
+
+```txt
+use std                                     # snappy, heavy, breathe, bob
+
+module wobble(t: 0.3s) = spring(time: t)    # a mover, for `by:`
+module hop(s, at) in -1..1 = bounce(0..1, speed: s, at: at) * 2 - 1
+
+cue c0 = 0s
+moves = [c0: 1]
+out = snappy(moves)                         # spring(moves, time: 0.25s)
+b = heavy(moves, time: 0.5s)                # a default, overridden by name
+f = follow([0..1], by: wobble(), seed: 3)
+h = hop(0.7, c0)
+```
+
+```zig
+compiled.compile_with(&.{.{ .name = "std", .text = weft.lang.std_library }}, source) catch { … };
+```
+
+- **Parameters** take arguments by position or by name, and a default is a literal. A parameter's
+  kind is not declared: it is whatever the body uses it as, a signal, a number, a cue, or a path.
+- **A body sees its parameters**, the primitives, and the modules, never the file's names. A module
+  may be used above its declaration.
+- **Libraries** are text the client passes by name (`Limits.libraries` of them); `use` brings a
+  library's modules in. The core reads no files.
+- **Cycles are refused** with the path through them, `a -> b -> a`, and modules nest at most 16
+  deep. Using a module inside its own argument, `twice(twice(x))`, is not a cycle.
+- **Seeds** inside an instance hash the instance's place, so two instances differ and a new line
+  elsewhere never reshuffles one.
+- **A declared range**, `in lo..hi`, is checked after the build for an instance bound to a name.
+- **Errors** inside a library's module are reported on the file's call.
+
 ## Regress
 
 `zig build regress` renders `test/catalog.zig` on native and on wasm and compares both with
@@ -580,7 +618,8 @@ Bless only for a change the step means to make, in that step's commit.
 graph of 16 waves summed, per eval; four chases on a wave plus noise playing forwards at 60 Hz, per
 frame; that graph from a fresh state, the first eval at 60 s and at 600 s; a bounce and cues,
 `events` per 128-frame block at 48 kHz; a track write at the playhead at 600 s, then the
-frame's eval, which is what a knob costs from now on; and a compile of Play's `signals.weft`. It is native only and needs no GPU. Its
+frame's eval, which is what a knob costs from now on; a compile of Play's `signals.weft`; and a
+compile of modules nested 8 deep, 511 instances. It is native only and needs no GPU. Its
 numbers depend on the machine, so it has no thresholds and is not part of `test` or `regress`.
 
 ## Play

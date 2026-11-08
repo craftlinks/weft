@@ -98,6 +98,9 @@ pub const Memory = struct {
     goal_sources: []GoalSource,
     /// One for each track.
     track_nodes: []?Id,
+    /// One for each checked expression, so an expression the checker shares is built once: a
+    /// module's parameter used twice is one signal (`check.zig`, section 6).
+    expr_ids: []?Ids,
 };
 
 const Fail = error{Refused};
@@ -124,8 +127,18 @@ const Back = struct {
         return back.diagnostics.add(code, span[0], @max(span[1], 1), format, args);
     }
 
+    /// An expression's nodes, built the first time it is asked for.
     fn eval(back: *Back, expr_index: u32) Fail!Ids {
+        assert(expr_index < back.checked.exprs.len);
+        if (back.memory.expr_ids[expr_index]) |ids| return ids;
+        const ids = try back.eval_uncached(expr_index);
+        back.memory.expr_ids[expr_index] = ids;
+        return ids;
+    }
+
+    fn eval_uncached(back: *Back, expr_index: u32) Fail!Ids {
         const expr = back.checked.exprs[expr_index];
+        assert(back.memory.expr_ids[expr_index] == null);
         switch (expr.tag) {
             .call => {
                 const ids = try back.build_call(expr.a);
@@ -494,6 +507,8 @@ pub fn build(
     assert(memory.ids.len >= checked.bindings.len);
     assert(memory.track_nodes.len >= checked.tracks.len);
     assert(memory.cue_times.len >= checked.cue_times.len);
+    assert(memory.expr_ids.len >= checked.exprs.len);
+    @memset(memory.expr_ids[0..checked.exprs.len], null);
     tables.cues = Cues.init(memory.cue_times);
     for (checked.cue_times) |flicks| _ = tables.cues.add(.{ .flicks = flicks }) catch unreachable;
     tables.tracks = track_module.Tracks.init(memory.track_entries);

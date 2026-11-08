@@ -14,6 +14,7 @@
 //! write    the chase page with its springs' time from a track,  per frame, at 600 s
 //!          a write of the track at the playhead, then the eval
 //! compile  Play's `signals.weft` (step 12), parse to program      per compile
+//! modules  a patch of modules nested 8 deep, 511 instances           per compile
 //! ```
 //! `write` is what a knob costs when it applies from now on (step 9.5), beside `cold`, which is
 //! what it cost as a rebuild.
@@ -65,6 +66,7 @@ pub fn main(init: std.process.Init) !void {
     events(io);
     write(io);
     compile(io);
+    modules(io);
 }
 
 fn now(io: std.Io) i96 {
@@ -278,6 +280,50 @@ fn compile(io: std.Io) void {
         best = @min(best, now(io) - start);
     }
     report("compile Play's signals.weft, per compile", best, count, total);
+}
+
+/// A binary tree of modules 8 deep (step 13): each level calls the one below it twice, so a
+/// compile expands 511 instances into 768 nodes, with the argument shared as one wave.
+const nested =
+    "module m0(x) = x * 0.5\n" ++
+    "module m1(x) = m0(x) + m0(x)\n" ++
+    "module m2(x) = m1(x) + m1(x)\n" ++
+    "module m3(x) = m2(x) + m2(x)\n" ++
+    "module m4(x) = m3(x) + m3(x)\n" ++
+    "module m5(x) = m4(x) + m4(x)\n" ++
+    "module m6(x) = m5(x) + m5(x)\n" ++
+    "module m7(x) = m6(x) + m6(x)\n" ++
+    "module m8(x) = m7(x) + m7(x)\n" ++
+    "out = m8(wave(sine, 1hz))\n";
+
+var nested_compiled: weft.lang.Compiled(.{
+    .tokens = 1024,
+    .tree = 4096,
+    .names = 64,
+    .nodes = 1024,
+    .slab = 2048,
+    .cues = 2,
+    .goals = 2,
+    .regions = 2,
+    .tracks = 1,
+    .track_samples = 1,
+    .modules = 16,
+}) = undefined;
+
+/// Case 7: the nested patch compiled, per compile. The sum is the node count.
+fn modules(io: std.Io) void {
+    const count = 200;
+    var best: i96 = std.math.maxInt(i96);
+    var total: f64 = 0;
+    for (0..repeats) |_| {
+        const start = now(io);
+        for (0..count) |_| {
+            nested_compiled.compile(nested) catch |err| fail(err);
+            total += @floatFromInt(nested_compiled.program.nodes.len);
+        }
+        best = @min(best, now(io) - start);
+    }
+    report("compile 8 deep of modules, per compile", best, count, total);
 }
 
 fn fail(err: anyerror) noreturn {

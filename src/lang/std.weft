@@ -1,0 +1,13 @@
+# The standard library: the modules a file gets with `use std`.
+
+# A spring that settles fast, with no overshoot.
+module snappy(goal) = spring(goal, time: 0.25s)
+
+# A slow spring that overshoots a little.
+module heavy(goal, time: 0.9s) = spring(goal, time: time, overshoot: 0.1)
+
+# A value that breathes around its base at 0.2 Hz.
+module breathe(base, amount) = base * (1 + amount * wave(sine, 0.2hz))
+
+# A value that bobs around its base at 1 Hz.
+module bob(base, amount: 0.1) = base + amount * wave(sine, 1hz)

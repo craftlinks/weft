@@ -22,6 +22,9 @@
 //!         | "cue" name "=" expr [ ".." expr "every" expr ]
 //!         | "track" name "=" expr "in" expr ".." expr
 //!         | name "=" value | name "<-" value
+//!         | "module" name "(" [ param { "," param } [","] ] ")" [ "in" value ] "=" expr
+//!         | "use" name
+//! param   = name [ ":" value ]
 //! value   = expr [ ".." expr ]
 //! expr    = term { ("+" | "-") term }
 //! term    = unary { "*" unary }
@@ -69,6 +72,11 @@ pub const Tag = enum(u8) {
     bind,
     /// token: the delay's name; a: the value it is fed.
     feed,
+    /// token: the name; a: the parameters, a `list` of `param`s; b: the body; c: 1 + the
+    /// declared range, or 0.
+    module,
+    /// token: the library's name.
+    use,
     /// token: a number, time, or frequency; a: 1 when negated.
     literal,
     /// token: the name.
@@ -94,9 +102,11 @@ pub const Tag = enum(u8) {
     element,
     /// a: the inner expression.
     paren,
+    /// token: the parameter's name; a: 1 + its default value, or 0.
+    param,
 
     pub fn is_declaration(tag: Tag) bool {
-        return @backingInt(tag) <= @backingInt(Tag.feed);
+        return @backingInt(tag) <= @backingInt(Tag.use);
     }
 };
 
@@ -105,6 +115,7 @@ pub const Item = struct {
     token: u32,
     a: u32 = 0,
     b: u32 = 0,
+    c: u32 = 0,
     /// The first and last tokens of the item, comments between them included.
     first: u32,
     last: u32,
@@ -399,6 +410,14 @@ const Parser = struct {
             const bounds = try parser.value();
             return parser.push(.{ .tag = .track, .token = name, .a = initial, .b = bounds, .first = first, .last = parser.last });
         }
+        if (std.mem.eql(u8, word, "use") and parser.peek_second_tag() == .name) {
+            _ = parser.take();
+            const name = try parser.expect(.name, "a library's name");
+            return parser.push(.{ .tag = .use, .token = name, .first = first, .last = parser.last });
+        }
+        if (std.mem.eql(u8, word, "module") and parser.peek_second_tag() == .name) {
+            return parser.module(first);
+        }
         const name = parser.take();
         const operator = parser.peek();
         const tag: Tag = switch (parser.tokens[operator].tag) {
@@ -412,6 +431,47 @@ const Parser = struct {
         _ = parser.take();
         const operand = try parser.value();
         return parser.push(.{ .tag = tag, .token = name, .a = operand, .first = first, .last = parser.last });
+    }
+
+    /// `module name(p, q: default) [in lo..hi] = expr`. The parameters are on the stack while
+    /// the body and the range parse above them, so they copy to `extra` last, as one run.
+    fn module(parser: *Parser, first: u32) Fail!u32 {
+        _ = parser.take();
+        const name = try parser.expect(.name, "a module's name");
+        _ = try parser.expect(.l_paren, "`(`");
+        parser.nest += 1;
+        const base = parser.stack_count;
+        while (parser.peek_tag() != .r_paren) {
+            const at = try parser.expect(.name, "a parameter's name");
+            var default: u32 = 0;
+            if (parser.peek_tag() == .colon) {
+                _ = parser.take();
+                default = try parser.value() + 1;
+            }
+            const param = try parser.push(.{ .tag = .param, .token = at, .a = default, .first = at, .last = parser.last });
+            try parser.stack_push(param);
+            if (parser.peek_tag() == .comma) {
+                _ = parser.take();
+                continue;
+            }
+            if (parser.peek_tag() != .r_paren) {
+                return parser.fail_at(parser.peek(), .unexpected_token, "expected `,` or `)`, found {s}", .{
+                    describe(parser.tokens[parser.peek()], parser.source),
+                });
+            }
+        }
+        parser.nest -= 1;
+        _ = parser.take();
+        var range: u32 = 0;
+        if (parser.is_word("in")) {
+            _ = parser.take();
+            range = try parser.value() + 1;
+        }
+        _ = try parser.expect(.equal, "`=`");
+        const body = try parser.expression();
+        const run = try parser.stack_pop(base);
+        const params = try parser.push(.{ .tag = .list, .token = first, .a = run.first, .b = run.count, .first = first, .last = parser.last });
+        return parser.push(.{ .tag = .module, .token = name, .a = params, .b = body, .c = range, .first = first, .last = parser.last });
     }
 
     fn extra_pair(parser: *Parser, a: u32, b: u32) Fail!u32 {
