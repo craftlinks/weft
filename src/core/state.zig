@@ -197,6 +197,49 @@ pub const State = struct {
         return collector.result();
     }
 
+    /// Takes over `from`'s simulated state, a reader of another program, when every simulated or
+    /// input node of this program has a twin there (`twins[i]`, the old node of node i) of the
+    /// same op and size: its slab, its step, and its checkpoints, each node's region moved to
+    /// its own offset. Other nodes are caches a pass refills, so they start as `init` leaves them.
+    /// False, changing nothing, when a node has no twin, when the two programs start their steps
+    /// at different times, or when `from` has not read since its program last changed, since its
+    /// checkpoints could then be stale. A recompile uses this to keep a running program's state
+    /// (step 15); the caller finds the twins.
+    pub fn adopt(state: *State, from: *const State, twins: []const ?u32) bool {
+        assert(twins.len == state.program.nodes.len);
+        assert(state.slab.len == state.program.slab_count);
+        if (!state.program.simulated or !from.program.simulated) return false;
+        const step = from.step orelse return false;
+        if (from.generation != from.program.cues.generation) return false;
+        if (from.track_generation != from.program.tracks.generation) return false;
+        const start = state.program.cues.at(state.program.start);
+        if (start.flicks != from.program.cues.at(from.program.start).flicks) return false;
+        for (state.program.nodes, twins) |*node, twin| {
+            if (!node.op.simulated() and node.op != .input) continue;
+            const old = twin orelse return false;
+            if (old >= from.program.nodes.len) return false;
+            const other = &from.program.nodes[old];
+            if (std.meta.activeTag(node.op) != std.meta.activeTag(other.op)) return false;
+            if (region_of(node) != region_of(other)) return false;
+        }
+        const filled = @min(from.checkpoints_filled, state.checkpoints_count());
+        move_regions(state.program, state.slab, from.program, from.slab, twins);
+        const size = state.slab.len;
+        const from_size = from.slab.len;
+        for (0..filled) |index| {
+            const into = state.checkpoints[index * size ..][0..size];
+            @memset(into, 0);
+            const out_of = from.checkpoints[index * from_size ..][0..from_size];
+            move_regions(state.program, into, from.program, out_of, twins);
+        }
+        state.step = step;
+        state.checkpoints_filled = filled;
+        state.generation = state.program.cues.generation;
+        state.track_generation = state.program.tracks.generation;
+        state.evaluated = false;
+        return true;
+    }
+
     /// How many checkpoints the state has room for.
     pub fn checkpoints_count(state: *const State) u32 {
         if (state.checkpoints.len == 0) return 0;
@@ -340,6 +383,21 @@ pub const State = struct {
         state.step = index * simulation.checkpoint_interval;
     }
 };
+
+/// The values and caches a node keeps in the slab.
+fn region_of(node: *const Node) u64 {
+    return node.extent.count() + node.op.cache_count(node.extent.count());
+}
+
+/// Copies each twinned simulated or input node's region from `from` into `into` (`adopt`).
+fn move_regions(program: Program, into: []f64, from_program: Program, from: []const f64, twins: []const ?u32) void {
+    for (program.nodes, twins) |*node, twin| {
+        if (!node.op.simulated() and node.op != .input) continue;
+        const other = &from_program.nodes[twin.?];
+        const count: usize = @intCast(region_of(node));
+        @memcpy(into[node.offset..][0..count], from[other.offset..][0..count]);
+    }
+}
 
 /// Where an events query puts what it finds: the collector, and the range it keeps.
 const Found = struct {

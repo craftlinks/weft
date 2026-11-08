@@ -26,7 +26,14 @@
 //! time written since g, or null when the ring no longer reaches back to g, which means drop
 //! everything.
 //!
-//! ## 4. TigerStyle Invariants
+//! ## 4. A Preview Undone
+//! A client may let a control write a track as a preview, then take the writes back: Play's text
+//! knob writes from now on while it is dragged, and on release rewrites the track's declaration
+//! instead (step 15). `restore` puts back the samples the client saved before the preview, and
+//! logs the preview's start as one write's time, since every change the preview made is at or
+//! after it: a reader drops what it worked out from that time on, and nothing before.
+//!
+//! ## 5. TigerStyle Invariants
 //! - The caller owns every sample array; a refused write or add changes nothing.
 //! - Samples are in time order, finite, and inside their track's bounds.
 //! - `value` is a binary search: at most 33 rounds over a track's samples.
@@ -159,6 +166,29 @@ pub const Tracks = struct {
         assert(track.value(time) == clamped);
     }
 
+    /// Puts back `samples`, which the client saved from this track's `table()`, as the track's
+    /// writes (section 4). Every change since they were saved is at or after `since`. Restoring
+    /// what the track already holds is not a write, so it keeps the generation.
+    pub fn restore(tracks: *Tracks, id: TrackId, samples: []const Sample, since: Time) Error!void {
+        if (id.index >= tracks.count) return error.UnknownTrack;
+        const track = &tracks.entries[id.index];
+        if (samples.len > track.samples.len) return error.TrackFull;
+        for (samples, 0..) |sample, index| {
+            assert(std.math.isFinite(sample.value));
+            assert(sample.value >= track.low and sample.value <= track.high);
+            if (index > 0) assert(samples[index - 1].time.flicks < sample.time.flicks);
+        }
+        const same = samples.len == track.count and for (samples, track.table()) |a, b| {
+            if (a.time.flicks != b.time.flicks or @as(u64, @bitCast(a.value)) != @as(u64, @bitCast(b.value))) break false;
+        } else true;
+        if (same) return;
+        @memcpy(track.samples[0..samples.len], samples);
+        track.count = @intCast(samples.len);
+        tracks.generation += 1;
+        tracks.log[@intCast(tracks.generation % log_len)] = since;
+        assert(track.table().len == samples.len);
+    }
+
     /// The earliest time written since generation `seen`, or null if the log no longer reaches
     /// back to it (section 3). `seen` is below the current generation.
     pub fn floor_since(tracks: *const Tracks, seen: u64) ?Time {
@@ -283,4 +313,30 @@ test "a track is refused by name" {
     try testing.expectError(error.NoSamples, tracks.add(samples[0..0], 0, 1, 0));
     _ = try tracks.add(&samples, 0, 1, 0);
     try testing.expectError(error.TrackCapacityExceeded, tracks.add(&samples, 0, 1, 0));
+}
+
+// Locks section 4: a preview's writes, one of which latched over a later sample, are taken back
+// whole, the floor is the preview's start, and restoring what is there already is no write.
+test "a preview is taken back by restoring the samples saved before it" {
+    var entries: [1]Track = undefined;
+    var samples: [8]Sample = undefined;
+    var tracks = Tracks.init(&entries);
+    const id = try tracks.add(&samples, 0, 2, 0.5);
+    try tracks.write(id, .{ .flicks = 100 }, 1);
+    try tracks.write(id, .{ .flicks = 300 }, 1.5);
+    var saved: [8]Sample = undefined;
+    const kept = tracks.at(id).table();
+    @memcpy(saved[0..kept.len], kept);
+    const saved_count = kept.len;
+    const before = tracks.generation;
+    try tracks.write(id, .{ .flicks = 200 }, 0.25);
+    try tracks.write(id, .{ .flicks = 250 }, 0.75);
+    try testing.expectEqual(@as(f64, 0.75), tracks.value(id, .{ .flicks = 400 }));
+    try tracks.restore(id, saved[0..saved_count], .{ .flicks = 200 });
+    try testing.expectEqual(@as(f64, 1.5), tracks.value(id, .{ .flicks = 400 }));
+    try testing.expectEqual(@as(f64, 1), tracks.value(id, .{ .flicks = 250 }));
+    try testing.expectEqual(Time{ .flicks = 200 }, tracks.floor_since(before).?);
+    const restored = tracks.generation;
+    try tracks.restore(id, saved[0..saved_count], .{ .flicks = 200 });
+    try testing.expectEqual(restored, tracks.generation);
 }

@@ -3,10 +3,10 @@
 # driver: 615.78.08
 # size: 1280x720 @120
 scenario       hash
-bouncers       7cd83cdeb3fb502e
-bouncers_300   30d25af602e23bd0
-bouncers_590   99de0ad29e757657
-bouncers_play  1cffef97717eba50
+bouncers       d5c637ed19c81327
+bouncers_300   f7e5fe6f0d5a667f
+bouncers_590   9f1ae6c66683bde3
+bouncers_play  c4862beadab369c2
 knob           74ff5cca350a11a6
 knob_600       cb4d5b6abb8a3c9e
 play           9720074c0a619016
@@ -17,3 +17,10 @@ scrub_back     170f16bb84d8f850
 shapes         a933c45d3636eca3
 shapes_play    226922fecc82eba1
 still          ef3c12248729f64e
+text           c87a9e765b897840
+text_600       8ecf49482b0c8ca2
+text_edit      f685989893317f2e
+text_error     b4818932eecb31a5
+text_knob      8fb9655d52ed0c9e
+text_knob_60   456ae128b5254a73
+text_knob_600  4ab50212ae8259ad

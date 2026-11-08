@@ -169,6 +169,7 @@ test/
   catalog.zig         the sampled signals, rendered as text of hex floats
   lang.zig            the catalog's graphs as text, which compile to its nodes
   modules.zig         modules against the same graphs written by hand
+  carry.zig           a recompile's carried reader against a fresh one, bit for bit
   cli.zig             the weft command's output against its goldens, and a client's nouns
   golden/signals.txt  the committed samples
   golden/cli/         the weft command's committed output
@@ -660,8 +661,9 @@ numbers depend on the machine, so it has no thresholds and is not part of `test`
 
 ## Play
 
-Play is Weft's first client: a Patchwork app with three pages on one 600 s clock. Its signals are
-text, `play/signals.weft` and `play/bouncers.weft`, compiled once at start.
+Play is Weft's first client: a Patchwork app with four pages on one 600 s clock. Its signals are
+text, `play/signals.weft` and `play/bouncers.weft`, compiled at start, and the first can be
+edited while it runs.
 
 - **scope** plots eight signals, one or more of each class but live, over a window from one second
   before the playhead to three after it, with each signal's range, its goal where it has one, the
@@ -680,8 +682,19 @@ text, `play/signals.weft` and `play/bouncers.weft`, compiled once at start.
   log lists the last six hits at their exact times, in seconds and flicks. Every hit is read from
   the graph each frame and none is kept, so a pause, a scrub, or a frame rate never changes what
   a time shows.
+- **text** is `signals.weft` in Patchwork's editor, coloured by Weft's own tokenizer, beside the
+  scope's rows and four knobs. Each edit recompiles; a text that does not compile keeps the last
+  good program running and marks its errors, with the first named under the editor. A program
+  that compiles runs from the playhead on, and its readers keep their steps when no simulated
+  node changed (Recompiling and Carry, `src/lang/lang.zig`), so such an edit costs under a
+  millisecond even at 600 s, and a spring in flight does not jump. The knobs here are bound to
+  the numbers of the `track` lines: turning one rewrites the number, one undo entry a drag, and
+  with it the track's history, unlike the shapes page's knobs, which apply from now on. While a
+  knob is dragged, its value is a preview from the playhead on, under a millisecond a step; the
+  release rewrites the history once, which runs a simulated program's steps again: about 10 ms
+  at 60 s, 90 ms at 600 s.
 
-Space or the play button plays and pauses, the page button cycles the pages and 1, 2, and 3 go to
+Space or the play button plays and pauses, the page button cycles the pages and 1 to 4 go to
 each, the slider scrubs, Home and End go to the ends, Left and Right step 100 ms, and Page Up and
 Page Down 10 s.
 
@@ -693,6 +706,7 @@ zig build test                      # its tests, with no GPU
 zig build regress -Doptimize=ReleaseFast   # its scenarios against test/golden (needs a GPU)
 zig build bench -Doptimize=ReleaseFast -- knob_600   # a knob dragged at 600 s, per frame
 zig build bench -Doptimize=ReleaseFast -- play_590   # the scope and its dots playing at 590 s
+zig build test -Doptimize=ReleaseFast   # prints what an edit and a text knob cost at 60 s and 600 s
 ```
 
 It needs Patchwork checked out beside Weft, at `../patchwork`, and Patchwork's requirements.

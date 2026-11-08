@@ -27,6 +27,28 @@
 //! knob applies from now on, costs about a microsecond at the playhead, and scrubbing back shows
 //! what was played. `knob` reads the parameter at t back, so a knob can show it.
 //!
+//! ## 3b. Recompiling
+//! The text page edits `signals.weft` while it runs (step 15), so `Motion` holds two compiled
+//! files, each with its own readers' memory, and `signals` points at the running one. `recompile`
+//! builds the text into the spare file, which never touches the running one, so a text that does
+//! not compile changes nothing but `invalid`, and `problems` reads its errors. A text that
+//! compiles takes the running file's track writes by name, then each reader carries over (Weft's
+//! `Compiled.carry`): its steps and checkpoints, moved node by node, when no simulated node
+//! changed. Otherwise the playhead's reader starts fresh and runs to t, and the scope's takes its
+//! state through `State.adopt`, so the steps run once, not twice. The old readers read t first,
+//! so a knob's write they had not seen yet cannot make their checkpoints stale. Then the files
+//! swap, and the rows, ranges, and report are read again; a row the text no longer declares has
+//! no node, reads 0, and has no range, so it is no shapes source.
+//!
+//! ## 3c. Previews
+//! A text knob's number is a track's value before any write, so changing it rewrites history,
+//! which costs a simulated program its steps again: about 90 ms at 600 s, too much for each
+//! frame of a drag. So while a text knob is dragged, its new value is a preview: written to the
+//! running program's track from the playhead on, as a shapes knob writes, for about a
+//! microsecond. `begin_preview` saves the track first, and `end_preview` puts it back exactly,
+//! since a latch removes what was written after it; the app then recompiles once, and the new
+//! number rewrites the whole history.
+//!
 //! ## 4. The Window
 //! From `t - before_ms` to `t + after_ms`, sample i at `start + floor(i * span / (n - 1))` flicks,
 //! so the first sample is at the start, the last at the end, and every time is a whole flick. The
@@ -65,6 +87,11 @@ const weft = @import("weft");
 const signals = @import("signals.zig");
 
 pub const row_count = signals.row_count;
+/// What the text page needs of the signal table, with nothing of Weft's in it (step 15).
+pub const source = signals.source;
+pub const Problem = signals.Problem;
+pub const TrackLiterals = signals.TrackLiterals;
+pub const track_literals = signals.track_literals;
 pub const scope_row_count = signals.scope_row_count;
 pub const timeline_ms = signals.timeline_ms;
 pub const sample_count = 256;
@@ -117,11 +144,12 @@ pub const Frame = struct {
     /// A node row's goal, sampled.
     goals: [signals.scope_row_count][sample_count]f32,
     /// A path row's goal as `step_counts` steps of a fraction and a value (section 5).
-    steps: [signals.scope_row_count][signals.cue_count + 1][2]f32,
+    steps: [signals.scope_row_count][signals.cue_count_max + 1][2]f32,
     step_counts: [signals.scope_row_count]u32,
     /// The playhead reader's value of each row.
     heads: [signals.row_count]f32,
-    cues: [signals.cue_count]f32,
+    cues: [signals.cue_count_max]f32,
+    cue_count: u32,
     /// The scope rows' events in the window (section 6), and what could not be kept.
     dots: [dots_max]Dot,
     dot_count: u32,
@@ -153,11 +181,28 @@ pub const Hits = struct {
 
 pub const Report = struct { seekable: bool, stepped: bool, first: ?usize };
 
+/// What a recompile did (section 3b).
+pub const Outcome = enum { invalid, fresh, carried };
+
 pub const Motion = struct {
-    signals: signals.Signals,
-    memory: [2][(1 + signals.checkpoint_seconds) * slab]f64,
-    /// The scope's reader, then the playhead's.
+    /// The file running, one of `files`.
+    signals: *signals.Signals,
+    /// Two compiled files: the running one, and the one a recompile builds into (section 3b).
+    files: [2]signals.Signals,
+    active: u1,
+    /// Each file's two readers' slabs and checkpoints.
+    memory: [2][2][(1 + signals.checkpoint_seconds) * slab]f64,
+    /// The scope's reader, then the playhead's, over the running file.
     readers: [2]weft.State,
+    /// The last compile failed, and `files[1 - active]` holds its errors.
+    invalid: bool,
+    /// What the last recompile did with the readers.
+    last: Outcome,
+    /// A text knob's preview (section 3c): the knob, the time it began, and its track as saved.
+    preview_knob: ?usize,
+    preview_since: weft.Time,
+    preview_samples: [signals.track_samples_max]weft.Sample,
+    preview_count: u32,
     ranges: [signals.row_count][2]f32,
     classes: [signals.row_count][]const u8,
     /// No live node, a read can cost steps, and the row of the first simulated node.
@@ -169,23 +214,18 @@ pub const Motion = struct {
 
     /// Builds the program and starts both readers fresh (section 3a).
     pub fn build(motion: *Motion) void {
-        motion.signals.build();
+        motion.active = 0;
+        motion.signals = &motion.files[0];
+        const built = motion.signals.build(signals.source);
+        assert(built);
         const program = motion.signals.program;
-        for (&motion.readers, &motion.memory) |*reader, *memory| {
+        for (&motion.readers, &motion.memory[0]) |*reader, *memory| {
             reader.* = .init_with_checkpoints(program, memory[0..slab], memory[slab..]);
         }
-        var ranges: [signals.node_count_max]weft.Range = undefined;
-        var classes: [signals.node_count_max]weft.Class = undefined;
-        program.ranges(&ranges);
-        program.classes(&classes);
-        const report = program.report();
-        motion.report = .{ .seekable = report.seekable, .stepped = report.stepped, .first = null };
-        for (motion.signals.rows, 0..) |row, index| {
-            const range = ranges[row.id.index];
-            motion.ranges[index] = .{ @floatCast(range.low), @floatCast(range.high) };
-            motion.classes[index] = @tagName(classes[row.id.index]);
-            if (std.meta.eql(report.first_simulated, row.id)) motion.report.first = index;
-        }
+        motion.invalid = false;
+        motion.last = .fresh;
+        motion.preview_knob = null;
+        motion.describe();
         motion.bouncers.build();
         const bouncers = motion.bouncers.program;
         motion.bouncer_reader = .init(bouncers, &motion.bouncer_slab);
@@ -195,6 +235,97 @@ pub const Motion = struct {
             .stepped = plain.stepped,
             .first = null,
         };
+    }
+
+    /// Compiles `text` into the spare file and, if it compiles, runs it from `clock` on: its
+    /// tracks keep their writes, and each reader keeps its steps when no simulated node changed;
+    /// otherwise the playhead's reader starts fresh, is brought to `clock`, and the scope's takes
+    /// its state, so the steps are run once (section 3b). A text that does not compile changes
+    /// nothing but `invalid`, and `problems` says why.
+    pub fn recompile(motion: *Motion, text: []const u8, clock: Clock) Outcome {
+        const spare_index: u1 = 1 - motion.active;
+        const spare = &motion.files[spare_index];
+        if (!spare.build(text)) {
+            motion.invalid = true;
+            return .invalid;
+        }
+        spare.carry_tracks(motion.signals);
+        var readers: [2]weft.State = undefined;
+        var carried = true;
+        for (&readers, &motion.readers, &motion.memory[spare_index]) |*reader, *old, *memory| {
+            reader.* = .init_with_checkpoints(spare.program, memory[0..slab], memory[slab..]);
+            old.eval(clock.t);
+            if (!spare.carry(reader, motion.signals, old)) carried = false;
+        }
+        if (!carried and spare.program.simulated) {
+            const memory = &motion.memory[spare_index];
+            for (&readers, memory) |*reader, *slabs| {
+                reader.* = .init_with_checkpoints(spare.program, slabs[0..slab], slabs[slab..]);
+            }
+            readers[1].eval(clock.t);
+            var same: [signals.node_count_max]?u32 = undefined;
+            for (same[0..spare.program.nodes.len], 0..) |*twin, index| twin.* = @intCast(index);
+            const shared = readers[0].adopt(&readers[1], same[0..spare.program.nodes.len]);
+            assert(shared);
+        }
+        motion.readers = readers;
+        motion.active = spare_index;
+        motion.signals = spare;
+        motion.invalid = false;
+        motion.last = if (carried) .carried else .fresh;
+        motion.describe();
+        return motion.last;
+    }
+
+    /// Saves knob `index`'s track before a preview (section 3c), which then writes it as `write`
+    /// does, from now on, until `end_preview` puts it back.
+    pub fn begin_preview(motion: *Motion, index: usize, clock: Clock) void {
+        assert(motion.preview_knob == null);
+        const id = motion.signals.knobs[index] orelse return;
+        const table = motion.signals.tracks.at(id).table();
+        @memcpy(motion.preview_samples[0..table.len], table);
+        motion.preview_count = @intCast(table.len);
+        motion.preview_since = clock.t;
+        motion.preview_knob = index;
+    }
+
+    /// Takes a preview's writes back: the track holds what it held before, and the readers drop
+    /// only what they worked out from the preview's start on.
+    pub fn end_preview(motion: *Motion) void {
+        const index = motion.preview_knob orelse return;
+        motion.preview_knob = null;
+        const id = motion.signals.knobs[index] orelse return;
+        const saved = motion.preview_samples[0..motion.preview_count];
+        motion.signals.tracks.restore(id, saved, motion.preview_since) catch unreachable;
+    }
+
+    /// The last failed compile's errors, with nothing of Weft's in them.
+    pub fn problems(motion: *const Motion, out: []signals.Problem) []const signals.Problem {
+        if (!motion.invalid) return out[0..0];
+        return motion.files[1 - motion.active].errors(out);
+    }
+
+    /// Each row's range and class, and the report, from the running file. A row the text no
+    /// longer declares has no range, so it is never a source, and the class "absent".
+    fn describe(motion: *Motion) void {
+        const program = motion.signals.program;
+        var ranges: [signals.node_count_max]weft.Range = undefined;
+        var classes: [signals.node_count_max]weft.Class = undefined;
+        program.ranges(ranges[0..program.nodes.len]);
+        program.classes(classes[0..program.nodes.len]);
+        const report = program.report();
+        motion.report = .{ .seekable = report.seekable, .stepped = report.stepped, .first = null };
+        for (motion.signals.rows, 0..) |row, index| {
+            const id = row.id orelse {
+                motion.ranges[index] = .{ std.math.nan(f32), std.math.nan(f32) };
+                motion.classes[index] = "absent";
+                continue;
+            };
+            const range = ranges[id.index];
+            motion.ranges[index] = .{ @floatCast(range.low), @floatCast(range.high) };
+            motion.classes[index] = @tagName(classes[id.index]);
+            if (std.meta.eql(report.first_simulated, id)) motion.report.first = index;
+        }
     }
 
     /// The scope's rows over the window around `clock`, their goals, and the cues.
@@ -213,12 +344,19 @@ pub const Motion = struct {
             previous = time.flicks;
             scope.eval(time);
             for (rows, 0..) |row, r| {
-                frame.samples[r][i] = @floatCast(scope.value(row.id));
+                const id = row.id orelse {
+                    frame.samples[r][i] = 0;
+                    frame.goals[r][i] = 0;
+                    continue;
+                };
+                frame.samples[r][i] = @floatCast(scope.value(id));
                 const goal = if (row.goal == .node) scope.value(row.goal.node) else 0;
                 frame.goals[r][i] = @floatCast(goal);
             }
         }
-        for (motion.signals.cues.table(), &frame.cues) |cue, *at| {
+        const cues = motion.signals.cues.table();
+        frame.cue_count = @intCast(cues.len);
+        for (cues, frame.cues[0..cues.len]) |cue, *at| {
             at.* = part(cue.flicks - start, span);
         }
         for (rows, &frame.steps, &frame.step_counts) |row, *steps, *count| {
@@ -243,7 +381,8 @@ pub const Motion = struct {
         frame.dropped += result.dropped;
         for (found[0..result.count]) |event| {
             const row = for (motion.signals.rows[0..signals.scope_row_count], 0..) |row, index| {
-                if (row.id.index == event.source.index) break index;
+                const id = row.id orelse continue;
+                if (id.index == event.source.index) break index;
             } else continue;
             if (frame.dot_count == dots_max) {
                 frame.dropped += 1;
@@ -316,14 +455,15 @@ pub const Motion = struct {
     /// Latches knob `index`'s parameter at `value` from `clock` on (section 3a). False when its
     /// track is full, which changes nothing.
     pub fn write(motion: *Motion, index: usize, clock: Clock, value: f64) bool {
-        const id = motion.signals.knobs[index];
+        const id = motion.signals.knobs[index] orelse return false;
         motion.signals.tracks.write(id, clock.t, value) catch return false;
         return true;
     }
 
-    /// Knob `index`'s parameter at `clock`.
-    pub fn knob(motion: *const Motion, index: usize, clock: Clock) f64 {
-        return motion.signals.tracks.value(motion.signals.knobs[index], clock.t);
+    /// Knob `index`'s parameter at `clock`, or null when the text no longer declares its track.
+    pub fn knob(motion: *const Motion, index: usize, clock: Clock) ?f64 {
+        const id = motion.signals.knobs[index] orelse return null;
+        return motion.signals.tracks.value(id, clock.t);
     }
 
     /// Every row's value at `clock`, from the playhead reader.
@@ -331,7 +471,7 @@ pub const Motion = struct {
         const head = &motion.readers[1];
         head.eval(clock.t);
         for (motion.signals.rows, &frame.heads) |row, *value| {
-            value.* = @floatCast(head.value(row.id));
+            value.* = if (row.id) |id| @floatCast(head.value(id)) else 0;
         }
     }
 };
@@ -377,7 +517,7 @@ fn expect_bits(expected: f64, found: f32) !void {
 fn fresh_value(motion: *const Motion, row: usize, flicks: i64) f64 {
     var fresh = weft.State.init(motion.signals.program, &fixture.fresh);
     fresh.eval(.{ .flicks = flicks });
-    return fresh.value(motion.signals.rows[row].id);
+    return fresh.value(motion.signals.rows[row].id.?);
 }
 
 // Locks the clock: a 16 ms frame is 11,289,600 flicks and the regress clock's frame 11,760,000; a
@@ -429,13 +569,13 @@ test "the scope matches a fresh state, bit for bit" {
             var fresh = weft.State.init(motion.signals.program, &fixture.fresh);
             fresh.eval(.{ .flicks = start + offset });
             for (motion.signals.rows[0..scope_row_count], 0..) |row, r| {
-                try expect_bits(fresh.value(row.id), fixture.frame.samples[r][i]);
+                try expect_bits(fresh.value(row.id.?), fixture.frame.samples[r][i]);
             }
         }
         var fresh = weft.State.init(motion.signals.program, &fixture.fresh);
         fresh.eval(clock.t);
         for (motion.signals.rows, fixture.frame.heads) |row, head| {
-            try expect_bits(fresh.value(row.id), head);
+            try expect_bits(fresh.value(row.id.?), head);
         }
     }
 }
@@ -703,7 +843,7 @@ test "the scope's dots are a fresh reader's events" {
         var count: u32 = 0;
         for (fixture.events[0..result.count]) |event| {
             const row = for (scope_rows, 0..) |row, index| {
-                if (row.id.index == event.source.index) break index;
+                if (row.id.?.index == event.source.index) break index;
             } else continue;
             const dot = fixture.frame.dots[count];
             try testing.expectEqual(@as(u8, @intCast(row)), dot.row);
@@ -715,7 +855,7 @@ test "the scope's dots are a fresh reader's events" {
         try testing.expect(count > 8);
     }
     var fresh = weft.State.init(motion.signals.program, &fixture.fresh);
-    const goals = .{ scope_rows[3].id, scope_rows[4].id };
+    const goals = .{ scope_rows[3].id.?, scope_rows[4].id.? };
     const twelve = signals.ms(12_000);
     const result = fresh.events(.{ .flicks = 0 }, twelve, &fixture.events);
     var reached: u32 = 0;
@@ -793,7 +933,7 @@ test "no window drops an event over the timeline" {
     var count: usize = 0;
     for (fixture.events[0..all.count]) |event| {
         for (motion.signals.rows[0..scope_row_count]) |row| {
-            if (row.id.index != event.source.index) continue;
+            if (row.id.?.index != event.source.index) continue;
             times[count] = event.time.flicks;
             count += 1;
         }
