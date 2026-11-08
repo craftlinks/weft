@@ -109,6 +109,31 @@ const Formatter = struct {
                 try formatter.write(" in ");
                 try formatter.value(item.b, 0, .signal);
             },
+            .use => {
+                try formatter.write("use ");
+                try formatter.write(name);
+            },
+            .module => {
+                try formatter.write("module ");
+                try formatter.write(name);
+                try formatter.write("(");
+                for (tree.children(item.a), 0..) |child, at| {
+                    if (at > 0) try formatter.write(", ");
+                    const param = tree.item(child);
+                    try formatter.write(tree.token_text(param.token));
+                    if (param.a != 0) {
+                        try formatter.write(": ");
+                        try formatter.value(param.a - 1, 0, .signal);
+                    }
+                }
+                try formatter.write(")");
+                if (item.c != 0) {
+                    try formatter.write(" in ");
+                    try formatter.value(item.c - 1, 0, .signal);
+                }
+                try formatter.write(" = ");
+                try formatter.value(item.b, 0, .signal);
+            },
             .bind, .feed => {
                 try formatter.write(name);
                 try formatter.write(if (item.tag == .bind) " = " else " <- ");
@@ -379,6 +404,26 @@ test "a canonical file formats to its own bytes" {
     ;
     var out: [1024]u8 = undefined;
     try testing.expectEqualStrings(canonical, try format_text(canonical, &out));
+}
+
+test "a module and a use line format to their canonical text" {
+    const canonical =
+        \\use std
+        \\module heavy(goal, time: 0.9s) in 0..2 = spring(goal, time: time, overshoot: 0.1)
+        \\module breathe(base, amount) = base * (1 + amount * wave(sine, 0.2hz))
+        \\out = heavy([c1: 1])
+        \\
+    ;
+    var out: [1024]u8 = undefined;
+    try testing.expectEqualStrings(canonical, try format_text(canonical, &out));
+    var messy: [1024]u8 = undefined;
+    try testing.expectEqualStrings(canonical, try format_text(
+        \\use   std
+        \\module heavy( goal,time:0.9s ) in 0..2=spring(goal,time:time,overshoot:0.1)
+        \\module breathe(base,amount)=base*(1+amount*wave(sine,0.2hz))
+        \\out=heavy([c1:1])
+        \\
+    , &messy));
 }
 
 // Locks the rules of section 1 on a messy file: spacing, blank lines, the order of named

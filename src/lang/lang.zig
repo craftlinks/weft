@@ -26,12 +26,21 @@
 //! signal's node, a track, a cue, or where a signal's goal comes from, by the name the text gave
 //! it, once at init.
 //!
-//! ## 4. Robustness
+//! ## 4. Modules and Libraries
+//! A module (step 13) is checked where it is used: the checker expands it into the arrays a
+//! hand-written graph would fill (`check.zig`, section 6), so the back end and the program never
+//! see one. A library is a file of modules a client passes to `compile_with` by name, and a
+//! `use` line brings its modules in. The core reads no files: a library is text the client
+//! already holds, such as `std_library`, and it is parsed into a `Syntax` of its own, so its
+//! items are in its own tree. A module may declare the range its output stays in; that is
+//! checked after the build, against the instance's node, for an instance bound to a name.
+//!
+//! ## 5. Robustness
 //! Any bytes compile to a program or to at least one diagnostic, and never crash: the fuzz test
 //! below feeds random bytes and mutated examples through compile and format, and every limit is
 //! a diagnostic. A file that parsed formats to canonical text, idempotently.
 //!
-//! ## 5. TigerStyle Invariants
+//! ## 6. TigerStyle Invariants
 //! - No allocation: every array is a field, sized by `Limits`.
 //! - Compile is bounded: one pass for tokens, one for the tree, one for the checks, and one for
 //!   the nodes, each over arrays of fixed size, with expressions nested at most
@@ -47,6 +56,7 @@ pub const format = @import("format.zig");
 pub const check = @import("check.zig");
 pub const back_end = @import("graph.zig");
 const graph = @import("../core/graph.zig");
+const range_module = @import("../core/range.zig");
 const motion = @import("../core/motion.zig");
 const simulation = @import("../core/simulation.zig");
 const track_module = @import("../core/track.zig");
@@ -74,9 +84,20 @@ pub const Limits = struct {
     tracks: u32 = 8,
     /// Each track's samples: the writes it can hold.
     track_samples: u32 = 1024,
+    /// Modules in the file and its libraries.
+    modules: u32 = 32,
+    /// Libraries a file may `use`, passed to `compile_with`. None by default, so a client that
+    /// never uses one pays for no library's tree.
+    libraries: u32 = 0,
     /// Diagnostics kept; more are counted.
     errors: u32 = 16,
 };
+
+/// A library's name and its text, for `compile_with`.
+pub const Source = struct { name: []const u8, text: []const u8 };
+
+/// The standard library, `std`: modules any file may `use std` for (src/lang/std.weft).
+pub const std_library = @embedFile("std.weft");
 
 /// The tokens and tree of one file, for formatting without compiling.
 pub fn Syntax(comptime limits: Limits) type {
@@ -140,6 +161,15 @@ pub fn Compiled(comptime limits: Limits) type {
         checked_regions: [limits.regions]check.Region,
         checked_runs: [limits.regions]check.Run,
         checked_tracks: [limits.tracks]check.Track,
+        modules: [limits.modules]check.Module,
+        frames: [check.frames_max]check.Frame,
+        library_syntax: [limits.libraries]Syntax(limits),
+        library_list: [limits.libraries]check.Library,
+        library_count: u32 = 0,
+        /// The library that failed to parse; `errors` then lists its diagnostics.
+        failed_library: ?u32 = null,
+        instances: [limits.names]check.Instance,
+        ranges: [limits.nodes]range_module.Range,
         checked: check.Checked,
         nodes: [limits.nodes]graph.Node,
         cue_times: [limits.cues]time_module.Time,
@@ -152,6 +182,7 @@ pub fn Compiled(comptime limits: Limits) type {
         ids: [limits.names]Ids,
         goal_sources: [limits.names]GoalSource,
         track_nodes: [limits.tracks]?graph.Id,
+        expr_ids: [limits.tree]?back_end.Ids,
         tables: back_end.Tables,
         program: graph.Program,
         ok: bool,
@@ -159,9 +190,32 @@ pub fn Compiled(comptime limits: Limits) type {
         /// Compiles `source` in place. On an error, `errors` lists what was found, and the
         /// program is not set.
         pub fn compile(compiled: *Self, source: []const u8) error{Invalid}!void {
+            return compiled.compile_with(&.{}, source);
+        }
+
+        /// Compiles `source`, which may `use` any of `libraries`. A library that does not parse
+        /// is an error: `errors` then lists its diagnostics, and `failed_library` names it.
+        pub fn compile_with(compiled: *Self, libraries: []const Source, source: []const u8) error{Invalid}!void {
             compiled.ok = false;
+            compiled.failed_library = null;
+            assert(libraries.len <= limits.libraries);
+            if (comptime limits.libraries > 0) {
+                for (libraries, 0..) |library, at| {
+                    const syntax = &compiled.library_syntax[at];
+                    if (!syntax.parse_source(library.text) or !syntax.tree.complete) {
+                        compiled.failed_library = @intCast(at);
+                        return error.Invalid;
+                    }
+                    compiled.library_list[at] = .{ .name = library.name, .tree = &syntax.tree };
+                }
+            }
+            compiled.library_count = @intCast(libraries.len);
             if (!compiled.syntax.parse_source(source) or !compiled.syntax.tree.complete) return error.Invalid;
             compiled.checked = check.check(&compiled.syntax.tree, .{
+                .modules = &compiled.modules,
+                .frames = &compiled.frames,
+                .libraries = compiled.library_list[0..libraries.len],
+                .instances = &compiled.instances,
                 .bindings = &compiled.bindings,
                 .declarations = &compiled.checked_declarations,
                 .calls = &compiled.calls,
@@ -189,12 +243,35 @@ pub fn Compiled(comptime limits: Limits) type {
                 .ids = &compiled.ids,
                 .goal_sources = &compiled.goal_sources,
                 .track_nodes = &compiled.track_nodes,
+                .expr_ids = &compiled.expr_ids,
             }, &compiled.tables, &compiled.syntax.diagnostics) orelse return error.Invalid;
             compiled.program = program;
+            if (!compiled.check_declared_ranges()) return error.Invalid;
             compiled.ok = true;
         }
 
+        /// Each module instance with a declared range keeps its output inside it (section 3).
+        fn check_declared_ranges(compiled: *Self) bool {
+            if (compiled.checked.instances.len == 0) return true;
+            compiled.program.ranges(compiled.ranges[0..compiled.program.nodes.len]);
+            var ok = true;
+            for (compiled.checked.instances) |instance| {
+                const id = compiled.ids[instance.binding].first;
+                const reached = compiled.ranges[id.index];
+                if (reached.low >= instance.low and reached.high <= instance.high) continue;
+                ok = false;
+                const tree = &compiled.syntax.tree;
+                const at_token = tree.tokens[tree.item(instance.item).token];
+                const found = compiled.syntax.diagnostics.add(.out_of_range, at_token.start, at_token.len, "{s}'s output reaches {d}..{d}, outside its declared {d}..{d}", .{ tree.text(instance.item), reached.low, reached.high, instance.low, instance.high }) orelse continue;
+                diagnostic.hint(found, "narrow the body, or widen the declared range", .{});
+            }
+            return ok;
+        }
+
         pub fn errors(compiled: *const Self) []const Diagnostic {
+            if (comptime limits.libraries > 0) {
+                if (compiled.failed_library) |at| return compiled.library_syntax[at].errors();
+            }
             return compiled.syntax.errors();
         }
 
@@ -419,6 +496,9 @@ const fuzz_seeds = [_][]const u8{
         "bars = cues(bar)\n",
     "cue c0 = 0s\nfb = delay(0)\nl = chase(1 + fb * -0.8, time: 0.5s)\nfb <- l\n" ++
         "f = follow(\n    [0..1], # one\n    by: newtonian(speed: 1, accel: 4, decel: 4),\n    seed: 9,\n)\n",
+    "module m(x, y: 2) in -4..4 = x * y\nmodule n(g) = m(g, y: 0.5) + m(m(g))\n" ++
+        "module w(t: 0.3s) = spring(time: t)\nout = n(wave(sine, 1hz))\n" ++
+        "f = follow([0..1], by: w(), seed: 3)\nuse std\n",
 };
 
 var fuzz_syntax: Syntax(.{}) = undefined;

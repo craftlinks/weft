@@ -35,9 +35,36 @@
 //! and the second seeded call in one declaration hashes that with its ordinal, so adding a line
 //! never reshuffles another.
 //!
-//! ## 6. TigerStyle Invariants
+//! ## 6. Modules
+//! A module is a macro with types (step 13). `register` puts every module of the file, and of
+//! each library a `use` line names, in one table before any declaration is checked, so a module
+//! may be used above its declaration. A call to a module pushes a `Frame` that binds each
+//! parameter to the caller's argument item, then checks the body in that frame: a parameter
+//! reference is checked as its argument, in the frame the argument came from. So the arrays a
+//! module fills are the ones the same graph written by hand fills, and a back end never sees a
+//! module.
+//! - A body sees its parameters, the primitives, and the modules, never the file's names, so a
+//!   library cannot pick up a client's cue by accident.
+//! - A default is a literal, checked in the module's own frame, so a parameter never stands for
+//!   itself.
+//! - A parameter used as a signal is one signal: its first use is checked and kept in the frame,
+//!   and every later use is that expression, which the back end builds once. So `x + x` is
+//!   twice one noise, not two noises with two seeds.
+//! - A frame knows the frame it was called from. A module that is on that chain already is a
+//!   cycle, refused with its path. Using a module inside its own argument, `a(a(1))`, is not one:
+//!   the inner call is checked in the caller's frame.
+//! - A library's items are in its own tree, so an error inside one, and the item a call or an
+//!   expression reports at, is the file's call site (`site_of`).
+//! - An instance's seed base hashes its caller's base, the module's name, and how many instances
+//!   the caller has expanded in this declaration, so section 5 holds inside modules.
+//!
+//! ## 7. TigerStyle Invariants
 //! - Every array is the caller's; a full one is an error naming its limit, and checking stops.
 //! - Names are found by a linear search over at most `Limits.names`, at compile time only.
+//! - The recursion is bounded: expressions nest at most `parse.depth_max` deep, and modules at
+//!   most `module_depth_max`, each frame a counted entry of `Memory.frames`. A parameter's
+//!   argument is always in an earlier frame, or is a literal of its own frame, so following
+//!   arguments ends.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -164,6 +191,10 @@ pub const Memory = struct {
     regions: []Region,
     region_runs: []Run,
     tracks: []Track,
+    modules: []Module,
+    frames: []Frame,
+    libraries: []const Library = &.{},
+    instances: []Instance = &.{},
 };
 
 pub const Checked = struct {
@@ -182,6 +213,7 @@ pub const Checked = struct {
     regions: []const Region,
     region_runs: []const Run,
     tracks: []const Track,
+    instances: []const Instance,
     /// True when no error was found, so a back end may build.
     ok: bool,
 
@@ -198,10 +230,53 @@ pub const Checked = struct {
 
 const Fail = error{Checked};
 
+/// How deep modules may expand: the file's frame, then one frame an instance (section 6).
+pub const module_depth_max = 16;
+pub const frames_max = module_depth_max + 1;
+
+/// A library: a name and the tree its modules are in. A library's items are in its own tree.
+pub const Library = struct { name: []const u8, tree: *const Tree };
+
+/// A module: its name, the tree its declaration is in, and the declaration.
+pub const Module = struct { name: []const u8, tree: *const Tree, item: u32 };
+
+/// What a parameter stands for: an item of frame `frame`, the caller's or the module's own.
+pub const Arg = struct { item: u32, frame: u32 };
+
+/// One expansion, or the file itself (frame 0). A module's body is checked in its frame, and a
+/// parameter reference in it becomes its argument, checked in the frame the argument came from.
+pub const Frame = struct {
+    tree: *const Tree = undefined,
+    /// The file's call that this expansion came from, for errors and calls; a file frame's own.
+    site: u32 = 0,
+    /// The module this frame expands, or null for the file.
+    module: ?u32 = null,
+    /// The frame the module was called from, for the cycle check (section 6).
+    parent: u32 = 0,
+    /// The body's item in `tree`.
+    body: u32 = 0,
+    /// The parameters' items in `tree`, and what each is bound to.
+    param_items: [schema.params_max]u32 = undefined,
+    args: [schema.params_max]Arg = undefined,
+    /// A parameter's signal once checked, so every use of it is the one signal.
+    arg_exprs: [schema.params_max]?u32 = @splat(null),
+    params: u32 = 0,
+    /// The seed the frame's seeded calls hash from (section 5), and how many it has had.
+    seed_base: u64 = 0,
+    seeded: u32 = 0,
+    /// The instances expanded in this frame, for their seeds.
+    instances: u32 = 0,
+    /// The range the module declares for its output, if any, checked after the build.
+    declared: ?[2]f64 = null,
+};
+
+/// A module instance bound to a name with a declared range, checked after the build.
+pub const Instance = struct { binding: u32, low: f64, high: f64, item: u32 };
+
 /// The most items one path or one list of regions holds, compared before it enters its table.
 pub const run_max = 256;
 
-const reserved = [_][]const u8{ "seed", "start", "cue", "track" };
+const reserved = [_][]const u8{ "seed", "start", "cue", "track", "module", "use" };
 
 const Checker = struct {
     tree: *const Tree,
@@ -220,9 +295,14 @@ const Checker = struct {
     track_count: u32 = 0,
     seed: ?u64 = null,
     start_item: ?u32 = null,
-    /// The name of the declaration being checked, and its seeded calls so far (section 5).
-    current_name: []const u8 = "",
-    seeded: u32 = 0,
+    /// The file's tree, and the frame whose tree `tree` is.
+    root: *const Tree = undefined,
+    frame: u32 = 0,
+    frame_count: u32 = 1,
+    module_count: u32 = 0,
+    instance_count: u32 = 0,
+    /// The declared range of the outermost module instance last expanded.
+    declared_last: ?[2]f64 = null,
     stopped: bool = false,
 
     fn source(checker: *const Checker) []const u8 {
@@ -239,10 +319,37 @@ const Checker = struct {
 
     /// The bytes an item covers.
     fn span_of(checker: *const Checker, index: u32) [2]u32 {
-        const it = checker.item(index);
-        const first = checker.tree.tokens[it.first];
-        const last = checker.tree.tokens[it.last];
+        const at = checker.located(index);
+        const it = at.tree.item(at.index);
+        const first = at.tree.tokens[it.first];
+        const last = at.tree.tokens[it.last];
         return .{ first.start, last.start + last.len - first.start };
+    }
+
+    /// Where an item of the current frame is reported: a library's items at their call site.
+    fn located(checker: *const Checker, index: u32) struct { tree: *const Tree, index: u32 } {
+        if (checker.is_library(checker.frame)) return .{ .tree = checker.root, .index = checker.memory.frames[checker.frame].site };
+        return .{ .tree = checker.tree, .index = index };
+    }
+
+    fn is_library(checker: *const Checker, frame: u32) bool {
+        return checker.memory.frames[frame].tree != checker.root;
+    }
+
+    fn in_module(checker: *const Checker) bool {
+        return checker.memory.frames[checker.frame].module != null;
+    }
+
+    /// The item an expression or a call reports at: the file's call site inside a library.
+    fn site_of(checker: *const Checker, index: u32) u32 {
+        if (checker.is_library(checker.frame)) return checker.memory.frames[checker.frame].site;
+        return index;
+    }
+
+    /// Makes `frame` the one items are read from.
+    fn focus(checker: *Checker, frame: u32) void {
+        checker.frame = frame;
+        checker.tree = checker.memory.frames[frame].tree;
     }
 
     fn fail(
@@ -264,7 +371,8 @@ const Checker = struct {
         comptime format: []const u8,
         args: anytype,
     ) ?*error_module.Diagnostic {
-        const token = checker.tree.tokens[checker.item(index).token];
+        const at = checker.located(index);
+        const token = at.tree.tokens[at.tree.item(at.index).token];
         return checker.diagnostics.add(code, token.start, @max(token.len, 1), format, args);
     }
 
@@ -275,7 +383,9 @@ const Checker = struct {
         return error.Checked;
     }
 
+    /// A module sees its parameters only, so the file's names are not found from its body.
     fn find(checker: *const Checker, name: []const u8) ?u32 {
+        if (checker.in_module()) return null;
         for (checker.memory.bindings[0..checker.binding_count], 0..) |binding, index| {
             if (std.mem.eql(u8, binding.name, name)) return @intCast(index);
         }
@@ -330,9 +440,12 @@ const Checker = struct {
     fn declaration(checker: *Checker, index: u32) Fail!void {
         const it = checker.item(index);
         const name = checker.tree.token_text(it.token);
-        checker.current_name = name;
-        checker.seeded = 0;
+        checker.focus(0);
+        checker.memory.frames[0].seed_base = std.hash.Fnv1a_64.hash(name);
+        checker.memory.frames[0].seeded = 0;
+        checker.memory.frames[0].instances = 0;
         switch (it.tag) {
+            .module, .use => {},
             .seed => {
                 if (checker.seed != null) {
                     _ = checker.fail(index, .duplicate_setting, "the file's seed is set twice", .{});
@@ -442,7 +555,9 @@ const Checker = struct {
             _ = checker.fail(it.a, .wrong_type, "a name holds a signal, a path, or regions", .{});
             return error.Checked;
         }
+        checker.declared_last = null;
         const expr = try checker.signal(it.a);
+        const declared = checker.declared_last;
         var binding: Binding = .{ .name = name, .item = index, .kind = .signal, .index = expr };
         const node = checker.memory.exprs[expr];
         if (node.tag == .call and node.b == 0) {
@@ -451,6 +566,13 @@ const Checker = struct {
             binding.delay = entry.op == .delay;
         }
         const at = try checker.declare(index, binding);
+        if (declared) |range| if (value.tag == .call and checker.find_module(checker.text(it.a)) != null) {
+            if (checker.instance_count == checker.memory.instances.len) {
+                return checker.limit(index, "names", checker.memory.instances.len);
+            }
+            checker.memory.instances[checker.instance_count] = .{ .binding = at, .low = range[0], .high = range[1], .item = it.a };
+            checker.instance_count += 1;
+        };
         try checker.push_declaration(index, .{ .signal = .{ .binding = at, .expr = expr } });
     }
 
@@ -490,7 +612,9 @@ const Checker = struct {
             return checker.limit(expr.item, "expressions", checker.memory.exprs.len);
         }
         const at = checker.expr_count;
-        checker.memory.exprs[at] = expr;
+        var placed = expr;
+        placed.item = checker.site_of(expr.item);
+        checker.memory.exprs[at] = placed;
         checker.expr_count += 1;
         return at;
     }
@@ -506,6 +630,13 @@ const Checker = struct {
 
     /// A signal expression (section 3).
     fn signal(checker: *Checker, index: u32) Fail!u32 {
+        if (checker.bound_slot(index)) |slot| {
+            const frame = checker.frame;
+            if (checker.memory.frames[frame].arg_exprs[slot]) |expr| return expr;
+            const expr = try checker.signal_in(checker.memory.frames[frame].args[slot]);
+            checker.memory.frames[frame].arg_exprs[slot] = expr;
+            return expr;
+        }
         const it = checker.item(index);
         switch (it.tag) {
             .literal => {
@@ -520,9 +651,12 @@ const Checker = struct {
             .name => return checker.signal_name(index, 0),
             .call => {
                 const name = checker.text(index);
-                const entry = schema.find(name, .signal) orelse return checker.unknown_call(index);
-                const call = try checker.check_call(entry, index);
-                return checker.push_expr(.{ .tag = .call, .a = call, .item = index });
+                if (schema.find(name, .signal)) |entry| {
+                    const call = try checker.check_call(entry, index);
+                    return checker.push_expr(.{ .tag = .call, .a = call, .item = index });
+                }
+                if (checker.find_module(name)) |module| return checker.expand_signal(module, index);
+                return checker.unknown_call(index);
             },
             .paren => return checker.signal(it.a),
             .add, .multiply => {
@@ -552,35 +686,7 @@ const Checker = struct {
                 const minus_one = try checker.constant(-1, index);
                 return checker.push_expr(.{ .tag = .multiply, .a = operand, .b = minus_one, .item = index });
             },
-            .output => {
-                const base = checker.item(it.a);
-                const output_name = checker.text(index);
-                const entry: *const Entry = switch (base.tag) {
-                    .name => entry: {
-                        const base_name = checker.text(it.a);
-                        const found = checker.find(base_name) orelse return checker.unknown_name(it.a, base_name);
-                        if (checker.memory.bindings[found].entry) |entry| break :entry entry;
-                        const diagnostic = checker.fail_token(index, .unknown_output, "`{s}` has no output `{s}`", .{ base_name, output_name });
-                        error_module.hint(diagnostic, "only a call such as `bounce` has outputs", .{});
-                        return error.Checked;
-                    },
-                    .call => schema.find(checker.text(it.a), .signal) orelse return checker.unknown_call(it.a),
-                    else => {
-                        _ = checker.fail(index, .unknown_output, "only a name or a call has outputs", .{});
-                        return error.Checked;
-                    },
-                };
-                const output = entry.output(output_name) orelse {
-                    const diagnostic = checker.fail_token(index, .unknown_output, "{s} has no output `{s}`", .{ entry.name, output_name });
-                    if (entry.outputs.len > 0) {
-                        error_module.hint(diagnostic, "its outputs are `position` and `{s}`", .{entry.outputs[0]});
-                    }
-                    return error.Checked;
-                };
-                if (base.tag == .name) return checker.signal_name(it.a, output);
-                const call = try checker.check_call(entry, it.a);
-                return checker.push_expr(.{ .tag = .call, .a = call, .b = output, .item = index });
-            },
+            .output => return checker.output(index, it.a, checker.text(index)),
             .list, .range, .goal, .named, .element => {
                 _ = checker.fail(index, .wrong_type, "expected a signal, found {s}", .{item_kind(it.tag)});
                 return error.Checked;
@@ -589,12 +695,53 @@ const Checker = struct {
         }
     }
 
-    fn signal_name(checker: *Checker, index: u32, output: u32) Fail!u32 {
+    /// `base.name`: an output of a call, or of a name bound to one (section 3). `index` is the
+    /// output's item, and `base_index` the item it is taken from.
+    fn output(checker: *Checker, index: u32, base_index: u32, output_name: []const u8) Fail!u32 {
+        if (checker.bound(base_index)) |arg| {
+            const saved = checker.frame;
+            checker.focus(arg.frame);
+            defer checker.focus(saved);
+            return checker.output(arg.item, arg.item, output_name);
+        }
+        const base = checker.item(base_index);
+        const entry: *const Entry = switch (base.tag) {
+            .name => entry: {
+                const base_name = checker.text(base_index);
+                const found = checker.find(base_name) orelse return checker.unknown_name(base_index, base_name);
+                if (checker.memory.bindings[found].entry) |entry| break :entry entry;
+                const diagnostic = checker.fail_token(index, .unknown_output, "`{s}` has no output `{s}`", .{ base_name, output_name });
+                error_module.hint(diagnostic, "only a call such as `bounce` has outputs", .{});
+                return error.Checked;
+            },
+            .call => schema.find(checker.text(base_index), .signal) orelse {
+                const diagnostic = checker.fail(index, .unknown_output, "a module's call has no outputs until it has a name", .{});
+                error_module.hint(diagnostic, "bind it first, such as `x = {s}(…)`, then `x.{s}`", .{ checker.text(base_index), output_name });
+                return error.Checked;
+            },
+            else => {
+                _ = checker.fail(index, .unknown_output, "only a name or a call has outputs", .{});
+                return error.Checked;
+            },
+        };
+        const output_slot = entry.output(output_name) orelse {
+            const diagnostic = checker.fail_token(index, .unknown_output, "{s} has no output `{s}`", .{ entry.name, output_name });
+            if (entry.outputs.len > 0) {
+                error_module.hint(diagnostic, "its outputs are `position` and `{s}`", .{entry.outputs[0]});
+            }
+            return error.Checked;
+        };
+        if (base.tag == .name) return checker.signal_name(base_index, output_slot);
+        const call = try checker.check_call(entry, base_index);
+        return checker.push_expr(.{ .tag = .call, .a = call, .b = output_slot, .item = index });
+    }
+
+    fn signal_name(checker: *Checker, index: u32, output_index: u32) Fail!u32 {
         const name = checker.text(index);
         const found = checker.find(name) orelse return checker.unknown_name(index, name);
         const binding = checker.memory.bindings[found];
         switch (binding.kind) {
-            .signal => return checker.push_expr(.{ .tag = .binding, .a = found, .b = output, .item = index }),
+            .signal => return checker.push_expr(.{ .tag = .binding, .a = found, .b = output_index, .item = index }),
             .track => return checker.push_expr(.{ .tag = .track, .a = binding.index, .item = index }),
             else => {
                 _ = checker.fail(index, .wrong_type, "`{s}` is a {s}, not a signal", .{ name, kind_name(binding.kind) });
@@ -604,6 +751,12 @@ const Checker = struct {
     }
 
     fn unknown_name(checker: *Checker, index: u32, name: []const u8) Fail {
+        if (checker.in_module()) {
+            const module = checker.memory.modules[checker.memory.frames[checker.frame].module.?];
+            const diagnostic = checker.fail(index, .not_a_parameter, "`{s}` is not a parameter of {s}", .{ name, module.name });
+            error_module.hint(diagnostic, "a module sees its parameters, the primitives, and the modules; pass `{s}` in", .{name});
+            return error.Checked;
+        }
         if (checker.declared_later(name)) |later| {
             const line = error_module.locate(checker.source(), checker.span_of(later)[0]).line;
             const diagnostic = checker.fail(index, .used_before_declared, "`{s}` is used before it is declared, on line {d}", .{ name, line });
@@ -678,14 +831,14 @@ const Checker = struct {
         checker.value_count += @intCast(entry.params.len);
         for (entry.params, 0..) |*param, at| {
             const slot = first + at;
-            checker.memory.value_items[slot] = given[at] orelse index;
+            checker.memory.value_items[slot] = checker.site_of(given[at] orelse index);
             checker.memory.values[slot] = if (given[at]) |child|
                 try checker.argument(entry, param, child)
             else
                 try checker.default_of(entry, param, index);
         }
         const at = checker.call_count;
-        checker.memory.calls[at] = .{ .entry = entry, .values = first, .item = index };
+        checker.memory.calls[at] = .{ .entry = entry, .values = first, .item = checker.site_of(index) };
         checker.call_count += 1;
         return at;
     }
@@ -708,15 +861,323 @@ const Checker = struct {
         };
     }
 
+    /// The parameter `index` names in the current frame, bound to its argument (section 6).
+    fn bound(checker: *const Checker, index: u32) ?Arg {
+        const slot = checker.bound_slot(index) orelse return null;
+        return checker.memory.frames[checker.frame].args[slot];
+    }
+
+    /// Which parameter of the current frame `index` names, if it is a parameter's name.
+    fn bound_slot(checker: *const Checker, index: u32) ?u32 {
+        const frame = &checker.memory.frames[checker.frame];
+        assert(checker.frame < checker.frame_count);
+        assert(frame.tree == checker.tree);
+        if (frame.module == null) return null;
+        const it = checker.tree.item(index);
+        if (it.tag != .name) return null;
+        const name = checker.tree.text(index);
+        for (0..frame.params) |at| {
+            if (std.mem.eql(u8, frame.tree.text(frame.param_items[at]), name)) return @intCast(at);
+        }
+        return null;
+    }
+
+    /// Checks a bound argument's signal in the frame it came from.
+    fn signal_in(checker: *Checker, arg: Arg) Fail!u32 {
+        const saved = checker.frame;
+        checker.focus(arg.frame);
+        defer checker.focus(saved);
+        return checker.signal(arg.item);
+    }
+
+    fn find_module(checker: *const Checker, name: []const u8) ?u32 {
+        for (checker.memory.modules[0..checker.module_count], 0..) |module, at| {
+            if (std.mem.eql(u8, module.name, name)) return @intCast(at);
+        }
+        return null;
+    }
+
+    /// Records a module of `tree`, declared at `index`. Errors are reported at `report`, the
+    /// file's `use` line for a library's module, so they point into the file.
+    fn add_module(checker: *Checker, tree: *const Tree, index: u32, report: u32) Fail!void {
+        const name = tree.token_text(tree.item(index).token);
+        for (reserved) |word| {
+            if (std.mem.eql(u8, word, name)) {
+                const diagnostic = checker.fail(report, .reserved_name, "`{s}` is a keyword, not a module's name", .{name});
+                error_module.hint(diagnostic, "choose another name, such as `{s}_1`", .{name});
+                return error.Checked;
+            }
+        }
+        if (schema.find(name, .signal) != null or schema.find(name, .mover) != null) {
+            const diagnostic = checker.fail(report, .reserved_name, "`{s}` is a primitive, not a module's name", .{name});
+            error_module.hint(diagnostic, "choose another name, such as `{s}_1`", .{name});
+            return error.Checked;
+        }
+        if (checker.find_module(name) != null) {
+            const diagnostic = checker.fail(report, .duplicate_name, "the module `{s}` is declared twice", .{name});
+            error_module.hint(diagnostic, "rename one of them, or remove the `use` that brings it in", .{});
+            return error.Checked;
+        }
+        for (tree.children(tree.item(index).a)) |param| {
+            const default = tree.item(param).a;
+            if (default == 0 or tree.item(default - 1).tag == .literal) continue;
+            const diagnostic = checker.fail(report, .wrong_type, "the default of `{s}` in {s} is not a literal", .{ tree.text(param), name });
+            error_module.hint(diagnostic, "a default is a number, a time, or a frequency, such as `0.25s`", .{});
+            return error.Checked;
+        }
+        if (tree.children(tree.item(index).a).len > schema.params_max) {
+            const diagnostic = checker.fail(report, .limit, "`{s}` has more than {d} parameters", .{ name, schema.params_max });
+            error_module.hint(diagnostic, "a module takes at most {d}; split it", .{schema.params_max});
+            return error.Checked;
+        }
+        if (checker.module_count == checker.memory.modules.len) {
+            return checker.limit(report, "modules", checker.memory.modules.len);
+        }
+        checker.memory.modules[checker.module_count] = .{ .name = name, .tree = tree, .item = index };
+        checker.module_count += 1;
+    }
+
+    /// `use name`: every module of the library `name` joins the file's table.
+    fn use_library(checker: *Checker, index: u32) Fail!void {
+        const name = checker.tree.token_text(checker.item(index).token);
+        for (checker.memory.libraries) |library| {
+            if (!std.mem.eql(u8, library.name, name)) continue;
+            for (library.tree.declarations) |declaration_index| {
+                if (library.tree.item(declaration_index).tag != .module) continue;
+                try checker.add_module(library.tree, declaration_index, index);
+            }
+            return;
+        }
+        const diagnostic = checker.fail_token(index, .unknown_library, "there is no library `{s}`", .{name});
+        error_module.hint(diagnostic, "pass it to `compile_with` under its name", .{});
+        return error.Checked;
+    }
+
+    /// Records the file's modules and its `use` lines, before any declaration is checked, so a
+    /// module can be used above or below its declaration.
+    fn register(checker: *Checker, tree: *const Tree) void {
+        for (tree.declarations) |index| {
+            switch (tree.item(index).tag) {
+                .module => checker.add_module(tree, index, index) catch {},
+                .use => checker.use_library(index) catch {},
+                else => {},
+            }
+        }
+    }
+
+    /// Expands the module `module` for `call` (an item of the current frame): binds each
+    /// parameter, and returns the new frame. The caller checks the body there, then frees the
+    /// frame by resetting `frame_count`.
+    fn enter_module(checker: *Checker, module: u32, call: u32) Fail!u32 {
+        const found = checker.memory.modules[module];
+        assert(module < checker.module_count);
+        assert(checker.frame < checker.frame_count);
+        var chain = checker.frame;
+        for (0..checker.frame_count) |_| {
+            if (checker.memory.frames[chain].module == module) return checker.module_cycle(module, call);
+            if (chain == 0) break;
+            chain = checker.memory.frames[chain].parent;
+        }
+        if (checker.frame_count == checker.memory.frames.len) {
+            const diagnostic = checker.fail(call, .limit, "the modules nest deeper than {d}", .{module_depth_max});
+            error_module.hint(diagnostic, "a module that calls a module nests one deeper; flatten the patch", .{});
+            return error.Checked;
+        }
+        const caller = checker.frame;
+        const module_tree = found.tree;
+        const module_item = module_tree.item(found.item);
+        const params = module_tree.children(module_item.a);
+        var given: [schema.params_max]?u32 = @splat(null);
+        try checker.match_module(module_tree, found.name, params, call, &given);
+        const frame_index = checker.frame_count;
+        const caller_frame = &checker.memory.frames[caller];
+        const ordinal = caller_frame.instances;
+        caller_frame.instances += 1;
+        var frame: Frame = .{
+            .tree = module_tree,
+            .site = if (checker.is_library(caller)) caller_frame.site else call,
+            .module = module,
+            .parent = caller,
+            .body = module_item.b,
+            .seed_base = noise_module.hash(caller_frame.seed_base, std.hash.Fnv1a_64.hash(found.name) +% ordinal),
+            .params = @intCast(params.len),
+        };
+        for (params, 0..) |param, at| {
+            const param_item = module_tree.item(param);
+            frame.param_items[at] = param;
+            if (given[at]) |child| {
+                frame.args[at] = .{ .item = child, .frame = caller };
+            } else if (param_item.a != 0) {
+                frame.args[at] = .{ .item = param_item.a - 1, .frame = frame_index };
+            } else {
+                const diagnostic = checker.fail(call, .missing_argument, "{s} needs `{s}`", .{ found.name, module_tree.text(param) });
+                error_module.hint(diagnostic, "add `{s}: …`", .{module_tree.text(param)});
+                return error.Checked;
+            }
+        }
+        checker.memory.frames[frame_index] = frame;
+        checker.frame_count += 1;
+        if (module_item.c != 0) {
+            const saved = checker.frame;
+            checker.focus(frame_index);
+            defer checker.focus(saved);
+            checker.memory.frames[frame_index].declared = checker.number_range(module_item.c - 1) catch |err| {
+                checker.frame_count = frame_index;
+                return err;
+            };
+        }
+        return frame_index;
+    }
+
+    /// Matches a module call's arguments to its parameters, as a primitive's are matched.
+    fn match_module(
+        checker: *Checker,
+        module_tree: *const Tree,
+        name: []const u8,
+        params: []const u32,
+        call: u32,
+        given: *[schema.params_max]?u32,
+    ) Fail!void {
+        var positional: u32 = 0;
+        var named = false;
+        for (checker.tree.children(call)) |child| {
+            const it = checker.item(child);
+            if (it.tag == .named) {
+                named = true;
+                const argument_name = checker.text(child);
+                var slot: ?usize = null;
+                for (params, 0..) |param, at| {
+                    if (std.mem.eql(u8, module_tree.text(param), argument_name)) {
+                        slot = at;
+                        break;
+                    }
+                }
+                const at = slot orelse {
+                    var names: [schema.params_max][]const u8 = undefined;
+                    for (params, 0..) |param, k| names[k] = module_tree.text(param);
+                    const diagnostic = checker.fail_token(child, .unknown_parameter, "{s} has no parameter `{s}`", .{ name, argument_name });
+                    if (error_module.nearest(argument_name, names[0..params.len])) |near| {
+                        error_module.hint(diagnostic, "did you mean `{s}`?", .{near});
+                    }
+                    return error.Checked;
+                };
+                if (given[at] != null) {
+                    _ = checker.fail_token(child, .duplicate_argument, "`{s}` is given twice", .{argument_name});
+                    return error.Checked;
+                }
+                given[at] = it.a;
+                continue;
+            }
+            if (named) {
+                const diagnostic = checker.fail(child, .positional_after_named, "an argument without a name comes after a named one", .{});
+                error_module.hint(diagnostic, "write it first, or give it its name", .{});
+                return error.Checked;
+            }
+            if (positional == params.len) {
+                const diagnostic = checker.fail(child, .too_many_positional, "{s} takes {d} arguments", .{ name, params.len });
+                if (params.len == 0) {
+                    error_module.hint(diagnostic, "call it with none, `{s}()`", .{name});
+                } else {
+                    error_module.hint(diagnostic, "remove the extra ones", .{});
+                }
+                return error.Checked;
+            }
+            given[positional] = child;
+            positional += 1;
+        }
+    }
+
+    /// The error for a module that reaches itself: the modules on the chain of callers, from the
+    /// first time it was called, then itself again.
+    fn module_cycle(checker: *Checker, module: u32, call: u32) Fail!u32 {
+        var chain_modules: [frames_max]u32 = undefined;
+        var count: usize = 0;
+        var chain = checker.frame;
+        for (0..checker.frame_count) |_| {
+            const frame = checker.memory.frames[chain];
+            const of = frame.module orelse break;
+            chain_modules[count] = of;
+            count += 1;
+            if (of == module) break;
+            chain = frame.parent;
+        }
+        assert(count > 0);
+        assert(chain_modules[count - 1] == module);
+        var path: [error_module.hint_len_max]u8 = undefined;
+        var length: usize = 0;
+        var at = count;
+        while (at > 0) {
+            at -= 1;
+            length = append_name(&path, length, checker.memory.modules[chain_modules[at]].name);
+            length = append_name(&path, length, " -> ");
+        }
+        length = append_name(&path, length, checker.memory.modules[module].name);
+        const diagnostic = checker.fail(call, .module_cycle, "the module `{s}` uses itself", .{checker.memory.modules[module].name});
+        error_module.hint(diagnostic, "the cycle is {s}; break it with a parameter or a primitive", .{path[0..length]});
+        return error.Checked;
+    }
+
+    fn append_name(buffer: []u8, length: usize, chunk: []const u8) usize {
+        const room = buffer.len - length;
+        const count = @min(room, chunk.len);
+        @memcpy(buffer[length..][0..count], chunk[0..count]);
+        return length + count;
+    }
+
+    /// `module(args)` as a signal: its body, checked in its frame.
+    fn expand_signal(checker: *Checker, module: u32, call: u32) Fail!u32 {
+        const frame = try checker.enter_module(module, call);
+        defer checker.frame_count = frame;
+        const saved = checker.frame;
+        checker.focus(frame);
+        defer checker.focus(saved);
+        const expr = try checker.signal(checker.memory.frames[frame].body);
+        checker.declared_last = checker.memory.frames[frame].declared;
+        return expr;
+    }
+
+    /// A mover: a primitive mover, or a module whose body is one (section 6).
+    fn mover_of(checker: *Checker, index: u32) Fail!u32 {
+        if (checker.bound(index)) |arg| {
+            const saved = checker.frame;
+            checker.focus(arg.frame);
+            defer checker.focus(saved);
+            return checker.mover_of(arg.item);
+        }
+        const it = checker.item(index);
+        if (it.tag == .call) {
+            const name = checker.text(index);
+            if (schema.find(name, .mover)) |entry| return checker.check_call(entry, index);
+            if (checker.find_module(name)) |module| {
+                const frame = try checker.enter_module(module, index);
+                defer checker.frame_count = frame;
+                const saved = checker.frame;
+                checker.focus(frame);
+                defer checker.focus(saved);
+                return checker.mover_of(checker.memory.frames[frame].body);
+            }
+        }
+        const diagnostic = checker.fail(index, .wrong_type, "`by` takes a mover", .{});
+        error_module.hint(diagnostic, "`spring(time: …)` or `newtonian(speed: …, accel: …, decel: …)`", .{});
+        return error.Checked;
+    }
+
     /// The seed of section 5, for the next seeded call of this declaration.
     fn derived_seed(checker: *Checker) u64 {
-        const base = std.hash.Fnv1a_64.hash(checker.current_name);
-        const ordinal = checker.seeded;
-        checker.seeded += 1;
+        const frame = &checker.memory.frames[checker.frame];
+        const base = frame.seed_base;
+        const ordinal = frame.seeded;
+        frame.seeded += 1;
         return if (ordinal == 0) base else noise_module.hash(base, ordinal);
     }
 
     fn argument(checker: *Checker, entry: *const Entry, param: *const schema.Param, index: u32) Fail!Value {
+        if (checker.bound(index)) |arg| {
+            const saved = checker.frame;
+            checker.focus(arg.frame);
+            defer checker.focus(saved);
+            return checker.argument(entry, param, arg.item);
+        }
         const it = checker.item(index);
         switch (param.kind) {
             .number => {
@@ -802,15 +1263,7 @@ const Checker = struct {
                 }
                 return error.Checked;
             },
-            .mover => {
-                const entry_mover = if (it.tag == .call) schema.find(checker.text(index), .mover) else null;
-                const found = entry_mover orelse {
-                    const diagnostic = checker.fail(index, .wrong_type, "`by` takes a mover", .{});
-                    error_module.hint(diagnostic, "`spring(time: …)` or `newtonian(speed: …, accel: …, decel: …)`", .{});
-                    return error.Checked;
-                };
-                return .{ .mover = try checker.check_call(found, index) };
-            },
+            .mover => return .{ .mover = try checker.mover_of(index) },
             .seed => {
                 const token = checker.tree.tokens[it.token];
                 if (it.tag != .literal or token.tag != .number or it.a == 1) {
@@ -821,7 +1274,7 @@ const Checker = struct {
                     _ = checker.fail(index, .out_of_range, "a seed is a whole number from 0 to 2^64 - 1", .{});
                     return error.Checked;
                 };
-                checker.seeded += 1;
+                checker.memory.frames[checker.frame].seeded += 1;
                 return .{ .seed = seed };
             },
         }
@@ -854,6 +1307,12 @@ const Checker = struct {
 
     /// A cue: a cue's name, or an element of a series.
     fn cue_of(checker: *Checker, index: u32) Fail!u32 {
+        if (checker.bound(index)) |arg| {
+            const saved = checker.frame;
+            checker.focus(arg.frame);
+            defer checker.focus(saved);
+            return checker.cue_of(arg.item);
+        }
         const it = checker.item(index);
         if (it.tag == .element) {
             const base = checker.item(it.a);
@@ -968,6 +1427,12 @@ const Checker = struct {
     }
 
     fn number_range(checker: *Checker, index: u32) Fail![2]f64 {
+        if (checker.bound(index)) |arg| {
+            const saved = checker.frame;
+            checker.focus(arg.frame);
+            defer checker.focus(saved);
+            return checker.number_range(arg.item);
+        }
         const it = checker.item(index);
         if (it.tag != .range) {
             const diagnostic = checker.fail(index, .wrong_type, "expected a range, found {s}", .{item_kind(it.tag)});
@@ -980,6 +1445,12 @@ const Checker = struct {
     }
 
     fn literal_number(checker: *Checker, index: u32, what: []const u8) Fail!f64 {
+        if (checker.bound(index)) |arg| {
+            const saved = checker.frame;
+            checker.focus(arg.frame);
+            defer checker.focus(saved);
+            return checker.literal_number(arg.item, what);
+        }
         const it = checker.item(index);
         const token = checker.tree.tokens[it.token];
         if (it.tag != .literal or token.tag != .number) {
@@ -998,6 +1469,12 @@ const Checker = struct {
 
     /// A time literal in whole flicks (section 4).
     fn literal_time(checker: *Checker, index: u32) Fail!i64 {
+        if (checker.bound(index)) |arg| {
+            const saved = checker.frame;
+            checker.focus(arg.frame);
+            defer checker.focus(saved);
+            return checker.literal_time(arg.item);
+        }
         const it = checker.item(index);
         const token = if (it.tag == .literal) checker.tree.tokens[it.token] else null;
         if (token == null or token.?.tag != .time) {
@@ -1140,8 +1617,11 @@ fn example_of(param: *const schema.Param) []const u8 {
 /// Checks `tree`, which parsed with no error, into `memory`.
 pub fn check(tree: *const Tree, memory: Memory, diagnostics: *Diagnostics) Checked {
     assert(memory.values.len == memory.value_items.len);
-    var checker: Checker = .{ .tree = tree, .memory = memory, .diagnostics = diagnostics };
+    var checker: Checker = .{ .tree = tree, .root = tree, .memory = memory, .diagnostics = diagnostics };
     const before = diagnostics.total();
+    assert(memory.frames.len >= frames_max);
+    memory.frames[0] = .{ .tree = tree };
+    checker.register(tree);
     for (tree.declarations) |index| {
         if (checker.stopped) break;
         checker.declaration(index) catch {};
@@ -1179,6 +1659,7 @@ pub fn check(tree: *const Tree, memory: Memory, diagnostics: *Diagnostics) Check
         .regions = memory.regions[0..checker.region_count],
         .region_runs = memory.region_runs[0..checker.run_count],
         .tracks = memory.tracks[0..checker.track_count],
+        .instances = memory.instances[0..checker.instance_count],
         .ok = diagnostics.total() == before,
     };
 }
