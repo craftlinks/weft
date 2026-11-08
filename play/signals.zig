@@ -55,6 +55,15 @@
 //! Six legs are whole flicks, so those lanes hit 2 to 7 times a bar, exactly on the bars. The
 //! 0.7 lane is step 7's worked bounce, whose hits land one flick after the exact multiples.
 //!
+//! ## 6. Editing
+//! The text page edits `signals.weft` (step 15), so a `Signals` is built from any text, not only
+//! the embedded file: `build` copies the text first, since the program's names and the errors'
+//! places point into it, and returns false, with `errors` as plain `Problem`s, when it does not
+//! compile. Rows and knobs are found by name, so one the text no longer declares is null and the
+//! app shows it absent. The limits leave room for edits: 40 nodes, a slab of 160, and 16 cues.
+//! `track_literals` finds each knob's `track` line with the parser alone, so the text page's
+//! knobs stay bound while another line has an error the checker would refuse.
+//!
 //! ## 5. TigerStyle Invariants
 //! - Every capacity is a constant here, the compiler's limits, and the build asserts the program
 //!   fits them.
@@ -66,11 +75,15 @@ const weft = @import("weft");
 /// Rows: the scope's eight, then the shapes page's eight sources.
 pub const row_count = 16;
 pub const scope_row_count = 8;
+/// The cues `signals.weft` declares, and the most an edit may declare (step 15).
 pub const cue_count = 6;
-pub const node_count_max = 24;
-/// The program's slab, 112 f64 as built, which the build asserts it fits: two readers'
-/// checkpoints for 604 s are about 1.1 MB, so the bound stays close.
-pub const slab_count_max = 112;
+pub const cue_count_max = 16;
+/// Room for edits: `signals.weft` builds 21 nodes and a slab of 112 f64. Four readers'
+/// checkpoints for 604 s (two programs during a recompile, two readers each) are about 3.1 MB.
+pub const node_count_max = 40;
+pub const slab_count_max = 160;
+/// The longest file the editor can compile (step 15).
+pub const text_max = 16 << 10;
 /// Seconds of checkpoints each reader has room for: the timeline, the scope's window after it,
 /// and one more, so a scrub anywhere restores one.
 pub const checkpoint_seconds = 604;
@@ -86,19 +99,20 @@ pub const track_samples_max = 8192;
 
 pub const source = @embedFile("signals.weft");
 
-const Compiled = weft.lang.Compiled(.{
-    .tokens = 1024,
-    .tree = 512,
+const limits: weft.lang.Limits = .{
+    .tokens = 4096,
+    .tree = 2048,
     .names = 64,
     .nodes = node_count_max,
     .slab = slab_count_max,
-    .cues = cue_count,
+    .cues = cue_count_max,
     .goals = 3,
     .regions = 4,
     .tracks = knob_count,
     .track_samples = track_samples_max,
     .errors = 4,
-});
+};
+const Compiled = weft.lang.Compiled(limits);
 
 /// Where a row's goal trace comes from (section 2).
 pub const Goal = union(enum) {
@@ -113,7 +127,8 @@ pub const Row = struct {
     name: []const u8,
     /// An index into `widgets.accents`, cycled.
     accent: u8,
-    id: weft.Id,
+    /// Null when the text no longer declares the row (section 6).
+    id: ?weft.Id,
     goal: Goal,
 };
 
@@ -125,26 +140,35 @@ const row_names = [row_count][]const u8{
 
 pub const Signals = struct {
     compiled: Compiled,
+    /// The text compiled, which the program's names and the errors' places point into, so it
+    /// is a copy the editor's later edits do not move.
+    text: [text_max]u8,
+    text_len: u32,
     cues: *const weft.Cues,
     goals: *const weft.Goals,
     tracks: *weft.Tracks,
-    knobs: [knob_count]weft.TrackId,
+    /// Null for a knob whose track the text no longer declares (section 6).
+    knobs: [knob_count]?weft.TrackId,
     rows: [row_count]Row,
     program: weft.Program,
 
-    /// Compiles `signals.weft` in place and finds the rows and the knobs by name.
-    pub fn build(signals: *Signals) void {
-        signals.compiled.compile(source) catch unreachable;
+    /// Compiles a copy of `text` in place and finds the rows and the knobs by name. False when
+    /// the text does not compile, with `errors` saying why; nothing else is then set.
+    pub fn build(signals: *Signals, text: []const u8) bool {
+        if (text.len > text_max) return false;
+        @memcpy(signals.text[0..text.len], text);
+        signals.text_len = @intCast(text.len);
         const compiled = &signals.compiled;
+        compiled.compile(signals.text[0..text.len]) catch return false;
         signals.cues = &compiled.tables.cues;
         signals.goals = &compiled.tables.goals;
         signals.tracks = &compiled.tables.tracks;
-        for (&signals.knobs, knob_names) |*knob, name| knob.* = compiled.track(name).?;
+        for (&signals.knobs, knob_names) |*knob, name| knob.* = compiled.track(name);
         for (&signals.rows, row_names, 0..) |*row, name, index| {
             row.* = .{
                 .name = name,
                 .accent = @intCast(index % 4),
-                .id = compiled.signal(name).?,
+                .id = compiled.signal(name),
                 .goal = switch (compiled.goal(name)) {
                     .none => .none,
                     .path => |path| .{ .path = .{ .path = path.path, .from = path.from } },
@@ -153,11 +177,93 @@ pub const Signals = struct {
             };
         }
         signals.program = compiled.program;
-        assert(signals.cues.count == cue_count);
+        assert(signals.cues.count <= cue_count_max);
         assert(signals.program.nodes.len <= node_count_max);
         assert(signals.program.slab_count <= slab_count_max);
+        return true;
+    }
+
+    /// The errors of the last `build` that failed, as plain text and byte places (section 6).
+    pub fn errors(signals: *const Signals, out: []Problem) []const Problem {
+        const found = signals.compiled.errors();
+        const count = @min(found.len, out.len);
+        const text = signals.text[0..signals.text_len];
+        for (out[0..count], found[0..count]) |*problem, *diagnostic| {
+            const place = weft.lang.diagnostic.locate(text, diagnostic.start);
+            problem.* = .{
+                .start = diagnostic.start,
+                .end = @min(diagnostic.start + diagnostic.len, signals.text_len),
+                .line = place.line,
+                .column = place.column,
+                .message = diagnostic.message_text(),
+                .hint = diagnostic.hint_text(),
+            };
+        }
+        return out[0..count];
+    }
+
+    /// Keeps `old`'s reader state in `state`, a reader of this program, when no simulated node
+    /// changed (Weft's `Compiled.carry`); false otherwise.
+    pub fn carry(signals: *const Signals, state: *weft.State, old: *const Signals, old_state: *const weft.State) bool {
+        return signals.compiled.carry(state, &old.compiled, old_state);
+    }
+
+    /// Writes `old`'s track writes into this program's tracks of the same names.
+    pub fn carry_tracks(signals: *Signals, old: *const Signals) void {
+        signals.compiled.carry_tracks(&old.compiled);
     }
 };
+
+/// An error of the text, with nothing of Weft's in it (section 6).
+pub const Problem = struct {
+    start: u32,
+    end: u32,
+    line: u32,
+    column: u32,
+    message: []const u8,
+    hint: []const u8,
+};
+
+/// The three number literals of a knob's track line, `track name = value in lo..hi`, as byte
+/// ranges of the text (section 6).
+pub const TrackLiterals = struct { value: [2]u32, lo: [2]u32, hi: [2]u32 };
+
+var binding_syntax: weft.lang.Syntax(limits) = undefined;
+
+/// Each knob's track line in `text`, found by its name, or null where the text does not parse,
+/// the track is gone, or one of its three numbers is not a plain number literal. Runs the
+/// parser only, so it finds them while the text has errors the checker would refuse.
+pub fn track_literals(text: []const u8, out: *[knob_count]?TrackLiterals) void {
+    out.* = @splat(null);
+    if (text.len > text_max) return;
+    _ = binding_syntax.parse_source(text);
+    const tree = &binding_syntax.tree;
+    if (!tree.complete) return;
+    for (tree.declarations) |index| {
+        const item = tree.item(index);
+        if (item.tag != .track) continue;
+        const name = tree.token_text(item.token);
+        const knob = for (knob_names, 0..) |known, at| {
+            if (std.mem.eql(u8, known, name)) break at;
+        } else continue;
+        const bounds = tree.item(item.b);
+        if (bounds.tag != .range) continue;
+        const value = number_literal(tree, item.a) orelse continue;
+        const lo = number_literal(tree, bounds.a) orelse continue;
+        const hi = number_literal(tree, bounds.b) orelse continue;
+        out[knob] = .{ .value = value, .lo = lo, .hi = hi };
+    }
+}
+
+/// The bytes of a plain number literal, its sign included, or null for anything else.
+fn number_literal(tree: anytype, index: u32) ?[2]u32 {
+    const item = tree.item(index);
+    if (item.tag != .literal) return null;
+    if (tree.tokens[item.token].tag != .number) return null;
+    const first = tree.tokens[item.first];
+    const last = tree.tokens[item.last];
+    return .{ first.start, last.start + last.len };
+}
 
 /// The bouncers page's lanes: step 7's worked bounce, then six that hit 2 to 7 times a bar.
 pub const lane_count = 7;
@@ -265,7 +371,7 @@ fn program_hash(program: weft.Program, tracks: *const weft.Tracks) u64 {
 // text replaced in step 12, checked field for field then, so a change to either file or to the
 // compiler that moves a node shows here, before the goldens.
 test "the text compiles to the programs it replaced" {
-    built.build();
+    try testing.expect(built.build(source));
     built_bouncers.build();
     try testing.expectEqual(@as(u64, 0xdea1386a4be8a783), program_hash(built.program, built.tracks));
     const bouncer_tracks = &built_bouncers.compiled.tables.tracks;
@@ -275,12 +381,12 @@ test "the text compiles to the programs it replaced" {
 // Locks what the rows find by name: the spring's and the Newtonian move's shared path, the chase's
 // target, and the knobs' bounds.
 test "rows, goals, and knobs come from the text by name" {
-    built.build();
+    try testing.expect(built.build(source));
     try testing.expectEqual(built.rows[3].goal.path.path, built.rows[4].goal.path.path);
     try testing.expectEqual(@as(f64, 0), built.rows[3].goal.path.from);
-    try testing.expectEqual(built.rows[1].id, built.rows[5].goal.node);
+    try testing.expectEqual(built.rows[1].id.?, built.rows[5].goal.node);
     try testing.expect(built.rows[0].goal == .none);
-    const glide = built.tracks.at(built.knobs[3]);
+    const glide = built.tracks.at(built.knobs[3].?);
     try testing.expectEqual(@as(f64, 0.25), glide.low);
     try testing.expectEqual(@as(f64, 4), glide.high);
     try testing.expectEqual(@as(f64, 1), glide.initial);

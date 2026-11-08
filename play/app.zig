@@ -1,10 +1,12 @@
 //! Play: Weft's own Modulator Play on Patchwork: a scope of signals around a playhead, a page of
-//! shapes whose parameters any signal can drive, and a page of bouncers whose hits are events.
+//! shapes whose parameters any signal can drive, a page of bouncers whose hits are events, and a
+//! page where `signals.weft` is edited while it runs.
 //!
 //! # Deep Architectural Guide for Reviewers:
 //!
-//! ## 1. The Two-File Rule
-//! Only `signals.zig` and `glue.zig` import `weft`. This file, `scope.zig`, `patch.zig`,
+//! ## 1. The Three-File Rule
+//! Only `signals.zig`, `glue.zig`, and `language.zig` import `weft`; the last only for its
+//! tokenizer, which colours the editor. This file, `scope.zig`, `patch.zig`,
 //! `shapes.zig`, and `bouncers.zig` see time as a `glue.Clock` and everything else as `f32`
 //! arrays and plain structs, so the app is the only glue between Weft and Patchwork, and neither
 //! library knows the other exists. The app reads each row's name, accent, and goal kind from the
@@ -22,6 +24,8 @@
 //!            y 56..712 (`shapes.zig`)
 //! bouncers   seven lanes of 80 px from y 48: a 200 px label column with the small bouncer, then
 //!            the lane (`bouncers.zig`); the log of six lines from y 616
+//! text       the editor x 8..712, y 56..668, and its status line under it; four knobs from
+//!            x 736 as on the shapes page; the scope's eight rows of 60 px from y 224, x 728..1280
 //! ```
 //! Each scope plot and each lane is a window from `t - 1 s` to `t + 3 s`, so the playhead sits at
 //! a quarter of its width. The shapes page reads only the playhead reader, so it never samples
@@ -59,7 +63,12 @@
 //! `shapes` and `shapes_play` are the shapes page still and playing. `repoint` moves lines.width
 //! two rows on. `knob` moves to 2 s, drags `chase s` to 1 s there, and shows the scope: the chase
 //! slows from 2 s on and not before. `knob_600` drags `pulse hz` up and down at 600 s, a write each
-//! frame: the bench scenario. `bouncers` and `bouncers_play` are the bouncers page still and
+//! frame: the bench scenario. `text` is the text page still. `text_edit` clicks the wave's line,
+//! goes to its end, and types ` * 2`; `text_error` types ` +`, which does not compile; `text_knob`
+//! drags the `pulse hz` text knob. `text_600` types a space and deletes it at 600 s, a recompile
+//! each frame, and `text_knob_60` and `text_knob_600` drag that knob and let it go at 60 s and
+//! 600 s, a release, so a recompile that rewrites the history, each frame: the benches for
+//! section 8. `bouncers` and `bouncers_play` are the bouncers page still and
 //! playing, and `bouncers_300` scrubs to 300 s, where six lanes hit at once. `play_590` and
 //! `bouncers_590` play from 590 s on the scope and the bouncers: the benches for the events.
 //!
@@ -69,7 +78,34 @@
 //! quarter second (`bouncers.zig`, section 3). The app keeps none of them between frames, so a
 //! scrub, a pause, or a frame rate never changes what a time shows.
 //!
-//! ## 8. TigerStyle Invariants
+//! ## 8. The Text Page
+//! The editor holds `signals.weft`, coloured by Weft's own tokenizer (`language.zig`). Each event
+//! on the page goes to the editor, then to its knobs; when the editor's revision moved, the glue
+//! recompiles its text (`glue.zig`, section 3b). A text that does not compile keeps the last good
+//! program running: its errors are marked in the text and the first is named, with its place and
+//! hint, in the status line. One that compiles runs from the playhead on, and its readers keep
+//! their steps when no simulated node changed, so an edit costs under a millisecond at 600 s, and
+//! a spring in flight never jumps for a line it does not read.
+//!
+//! A knob means two things on two pages, as Weft's step 9 review set out. The shapes page's knobs
+//! apply from now on: each writes its track at t. The text page's knobs are bound to the number
+//! after `track name =`, the track's value before any write, so turning one rewrites the text,
+//! and with it the whole history of every node that reads the track. Their numbers come from a
+//! parse of the editor's text, not from the last good program, so they stay bound while another
+//! line has an error. A knob moves in steps of its number's last digit, between its bounds rounded
+//! to those digits (`editor.literal`, Patchwork's step 53): `0.3 in 0.075..1.2` moves from 0.1 to
+//! 1.2 by 0.1. A drag, or a wheel run until any other event but a pointer move or a frame, is one
+//! editor gesture, so one undo entry, and Ctrl+Z reaches the text with no focus on it; while a
+//! knob holds the gesture, keys do not reach the editor, since undo asserts inside one.
+//!
+//! Rewriting a simulated node's history runs its steps again, about 10 ms at 60 s and 90 ms at
+//! 600 s, which step 9 measured, so a drag does not recompile at each step. Each step writes the
+//! number in the text and writes the track from the playhead on, a preview that costs what a
+//! shapes knob costs (`glue.zig`, section 3c); the release takes the preview back and recompiles
+//! once. So a drag step costs under a millisecond at any t, and the history is rewritten when the
+//! knob is let go. A right press resets the number in one write, compiled at once.
+//!
+//! ## 9. TigerStyle Invariants
 //! - No allocation: the program, both readers' slabs and checkpoints, and the sampled frame live
 //!   in `App`, which the host keeps in static memory and which never moves.
 //! - A knob change is one track write; `writes` counts them for the tests.
@@ -83,7 +119,10 @@ const patch = @import("patch.zig");
 const scope = @import("scope.zig");
 const shapes = @import("shapes.zig");
 const bouncers = @import("bouncers.zig");
+const language = @import("language.zig");
 const input = patchwork.input;
+const literal = patchwork.editor.literal;
+const WeftEditor = patchwork.editor.EditorOf(language);
 const quads = patchwork.draw;
 const text = patchwork.text;
 const theme = patchwork.theme;
@@ -131,16 +170,35 @@ pub const Page = enum {
     scope,
     shapes,
     bouncers,
+    text,
 
     /// The page the page button goes to.
     pub fn next(page: Page) Page {
         return switch (page) {
             .scope => .shapes,
             .shapes => .bouncers,
-            .bouncers => .scope,
+            .bouncers => .text,
+            .text => .scope,
         };
     }
 };
+
+/// The text page (section 8): the editor, its status line, the four knobs bound to the track
+/// lines' numbers, and the scope's rows in a narrower column.
+pub const editor_rect: Rect = .{ .x = 8, .y = 56, .width = 704, .height = 612 };
+pub const status_rect: Rect = .{ .x = 8, .y = 676, .width = 704, .height = 36 };
+pub const text_rows_y: f32 = 224;
+pub const text_row_height: f32 = 60;
+pub const text_column_x: f32 = 728;
+const problems_max = 4;
+const editor_size: f32 = 15;
+
+/// The rect of text knob `index`, in two rows of two like the shapes page's.
+pub fn text_knob_rect(index: usize) Rect {
+    var rect = knob_rect(index);
+    rect.x += text_column_x - 8;
+    return rect;
+}
 
 /// The x of slider value `value` from the slider's left edge, as a scenario's `click_at` takes it.
 pub fn scrub_x(value: f32) f32 {
@@ -195,6 +253,31 @@ const click_300s: Step = .{ .click_at = .{ .target = scrub_target, .x = scrub_x(
 const click_500s: Step = .{ .click_at = .{ .target = scrub_target, .x = 525, .y = 16 } };
 const repoint_width: Step = .{ .click = patchwork.bench.area("source", 1) };
 const right: Step = .{ .key = .{ .key = .right, .text = "" } };
+const page_4: Step = .{ .key = .{ .key = .other, .text = "4" } };
+const line_end: Step = .{ .key = .{ .key = .end, .text = "" } };
+const backspace: Step = .{ .key = .{ .key = .backspace, .text = "" } };
+/// A click on line 21 of `signals.weft`, `wave = wave(sine, 0.5hz)`, which gives the editor focus.
+const click_wave_line: Step = .{ .click_at = .{
+    .target = patchwork.bench.area("editor", 0),
+    .x = 200,
+    .y = patchwork.editor.padding_px + 20 * 21 + 10,
+} };
+
+/// A key that types `text`.
+fn type_key(comptime text_typed: []const u8) Step {
+    return .{ .key = .{ .key = .other, .text = text_typed } };
+}
+
+/// A drag of `dy` px on text knob `index`, as `knob_drag` does on the shapes page.
+fn text_knob_drag(comptime index: u32, dy: f32) Step {
+    return .{ .drag = .{
+        .target = patchwork.bench.area("text_knob", index),
+        .from_x = 40,
+        .from_y = 36,
+        .dx = 0,
+        .dy = dy,
+    } };
+}
 
 /// A drag of `dy` px on knob `index` from its centre: up is positive v, 120 px for the whole range.
 fn knob_drag(comptime index: u32, dy: f32) Step {
@@ -206,6 +289,9 @@ fn knob_drag(comptime index: u32, dy: f32) Step {
         .dy = dy,
     } };
 }
+
+/// A text knob's drag or wheel run in progress (section 8).
+const Gesture = struct { knob: u8, wheel: bool };
 
 pub const App = struct {
     clock: glue.Clock,
@@ -226,20 +312,34 @@ pub const App = struct {
     hits: glue.Hits,
     row_dots: [glue.scope_row_count][glue.dots_max][2]f32,
     row_dot_counts: [glue.scope_row_count]u32,
+    /// The text page (section 8): `signals.weft` in the editor.
+    editor: WeftEditor,
+    /// The editor's revision the running program, or the last errors, were compiled from.
+    compiled_revision: u64,
+    text_knobs: [knob_count]widgets.Knob,
+    /// Each knob's track line's three numbers in the editor's text, or null when unbound.
+    literals: [knob_count]?glue.TrackLiterals,
+    /// The text knob whose drag or wheel run holds an editor gesture and a preview open.
+    gesture: ?Gesture,
+    problems: [problems_max]glue.Problem,
+    problem_count: u32,
+    /// Recompiles so far, and how many kept their readers, for the tests.
+    recompiles: u32,
+    carried: u32,
 
     pub const config: patchwork.app.Config = .{
         .title = "play",
         .timer_period_ms = 0,
         .draw = &.{
-            .{ .type = quads.Box, .cap = 320 },
+            .{ .type = quads.Box, .cap = 768 },
             .{ .type = quads.Arc, .cap = 16 },
             .{ .type = quads.Fill, .cap = 32 },
             .{ .type = quads.Path, .cap = 1024 },
-            .{ .type = quads.Glyph, .cap = 1536 },
+            .{ .type = quads.Glyph, .cap = 1536 + patchwork.editor.glyph_bound(704, 612, editor_size) },
         },
         .batch_order = .registered,
         .batch_cap = 32,
-        .area_cap = 32,
+        .area_cap = 64,
         .point_cap = 8192,
     };
 
@@ -301,6 +401,48 @@ pub const App = struct {
             .frames = 1,
         },
         .{
+            .name = "text",
+            .setup = &.{ page_4, .{ .wait = 2 } },
+            .cycle = &.{.{ .wait = 1 }},
+            .frames = 1,
+        },
+        .{
+            .name = "text_edit",
+            .setup = &.{ page_4, click_wave_line, line_end, type_key(" "), type_key("*"), type_key(" "), type_key("2"), .{ .wait = 3 } },
+            .cycle = &.{.{ .wait = 1 }},
+            .frames = 1,
+        },
+        .{
+            .name = "text_error",
+            .setup = &.{ page_4, click_wave_line, line_end, type_key(" "), type_key("+"), .{ .wait = 3 } },
+            .cycle = &.{.{ .wait = 1 }},
+            .frames = 1,
+        },
+        .{
+            .name = "text_knob",
+            .setup = &.{ page_4, text_knob_drag(0, -30), .{ .wait = 3 } },
+            .cycle = &.{.{ .wait = 1 }},
+            .frames = 1,
+        },
+        .{
+            .name = "text_600",
+            .setup = &.{ end, page_4, click_wave_line, line_end, .{ .wait = 2 } },
+            .cycle = &.{ type_key(" "), backspace },
+            .frames = 20,
+        },
+        .{
+            .name = "text_knob_60",
+            .setup = &([_]Step{page_4} ++ @as([6]Step, @splat(.{ .key = .{ .key = .page_down, .text = "" } })) ++ [_]Step{.{ .wait = 2 }}),
+            .cycle = &.{ text_knob_drag(0, -12), text_knob_drag(0, 12) },
+            .frames = 6,
+        },
+        .{
+            .name = "text_knob_600",
+            .setup = &.{ end, page_4, .{ .wait = 2 } },
+            .cycle = &.{ text_knob_drag(0, -12), text_knob_drag(0, 12) },
+            .frames = 6,
+        },
+        .{
             .name = "play_590",
             .setup = &.{ end, page_up, space },
             .cycle = &.{},
@@ -335,6 +477,19 @@ pub const App = struct {
             knob.* = widgets.Knob.init(id, name, 0.5, widgets.accents[index % widgets.accents.len]);
         }
         app.writes = 0;
+        app.editor.init(ui.id("editor", 0), WeftEditor.default_style);
+        const loaded = app.editor.load(glue.source);
+        assert(loaded);
+        app.compiled_revision = app.editor.revision();
+        for (&app.text_knobs, knob_names, 0..) |*knob, name, index| {
+            const id = ui.id("text_knob", @intCast(index));
+            knob.* = widgets.Knob.init(id, name, 0.5, widgets.accents[index % widgets.accents.len]);
+        }
+        app.gesture = null;
+        app.problem_count = 0;
+        app.recompiles = 0;
+        app.carried = 0;
+        app.bind_literals();
         for (&app.patch, &app.sources, 0..) |*row, *source, index| {
             row.* = app.row_named(patch.destinations[index].source);
             const id = ui.id("source", @intCast(index));
@@ -351,6 +506,7 @@ pub const App = struct {
     }
 
     pub fn event(app: *App, cx: *Context, event_value: input.Event) void {
+        if (app.page == .text) app.text_event(cx, event_value);
         if (app.play.handle(cx, event_value) == .clicked) app.toggle(cx);
         if (app.page_button.handle(cx, event_value) == .clicked) app.show(cx, app.page.next());
         switch (app.scrub.handle(cx, event_value)) {
@@ -387,6 +543,7 @@ pub const App = struct {
     }
 
     fn key(app: *App, cx: *Context, press: input.KeyPress) void {
+        if (app.page == .text and cx.focused(app.editor.id)) return;
         switch (press.key) {
             .home => app.clock.seek(0),
             .end => app.clock.seek(1),
@@ -400,6 +557,7 @@ pub const App = struct {
                 if (std.mem.eql(u8, typed, "1")) return app.show(cx, .scope);
                 if (std.mem.eql(u8, typed, "2")) return app.show(cx, .shapes);
                 if (std.mem.eql(u8, typed, "3")) return app.show(cx, .bouncers);
+                if (std.mem.eql(u8, typed, "4")) return app.show(cx, .text);
                 return;
             },
             else => return,
@@ -448,10 +606,189 @@ pub const App = struct {
             .scope => app.draw_scope(cx, clip),
             .shapes => app.draw_shapes(cx, clip),
             .bouncers => app.draw_bouncers(cx, clip),
+            .text => app.draw_text(cx, clip),
         }
     }
 
-    fn draw_scope(app: *App, cx: *Context, clip: Clip) void {
+    /// The text page's events (section 8). A wheel run on a knob ends at any event but another
+    /// wheel, a pointer move, or a frame. Then the editor, unless a knob holds its gesture open,
+    /// since undo asserts inside one; then Ctrl+Z and Ctrl+Y with nothing focused; then the
+    /// knobs; then a recompile if the text moved and no knob holds it.
+    fn text_event(app: *App, cx: *Context, event_value: input.Event) void {
+        if (app.gesture) |gesture| if (gesture.wheel) switch (event_value) {
+            .wheel, .pointer_move, .frame => {},
+            else => app.end_gesture(cx),
+        };
+        const keyed = switch (event_value) {
+            .key_down, .key_up, .paste => true,
+            else => false,
+        };
+        if (!(keyed and app.gesture != null)) _ = app.editor.handle(cx, event_value);
+        // Ctrl+Z and Ctrl+Y reach the text with no focus on it, so a knob's write undoes from
+        // where the knob left focus, as in Patchwork's session example.
+        if (app.gesture == null and cx.focus == .none) switch (event_value) {
+            .key_down => |press| if (press.mods.shortcut()) switch (press.key) {
+                .z => _ = if (press.mods.shift) app.editor.redo(cx) else app.editor.undo(cx),
+                .y => _ = app.editor.redo(cx),
+                else => {},
+            },
+            else => {},
+        };
+        for (&app.text_knobs, 0..) |*knob, index| switch (knob.handle(cx, event_value)) {
+            .changed => |value| app.turn_text(cx, @intCast(index), value, if (event_value == .wheel) .wheel else .drag),
+            .reset => |value| app.turn_text(cx, @intCast(index), value, .reset),
+            .released => if (app.gesture) |gesture| {
+                if (gesture.knob == index) app.end_gesture(cx);
+            },
+            .none => {},
+        };
+        app.sync(cx);
+    }
+
+    const Turn = enum { drag, wheel, reset };
+
+    /// Sets text knob `index`'s number to the step at `value` of its range by rewriting its
+    /// literal (section 8). A drag or a wheel run is one editor gesture, one undo entry, and a
+    /// preview until it ends: each step writes the number and the track from the playhead on,
+    /// and the recompile that rewrites the history waits for the end (`glue.zig`, section 3c).
+    /// A reset is one write, compiled at once.
+    fn turn_text(app: *App, cx: *Context, index: u8, value: f32, turn: Turn) void {
+        const bound = app.literals[index] orelse return;
+        const numbers = app.literal_numbers(bound) orelse return;
+        const steps = literal.steps(numbers[1], numbers[0], numbers[2]) orelse return;
+        const span: f64 = @floatFromInt(steps.hi - steps.lo);
+        const units = steps.lo + @as(i64, @intFromFloat(@round(@as(f64, value) * span)));
+        if (units == numbers[0].units) return;
+        if (app.gesture) |gesture| if (gesture.knob != index) app.end_gesture(cx);
+        const fixed = numbers[0].with_units(units);
+        if (turn != .reset and app.gesture == null) {
+            app.editor.gesture_begin();
+            app.motion.begin_preview(index, app.clock);
+            app.gesture = .{ .knob = index, .wheel = turn == .wheel };
+        }
+        const range: literal.Range = .{ .start = bound.value[0], .end = bound.value[1] };
+        _ = literal.write(&app.editor, range, fixed) orelse return;
+        if (app.gesture != null) {
+            if (app.motion.write(index, app.clock, literal.to_f64(fixed))) app.writes += 1;
+        }
+        cx.redraw();
+    }
+
+    /// Ends a knob's gesture: its preview is taken back, the editor closes the undo entry, and
+    /// the one recompile the gesture waited for runs.
+    fn end_gesture(app: *App, cx: *Context) void {
+        assert(app.gesture != null);
+        app.motion.end_preview();
+        app.editor.gesture_end();
+        app.gesture = null;
+        app.sync(cx);
+    }
+
+    /// A bound track line's value, low, and high, parsed from the editor's text.
+    fn literal_numbers(app: *const App, bound: glue.TrackLiterals) ?[3]literal.Fixed {
+        const bytes = app.editor.text();
+        return .{
+            literal.parse(bytes[bound.value[0]..bound.value[1]]) orelse return null,
+            literal.parse(bytes[bound.lo[0]..bound.lo[1]]) orelse return null,
+            literal.parse(bytes[bound.hi[0]..bound.hi[1]]) orelse return null,
+        };
+    }
+
+    /// Recompiles when the editor's text moved since the last compile (section 8), then binds
+    /// the knobs and marks the errors from the new text. While a knob holds a gesture, the text
+    /// is only parsed again for the knobs' places, and the recompile waits for its end.
+    fn sync(app: *App, cx: *Context) void {
+        if (app.editor.revision() == app.compiled_revision) return;
+        if (app.gesture != null) {
+            app.bind_literals();
+            return;
+        }
+        app.compiled_revision = app.editor.revision();
+        const outcome = app.motion.recompile(app.editor.text(), app.clock);
+        app.recompiles += 1;
+        if (outcome == .carried) app.carried += 1;
+        app.problem_count = @intCast(app.motion.problems(&app.problems).len);
+        app.bind_literals();
+        cx.redraw();
+    }
+
+    fn bind_literals(app: *App) void {
+        glue.track_literals(app.editor.text(), &app.literals);
+        app.decorate();
+    }
+
+    /// A box on each bound number, and the errors, as the editor's decorations.
+    fn decorate(app: *App) void {
+        const editor = &app.editor;
+        const length: u32 = @intCast(editor.text().len);
+        editor.decoration_count = 0;
+        for (app.literals) |found| {
+            const bound = found orelse continue;
+            editor.decorations[editor.decoration_count] = .{ .start = bound.value[0], .end = bound.value[1], .kind = .box };
+            editor.decoration_count += 1;
+        }
+        const bytes = editor.text();
+        for (app.problems[0..app.problem_count]) |problem| {
+            // An error at a line's end is at its newline, which draws nothing: mark the byte
+            // before it instead.
+            var start = @min(problem.start, length);
+            if (start > 0 and (start == length or bytes[start] == '\n')) start -= 1;
+            if (start >= length or bytes[start] == '\n') continue;
+            const stop = @min(@max(problem.end, start + 1), length);
+            editor.decorations[editor.decoration_count] = .{ .start = start, .end = stop, .kind = .@"error" };
+            editor.decoration_count += 1;
+        }
+    }
+
+    fn draw_text(app: *App, cx: *Context, clip: Clip) void {
+        app.sample_scope();
+        _ = cx.begin_at(editor_rect, .{ .flow = .down });
+        app.editor.draw(cx, ui.sized(.fill, .fill));
+        _ = cx.end();
+        var buffer: [2 * line_cap]u8 = undefined;
+        text.place(cx.drawing(), name_style, app.status(&buffer), status_rect, clip, left);
+        for (&app.text_knobs, 0..) |*knob, index| {
+            var shown: []const u8 = "-";
+            if (app.literals[index]) |bound| {
+                if (app.literal_numbers(bound)) |numbers| {
+                    if (literal.steps(numbers[1], numbers[0], numbers[2])) |steps| {
+                        const units = std.math.clamp(numbers[0].units, steps.lo, steps.hi);
+                        const share = @as(f64, @floatFromInt(units - steps.lo)) / @as(f64, @floatFromInt(steps.hi - steps.lo));
+                        knob.value = @floatCast(share);
+                    }
+                    shown = app.editor.text()[bound.value[0]..bound.value[1]];
+                }
+            }
+            _ = cx.begin_at(text_knob_rect(index), .{ .flow = .down });
+            knob.draw_text(cx, ui.sized(.fill, .fill), shown);
+            _ = cx.end();
+        }
+        for (0..glue.scope_row_count) |index| {
+            const rect: Rect = .{
+                .x = text_column_x,
+                .y = text_rows_y + text_row_height * @as(f32, @floatFromInt(index)),
+                .width = cx.window.width - text_column_x,
+                .height = text_row_height,
+            };
+            scope.draw(cx, app.scope_row(index), rect, clip);
+        }
+    }
+
+    /// The status line: the first error with its place and hint, or what the last compile did.
+    pub fn status(app: *const App, out: []u8) []const u8 {
+        if (app.problem_count > 0) {
+            const problem = app.problems[0];
+            const args = .{ problem.line, problem.column, problem.message, problem.hint };
+            const shown = std.fmt.bufPrint(out, "{d}:{d}  {s}   {s}", args) catch out;
+            return shown;
+        }
+        if (app.recompiles == 0) return "signals.weft, as built";
+        const kept = if (app.motion.last == .carried) "readers kept their steps" else "readers started again";
+        return std.fmt.bufPrint(out, "compiled, {s}", .{kept}) catch out;
+    }
+
+    /// The scope's window, with its dots sorted by row (section 7).
+    fn sample_scope(app: *App) void {
         app.motion.sample_window(app.clock, &app.frame);
         app.row_dot_counts = @splat(0);
         for (app.frame.dots[0..app.frame.dot_count]) |dot| {
@@ -459,6 +796,10 @@ pub const App = struct {
             app.row_dots[dot.row][count.*] = .{ dot.at, dot.value };
             count.* += 1;
         }
+    }
+
+    fn draw_scope(app: *App, cx: *Context, clip: Clip) void {
+        app.sample_scope();
         for (0..glue.scope_row_count) |index| {
             const rect: Rect = .{
                 .x = 0,
@@ -473,7 +814,7 @@ pub const App = struct {
     fn draw_shapes(app: *App, cx: *Context, clip: Clip) void {
         const values = app.destination_values();
         for (&app.knobs, 0..) |*knob, index| {
-            knob.value = knob_value(index, app.motion.knob(index, app.clock));
+            knob.value = knob_value(index, app.motion.knob(index, app.clock) orelse knob_middles[index]);
             var buffer: [16]u8 = undefined;
             const shown = app.knob_text(index, &buffer);
             _ = cx.begin_at(knob_rect(index), .{ .flow = .down });
@@ -550,14 +891,19 @@ pub const App = struct {
     pub fn destination_values(app: *const App) [patch.count]f32 {
         var values: [patch.count]f32 = undefined;
         for (&values, patch.destinations, app.patch) |*value, destination, row| {
-            value.* = patch.map(destination, app.frame.heads[row], app.motion.ranges[row]);
+            const range = app.motion.ranges[row];
+            const known = std.math.isFinite(range[0]) and std.math.isFinite(range[1]);
+            value.* = if (known)
+                patch.map(destination, app.frame.heads[row], range)
+            else
+                (destination.low + destination.high) / 2;
         }
         return values;
     }
 
     /// Knob `index`'s parameter at t, to two decimals.
     fn knob_text(app: *const App, index: usize, out: *[16]u8) []const u8 {
-        const value = app.motion.knob(index, app.clock);
+        const value = app.motion.knob(index, app.clock) orelse return "-";
         return std.fmt.bufPrint(out, "{d:.2}", .{value}) catch unreachable;
     }
 
@@ -607,7 +953,7 @@ pub const App = struct {
             .samples = &frame.samples[index],
             .goal = goal,
             .steps = steps,
-            .cues = &frame.cues,
+            .cues = frame.cues[0..frame.cue_count],
             .head_at = head_at,
             .head = frame.heads[index],
             .color = accent(signal.accent),
@@ -714,6 +1060,7 @@ test {
     _ = patch;
     _ = shapes;
     _ = bouncers;
+    _ = language;
 }
 
 // Locks the transport's ends: playing stops at 600 s and play from there restarts at 0, and a
@@ -989,12 +1336,12 @@ test "the scenarios replay headless" {
     }
 }
 
-// Locks the pages: the page button cycles scope, shapes, bouncers and names the next page; 3 goes
+// Locks the pages: the page button cycles scope, shapes, bouncers, text and names the next; 3 goes
 // to the bouncers, whose label reports their own program, seekable with no steps, and which,
 // paused, ask for no frame.
-test "the page button cycles the three pages" {
+test "the page button cycles the four pages" {
     const app = new_app();
-    const order = [_]Page{ .shapes, .bouncers, .scope };
+    const order = [_]Page{ .shapes, .bouncers, .text, .scope };
     for (order) |expected| {
         _ = frame_at(app);
         try std.testing.expectEqualStrings(@tagName(expected), app.page_button.label);
@@ -1054,4 +1401,160 @@ test "the log shows a hit's exact time" {
     try std.testing.expectEqualStrings("999", group(999, &grouped));
     try std.testing.expectEqualStrings("1,000", group(1000, &grouped));
     try std.testing.expectEqualStrings("423,360,000,000", group(423_360_000_000, &grouped));
+}
+
+// Locks section 8's edit: typing ` * 2` after the wave's call recompiles, every reader keeps its
+// steps (the wave is pure, so no simulated node changed), and the wave row reads twice its value.
+test "an edit to a pure line recompiles and keeps the readers' steps" {
+    const app = new_app();
+    try replay(app, "text_edit", 64);
+    try std.testing.expect(std.mem.indexOf(u8, app.editor.text(), "wave = wave(sine, 0.5hz) * 2\n") != null);
+    try std.testing.expectEqual(@as(u32, 0), app.problem_count);
+    try std.testing.expect(app.recompiles >= 1);
+    try std.testing.expectEqual(glue.Outcome.carried, app.motion.last);
+    app.clock.seek(0.001);
+    app.motion.sample_head(app.clock, &app.frame);
+    const doubled = app.frame.heads[0];
+    try std.testing.expect(@abs(doubled) > 1);
+}
+
+// Locks section 8's errors: a bad edit keeps the last good program running, marks the error in
+// the text, and names its place in the status line.
+test "a bad edit keeps the last good program and shows the error" {
+    const app = new_app();
+    try replay(app, "text_error", 64);
+    try std.testing.expect(app.problem_count > 0);
+    try std.testing.expect(app.motion.invalid);
+    const running = app.motion.signals.text[0..app.motion.signals.text_len];
+    try std.testing.expect(std.mem.indexOf(u8, app.editor.text(), "0.5hz) +\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, running, "0.5hz) \n") != null);
+    var buffer: [2 * line_cap]u8 = undefined;
+    const shown = app.status(&buffer);
+    try std.testing.expect(std.mem.startsWith(u8, shown, "21:"));
+    try std.testing.expect(std.unicode.utf8ValidateSlice(shown));
+    var errors: u32 = 0;
+    for (app.editor.decorations[0..app.editor.decoration_count]) |decoration| {
+        if (decoration.kind == .@"error") errors += 1;
+    }
+    try std.testing.expect(errors > 0);
+}
+
+// Locks section 8's knobs: a drag on a text knob rewrites its track's number in the text, as
+// one undo entry, and the program it compiles reads the new value; one undo restores both.
+test "a text knob rewrites its number, as one undo entry" {
+    const app = new_app();
+    try replay(app, "text_knob", 64);
+    const bound = app.literals[0].?;
+    const shown = app.editor.text()[bound.value[0]..bound.value[1]];
+    try std.testing.expect(!std.mem.eql(u8, shown, "0.3"));
+    const turned = app.motion.knob(0, app.clock).?;
+    try std.testing.expectEqual(literal.to_f64(literal.parse(shown).?), turned);
+    const ctrl: input.Mods = .{ .shift = false, .ctrl = true, .alt = false, .meta = false };
+    send(app, .{ .key_down = input.key_press(.z, ctrl, false, "") });
+    const restored = app.literals[0].?;
+    try std.testing.expectEqualStrings("0.3", app.editor.text()[restored.value[0]..restored.value[1]]);
+    try std.testing.expectEqual(@as(f64, 0.3), app.motion.knob(0, app.clock).?);
+}
+
+// Locks the step's promise: at 7 s the spring is in flight toward its goal at c3, and an edit to
+// an unrelated line moves neither its value nor its readers' steps.
+test "a spring in flight does not jump when an unrelated line changes" {
+    const app = new_app();
+    app.clock.seek(7.0 / 600.0);
+    app.motion.sample_head(app.clock, &app.frame);
+    const spring_row = app.row_named("spring");
+    const chase_row = app.row_named("chase");
+    const before = .{ app.frame.heads[spring_row], app.frame.heads[chase_row] };
+    const at = std.mem.indexOf(u8, app.editor.text(), "0.5hz)").?;
+    try std.testing.expect(app.editor.replace(.{ .start = @intCast(at), .end = @intCast(at + 5) }, "2hz"));
+    const cx = &fixture.context;
+    app.sync(cx);
+    try std.testing.expectEqual(glue.Outcome.carried, app.motion.last);
+    app.motion.sample_head(app.clock, &app.frame);
+    try std.testing.expectEqual(before[0], app.frame.heads[spring_row]);
+    try std.testing.expectEqual(before[1], app.frame.heads[chase_row]);
+}
+
+// Locks section 8's preview: mid-drag at 300 s, the number in the text has moved, the program
+// is not recompiled, and the track holds the new value from the playhead on while the past keeps
+// the old; the release takes the preview back, recompiles once, and the new number holds from 0.
+test "a text knob's drag previews from now on and rewrites history on release" {
+    const app = new_app();
+    send(app, key_down(.other, "4"));
+    app.clock.seek(0.5);
+    _ = frame_at(app);
+    const rect = text_knob_rect(0);
+    const x = rect.x + 40;
+    const y = rect.y + 36;
+    const press: input.Button = .{ .x = x, .y = y, .time_ms = 0, .button = .left, .mods = .none };
+    send(app, .{ .pointer_move = .{ .x = x, .y = y } });
+    send(app, .{ .pointer_down = press });
+    send(app, .{ .pointer_move = .{ .x = x, .y = y - 30 } });
+    const bound = app.literals[0].?;
+    const shown = app.editor.text()[bound.value[0]..bound.value[1]];
+    try std.testing.expect(!std.mem.eql(u8, shown, "0.3"));
+    const turned = literal.to_f64(literal.parse(shown).?);
+    try std.testing.expectEqual(@as(u32, 0), app.recompiles);
+    try std.testing.expectEqual(turned, app.motion.knob(0, app.clock).?);
+    try std.testing.expectEqual(@as(f64, 0.3), app.motion.knob(0, glue.Clock{ .t = .{ .flicks = 0 } }).?);
+    var released = press;
+    released.y = y - 30;
+    send(app, .{ .pointer_up = released });
+    try std.testing.expectEqual(@as(u32, 1), app.recompiles);
+    try std.testing.expectEqual(glue.Outcome.fresh, app.motion.last);
+    try std.testing.expectEqual(turned, app.motion.knob(0, glue.Clock{ .t = .{ .flicks = 0 } }).?);
+    try std.testing.expectEqual(turned, app.motion.knob(0, app.clock).?);
+    try std.testing.expectEqual(@as(usize, 0), app.motion.signals.tracks.at(app.motion.signals.knobs[0].?).table().len);
+}
+
+// Measures, and prints, what an edit and a text knob cost at 60 s and 600 s, for the step page:
+// an edit to a pure line, which carries the readers; a step of a text knob's drag, a preview
+// written from now on; and the drag's release, which rewrites the history, so the playhead's
+// reader runs its steps again. Only in ReleaseFast.
+test "the cost of an edit and of a text knob at 60 s and 600 s" {
+    if (@import("builtin").mode != .fast) return;
+    const io = std.testing.io;
+    const app = new_app();
+    send(app, key_down(.other, "4"));
+    const cx = &fixture.context;
+    for ([_]f32{ 0.1, 1 }, [_][]const u8{ "0.6", "0.7" }) |at, frequency| {
+        app.clock.seek(at);
+        _ = frame_at(app);
+        const wave_at = std.mem.indexOf(u8, app.editor.text(), "wave(sine, ").? + "wave(sine, ".len;
+        var start = std.Io.Clock.awake.now(io).nanoseconds;
+        try std.testing.expect(app.editor.replace(.{ .start = @intCast(wave_at), .end = @intCast(wave_at + 3) }, frequency));
+        app.sync(cx);
+        _ = frame_at(app);
+        const edit_ns = std.Io.Clock.awake.now(io).nanoseconds - start;
+        try std.testing.expectEqual(glue.Outcome.carried, app.motion.last);
+        const rect = text_knob_rect(0);
+        const x = rect.x + 40;
+        const y = rect.y + 36;
+        const press: input.Button = .{ .x = x, .y = y, .time_ms = 0, .button = .left, .mods = .none };
+        send(app, .{ .pointer_move = .{ .x = x, .y = y } });
+        send(app, .{ .pointer_down = press });
+        var step_ns: i96 = 0;
+        for (0..8) |step| {
+            start = std.Io.Clock.awake.now(io).nanoseconds;
+            const dy: f32 = if (step % 2 == 0) -12 else 12;
+            send(app, .{ .pointer_move = .{ .x = x, .y = y + dy } });
+            _ = frame_at(app);
+            step_ns = @max(step_ns, std.Io.Clock.awake.now(io).nanoseconds - start);
+        }
+        try std.testing.expectEqual(@as(?Gesture, .{ .knob = 0, .wheel = false }), app.gesture);
+        start = std.Io.Clock.awake.now(io).nanoseconds;
+        var released = press;
+        released.y = y - 12;
+        send(app, .{ .pointer_move = .{ .x = x, .y = y - 12 } });
+        send(app, .{ .pointer_up = released });
+        _ = frame_at(app);
+        const release_ns = std.Io.Clock.awake.now(io).nanoseconds - start;
+        try std.testing.expectEqual(glue.Outcome.fresh, app.motion.last);
+        std.debug.print("at {d} s: edit {d} us, drag step at most {d} us, release {d} us\n", .{
+            @divFloor(app.clock.millis(), 1000),
+            @divFloor(edit_ns, 1000),
+            @divFloor(step_ns, 1000),
+            @divFloor(release_ns, 1000),
+        });
+    }
 }

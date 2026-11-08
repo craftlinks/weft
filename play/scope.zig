@@ -54,7 +54,7 @@ pub const axis_pad: f32 = 0.1;
 pub const playhead_layer: quads.Layer = @fromBackingInt(@intCast(2));
 const line_cap = 64;
 /// The most steps a goal trace takes.
-pub const steps_max = 16;
+pub const steps_max = 17;
 
 const ink = theme.dark.colors.text;
 const name_style: text.Style = .{ .face = .sans_bold, .size = 14, .color = ink };

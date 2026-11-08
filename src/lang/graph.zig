@@ -67,6 +67,9 @@ pub const GoalSource = union(enum) {
     node: Id,
 };
 
+/// The nodes a declaration's expression built, `first` to `end`, in build order.
+pub const NodeRange = struct { first: u32, end: u32 };
+
 /// A binding's nodes: its first output, and a bounce's velocity.
 pub const Ids = struct {
     first: Id,
@@ -101,6 +104,8 @@ pub const Memory = struct {
     /// One for each checked expression, so an expression the checker shares is built once: a
     /// module's parameter used twice is one signal (`check.zig`, section 6).
     expr_ids: []?Ids,
+    /// One for each binding: the nodes its declaration built, for a recompile's carry (step 15).
+    node_ranges: []NodeRange,
 };
 
 const Fail = error{Refused};
@@ -513,6 +518,8 @@ pub fn build(
     assert(memory.track_nodes.len >= checked.tracks.len);
     assert(memory.cue_times.len >= checked.cue_times.len);
     assert(memory.expr_ids.len >= checked.exprs.len);
+    assert(memory.node_ranges.len >= checked.bindings.len);
+    @memset(memory.node_ranges[0..checked.bindings.len], .{ .first = 0, .end = 0 });
     @memset(memory.expr_ids[0..checked.exprs.len], null);
     tables.cues = Cues.init(memory.cue_times);
     for (checked.cue_times) |flicks| _ = tables.cues.add(.{ .flicks = flicks }) catch unreachable;
@@ -567,7 +574,9 @@ pub fn build(
     for (checked.declarations) |declaration| {
         switch (declaration) {
             .signal => |signal| {
+                const first = back.builder.node_count;
                 const ids = back.eval(signal.expr) catch return null;
+                memory.node_ranges[signal.binding] = .{ .first = first, .end = back.builder.node_count };
                 memory.ids[signal.binding] = ids;
                 memory.goal_sources[signal.binding] = goal_source(&back, signal.expr);
             },

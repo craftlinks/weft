@@ -3,10 +3,10 @@
 # driver: Mesa 26.2.5-arch1.1
 # size: 1280x720 @120
 scenario       hash
-bouncers       2065fa03b437815c
-bouncers_300   bac277769b069bf7
-bouncers_590   7b733b5a8baa8453
-bouncers_play  40629f869c0aadec
+bouncers       191390d255d9aedd
+bouncers_300   708de4d6dd9233f9
+bouncers_590   2135385fc7557807
+bouncers_play  b5543272e83344f1
 knob           0d81e2258de9d489
 knob_600       4e7912e181048932
 play           621dfa8a554fe42a
@@ -17,3 +17,10 @@ scrub_back     4f01998debf6b2e7
 shapes         171d1ad281a43485
 shapes_play    00b35977db4fd287
 still          1140d082224616d1
+text           ec3bf35a291ad727
+text_600       d10355cd0792c6d5
+text_edit      6900389d15dd74ee
+text_error     de13483c5cdba8f4
+text_knob      92e915a01f521d56
+text_knob_60   4a7de2f19cf5a079
+text_knob_600  314a275481243898

@@ -127,7 +127,9 @@ pub fn tokenize(source: []const u8, out: []Token) Result {
     return .{ .count = count + 1, .full = false };
 }
 
-fn next(source: []const u8, start: u32) Token {
+/// The token that starts at `start`, which is not a space, a tab, or a carriage return. An
+/// editor tokenizes one line with it, since no token spans a line but `newline` itself.
+pub fn next(source: []const u8, start: u32) Token {
     const byte = source[start];
     const rest = source[start..];
     const one: Tag = switch (byte) {

@@ -38,12 +38,29 @@
 //! A client's nouns (step 14) join the table of primitives through `compile_client`. The checker
 //! accepts them, and the back end refuses them, so the client builds them from `checked`.
 //!
-//! ## 5. Robustness
+//! ## 5. Recompiling and Carry
+//! A client that recompiles a running program, as Play's editor does on each edit (step 15),
+//! keeps two `Compiled`s and moves its readers from the old to the new. A seekable program needs
+//! nothing moved: a fresh reader computes the same values. A simulated one would replay every
+//! step from its start, which at 600 s costs tens of milliseconds a reader, so `carry` keeps the
+//! old reader's steps and checkpoints when no simulated node changed:
+//! - A binding's fingerprint hashes its declaration's tokens (comments and spacing left out),
+//!   the fingerprints of the earlier bindings it names, and the seed, the start, the modules, and
+//!   the libraries. Two bindings with one name and one fingerprint build the same nodes.
+//! - `twins` pairs each node with the node at the same place among its binding's nodes in the
+//!   old program; a track's node is skipped, since it is built where it is first read.
+//! - `State.adopt` takes the old reader's state only when every simulated node has a twin, so a
+//!   changed simulated node, or one whose input changed, starts the whole reader fresh, which is
+//!   right: its history is a new one. A file that feeds a delay never carries.
+//! - `carry_tracks` writes a track's writes into the new program's track of the same name,
+//!   before any reader reads, so a knob's past survives an edit.
+//!
+//! ## 6. Robustness
 //! Any bytes compile to a program or to at least one diagnostic, and never crash: the fuzz test
 //! below feeds random bytes and mutated examples through compile and format, and every limit is
 //! a diagnostic. A file that parsed formats to canonical text, idempotently.
 //!
-//! ## 6. TigerStyle Invariants
+//! ## 7. TigerStyle Invariants
 //! - No allocation: every array is a field, sized by `Limits`.
 //! - Compile is bounded: one pass for tokens, one for the tree, one for the checks, and one for
 //!   the nodes, each over arrays of fixed size, with expressions nested at most
@@ -59,6 +76,7 @@ pub const format = @import("format.zig");
 pub const check = @import("check.zig");
 pub const back_end = @import("graph.zig");
 const graph = @import("../core/graph.zig");
+const State = graph.State;
 const range_module = @import("../core/range.zig");
 const motion = @import("../core/motion.zig");
 const simulation = @import("../core/simulation.zig");
@@ -98,6 +116,17 @@ pub const Limits = struct {
 
 /// A library's name and its text, for `compile_with`.
 pub const Source = struct { name: []const u8, text: []const u8 };
+
+/// Hashes the tags and texts of an item's tokens, comments and newlines left out, so spacing and
+/// comments never change a fingerprint.
+fn hash_tokens(hash: *std.hash.Fnv1a_64, tree: *const parse.Tree, index: u32) void {
+    const item = tree.item(index);
+    for (tree.tokens[item.first .. item.last + 1]) |each| {
+        if (each.tag == .comment or each.tag == .newline) continue;
+        hash.update(std.mem.asBytes(&each.tag));
+        hash.update(each.text(tree.source));
+    }
+}
 
 /// The standard library, `std`: modules any file may `use std` for (src/lang/std.weft).
 pub const std_library = @embedFile("std.weft");
@@ -186,6 +215,11 @@ pub fn Compiled(comptime limits: Limits) type {
         goal_sources: [limits.names]GoalSource,
         track_nodes: [limits.tracks]?graph.Id,
         expr_ids: [limits.tree]?back_end.Ids,
+        node_ranges: [limits.names]back_end.NodeRange,
+        /// Each binding's fingerprint (section 5), for a recompile's carry.
+        fingerprints: [limits.names]u64,
+        /// The file feeds a delay, so a recompile never carries its state (section 5).
+        has_feed: bool,
         tables: back_end.Tables,
         program: graph.Program,
         ok: bool,
@@ -255,10 +289,105 @@ pub fn Compiled(comptime limits: Limits) type {
                 .goal_sources = &compiled.goal_sources,
                 .track_nodes = &compiled.track_nodes,
                 .expr_ids = &compiled.expr_ids,
+                .node_ranges = &compiled.node_ranges,
             }, &compiled.tables, &compiled.syntax.diagnostics) orelse return error.Invalid;
             compiled.program = program;
             if (!compiled.check_declared_ranges()) return error.Invalid;
+            compiled.fingerprint(libraries);
             compiled.ok = true;
+        }
+
+        /// Each binding's fingerprint (section 5): its declaration's tokens, the fingerprint of
+        /// every earlier binding it names, and what every declaration depends on: the seed, the
+        /// start, the modules, and the libraries.
+        fn fingerprint(compiled: *Self, libraries: []const Source) void {
+            const tree = &compiled.syntax.tree;
+            const bindings = compiled.checked.bindings;
+            var global = std.hash.Fnv1a_64.init();
+            for (libraries) |library| global.update(library.text);
+            for (tree.declarations) |index| {
+                switch (tree.item(index).tag) {
+                    .seed, .start, .module, .use => hash_tokens(&global, tree, index),
+                    else => {},
+                }
+            }
+            const base = global.final();
+            for (bindings, 0..) |entry, at| {
+                var hash = std.hash.Fnv1a_64.init();
+                hash.update(std.mem.asBytes(&base));
+                hash_tokens(&hash, tree, entry.item);
+                const item = tree.item(entry.item);
+                for (item.first..item.last + 1) |token_index| {
+                    const named = tree.tokens[token_index];
+                    if (named.tag != .name) continue;
+                    const name = named.text(tree.source);
+                    for (bindings[0..at], 0..) |earlier, earlier_at| {
+                        if (!std.mem.eql(u8, earlier.name, name)) continue;
+                        hash.update(std.mem.asBytes(&compiled.fingerprints[earlier_at]));
+                        break;
+                    }
+                }
+                compiled.fingerprints[at] = hash.final();
+            }
+            compiled.has_feed = false;
+            for (compiled.checked.declarations) |declaration| {
+                if (declaration == .feed) compiled.has_feed = true;
+            }
+        }
+
+        /// For each node of this program, its twin in `old`'s (section 5), or null: a node of a
+        /// binding with the same name and fingerprint in both, at the same place among the
+        /// binding's nodes, a track's nodes not counted.
+        pub fn twins(compiled: *const Self, old: *const Self, out: []?u32) void {
+            assert(compiled.ok and old.ok);
+            assert(out.len == compiled.program.nodes.len);
+            @memset(out, null);
+            for (compiled.checked.bindings, 0..) |binding_entry, at| {
+                if (binding_entry.kind != .signal) continue;
+                const old_at = old.binding(binding_entry.name, .signal) orelse continue;
+                if (old.fingerprints[old_at] != compiled.fingerprints[at]) continue;
+                const range = compiled.node_ranges[at];
+                const old_range = old.node_ranges[old_at];
+                var j = old_range.first;
+                for (range.first..range.end) |i| {
+                    if (compiled.program.nodes[i].op == .track) continue;
+                    while (j < old_range.end and old.program.nodes[j].op == .track) j += 1;
+                    if (j == old_range.end) break;
+                    out[i] = j;
+                    j += 1;
+                }
+            }
+        }
+
+        /// Keeps `old_state`'s simulated state in `state`, a reader of this program, when every
+        /// simulated node has its twin in `old` (section 5). False, changing nothing, otherwise:
+        /// the reader then starts fresh, which is right, since a changed simulated node has a
+        /// history of its own.
+        pub fn carry(compiled: *const Self, state: *State, old: *const Self, old_state: *const State) bool {
+            assert(compiled.ok and old.ok);
+            if (compiled.has_feed or old.has_feed) return false;
+            var found: [limits.nodes]?u32 = undefined;
+            const twins_found = found[0..compiled.program.nodes.len];
+            compiled.twins(old, twins_found);
+            return state.adopt(old_state, twins_found);
+        }
+
+        /// Writes again, into this program's tracks, every write a track of the same name has
+        /// in `old`, in time order, but those outside the new bounds, which are dropped. Call it
+        /// before a reader of this program first reads.
+        pub fn carry_tracks(compiled: *Self, old: *const Self) void {
+            assert(compiled.ok and old.ok);
+            for (compiled.checked.bindings) |binding_entry| {
+                if (binding_entry.kind != .track) continue;
+                const old_at = old.binding(binding_entry.name, .track) orelse continue;
+                const from = old.tables.tracks.at(.{ .index = old.checked.bindings[old_at].index });
+                const id: track_module.TrackId = .{ .index = binding_entry.index };
+                const to = compiled.tables.tracks.at(id);
+                for (from.table()) |sample| {
+                    if (sample.value < to.low or sample.value > to.high) continue;
+                    compiled.tables.tracks.write(id, sample.time, sample.value) catch break;
+                }
+            }
         }
 
         /// Each module instance with a declared range keeps its output inside it (section 3).
