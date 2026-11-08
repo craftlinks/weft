@@ -241,65 +241,58 @@ pub fn ms(count: i64) weft.Time {
 }
 
 const testing = std.testing;
-const reference = @import("signals_reference.zig");
 
-var compared: Signals = undefined;
-var hand_built: reference.Signals = undefined;
-var compared_bouncers: Bouncers = undefined;
-var hand_built_bouncers: reference.Bouncers = undefined;
+var built: Signals = undefined;
+var built_bouncers: Bouncers = undefined;
 
-// TEMPORARY: the text compiles to the hand-built tables, field for field.
-test "the text compiles to the hand-built program" {
-    compared.build();
-    hand_built.build();
-    try testing.expectEqual(hand_built.program.nodes.len, compared.program.nodes.len);
-    for (hand_built.program.nodes, compared.program.nodes, 0..) |a, b, index| {
-        if (!std.meta.eql(a, b)) {
-            std.debug.print("node {d}\n{any}\n{any}\n", .{ index, a, b });
-            return error.TestUnexpectedResult;
-        }
+/// A hash of a program and the tables it reads, from each node's and entry's printed fields, so
+/// padding bytes never count (section 1's lock).
+fn program_hash(program: weft.Program, tracks: *const weft.Tracks) u64 {
+    var hasher = std.hash.Wyhash.init(0);
+    var buffer: [1024]u8 = undefined;
+    for (program.nodes) |node| hasher.update(std.fmt.bufPrint(&buffer, "{any}", .{node}) catch unreachable);
+    for (program.cues.table()) |time| hasher.update(std.mem.asBytes(&time.flicks));
+    for (program.goals) |goal| hasher.update(std.fmt.bufPrint(&buffer, "{any}", .{goal}) catch unreachable);
+    for (program.regions) |region| hasher.update(std.fmt.bufPrint(&buffer, "{any}", .{region}) catch unreachable);
+    for (tracks.entries[0..tracks.count]) |track| {
+        hasher.update(std.fmt.bufPrint(&buffer, "{d} {d} {d} {d}", .{ track.low, track.high, track.initial, track.samples.len }) catch unreachable);
     }
-    try testing.expectEqual(hand_built.program.slab_count, compared.program.slab_count);
-    try testing.expectEqual(hand_built.program.simulated, compared.program.simulated);
-    try testing.expectEqual(hand_built.program.start, compared.program.start);
-    try testing.expectEqualSlices(weft.Time, hand_built.cues.table(), compared.cues.table());
-    try testing.expectEqualSlices(weft.Goal, hand_built.goals.table(), compared.goals.table());
-    try testing.expectEqualSlices(weft.Region, hand_built.regions.table(), compared.program.regions);
-    for (hand_built.rows, compared.rows) |a, b| {
-        try testing.expectEqualStrings(a.name, b.name);
-        try testing.expectEqual(a.accent, b.accent);
-        try testing.expectEqual(a.id, b.id);
-        try testing.expectEqualStrings(@tagName(a.goal), @tagName(b.goal));
-        switch (a.goal) {
-            .none => {},
-            .path => |path| {
-                try testing.expectEqual(path.path, b.goal.path.path);
-                try testing.expectEqual(path.from, b.goal.path.from);
-            },
-            .node => |id| try testing.expectEqual(id, b.goal.node),
-        }
-    }
-    try testing.expectEqualSlices(weft.TrackId, &hand_built.knobs, &compared.knobs);
-    for (0..knob_count) |index| {
-        const a = hand_built.tracks.entries[index];
-        const b = compared.tracks.entries[index];
-        try testing.expectEqual(a.low, b.low);
-        try testing.expectEqual(a.high, b.high);
-        try testing.expectEqual(a.initial, b.initial);
-        try testing.expectEqual(a.samples.len, b.samples.len);
-    }
-    compared_bouncers.build();
-    hand_built_bouncers.build();
-    const bouncer_pairs = .{ hand_built_bouncers.program.nodes, compared_bouncers.program.nodes };
-    for (bouncer_pairs[0], bouncer_pairs[1]) |a, b| try testing.expect(std.meta.eql(a, b));
-    try testing.expectEqual(hand_built_bouncers.bars, compared_bouncers.bars);
-    const bar_times = compared_bouncers.compiled.tables.cues.table();
-    try testing.expectEqualSlices(weft.Time, hand_built_bouncers.cues.table(), bar_times);
-    for (hand_built_bouncers.lanes, compared_bouncers.lanes) |a, b| {
-        try testing.expectEqualStrings(a.name, b.name);
-        try testing.expectEqualStrings(a.note, b.note);
-        try testing.expectEqual(a.accent, b.accent);
-        try testing.expectEqual(a.speed, b.speed);
-        try testing.expectEqual(a.id, b.id);
+    hasher.update(std.fmt.bufPrint(&buffer, "{d} {} {d}", .{ program.slab_count, program.simulated, program.start.index }) catch unreachable);
+    return hasher.final();
+}
+
+// Locks both programs as built from the text: the hashes are those of the hand-built tables the
+// text replaced in step 12, checked field for field then, so a change to either file or to the
+// compiler that moves a node shows here, before the goldens.
+test "the text compiles to the programs it replaced" {
+    built.build();
+    built_bouncers.build();
+    try testing.expectEqual(@as(u64, 0xdea1386a4be8a783), program_hash(built.program, built.tracks));
+    const bouncer_tracks = &built_bouncers.compiled.tables.tracks;
+    try testing.expectEqual(@as(u64, 0x69071b1bdb435f6a), program_hash(built_bouncers.program, bouncer_tracks));
+}
+
+// Locks what the rows find by name: the spring's and the Newtonian move's shared path, the chase's
+// target, and the knobs' bounds.
+test "rows, goals, and knobs come from the text by name" {
+    built.build();
+    try testing.expectEqual(built.rows[3].goal.path.path, built.rows[4].goal.path.path);
+    try testing.expectEqual(@as(f64, 0), built.rows[3].goal.path.from);
+    try testing.expectEqual(built.rows[1].id, built.rows[5].goal.node);
+    try testing.expect(built.rows[0].goal == .none);
+    const glide = built.tracks.at(built.knobs[3]);
+    try testing.expectEqual(@as(f64, 0.25), glide.low);
+    try testing.expectEqual(@as(f64, 4), glide.high);
+    try testing.expectEqual(@as(f64, 1), glide.initial);
+}
+
+var syntax: weft.lang.Syntax(.{ .tokens = 1024, .tree = 512, .names = 64 }) = undefined;
+var formatted: [8192]u8 = undefined;
+
+// Locks the round trip: both files are in the canonical format, so formatting gives their bytes.
+test "both files are canonical" {
+    for ([_][]const u8{ source, bouncer_source }) |text| {
+        try testing.expect(syntax.parse_source(text));
+        try testing.expectEqualStrings(text, try syntax.format_into(&formatted));
     }
 }

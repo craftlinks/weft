@@ -150,11 +150,21 @@ src/
     time.zig          Time and Rate: an integer count of flicks
     track.zig         Tracks: timed values a client writes, read as signals, latched from a time
     wave.zig          Wave: sine, triangle, saw, and square, pure functions of time
+  lang/
+    lang.zig          Compiled and Syntax: text to a Program, and the limits
+    token.zig         the tokenizer
+    parse.zig         the parser and its flat tree
+    schema.zig        the table of primitives
+    check.zig         names, order, types, defaults, and seeds
+    graph.zig         the back end: checked declarations to a Program
+    format.zig        the canonical format
+    error.zig         diagnostics and suggestions
 test/
   catalog.zig         the sampled signals, rendered as text of hex floats
+  lang.zig            the catalog's graphs as text, which compile to its nodes
   golden/signals.txt  the committed samples
 tools/
-  bench.zig           times four cases of reads, for zig build bench
+  bench.zig           times reads and a compile, for zig build bench
   regress.zig         compares native and wasm text with the golden, and blesses
   regress_wasm.zig    the catalog on wasm32-freestanding
   regress_wasm.mjs    runs that module under Node and prints its text
@@ -484,6 +494,70 @@ parameters, since a varying one would make them simulated. A spring whose stiffn
 node has no range Weft can prove, so it reports an unbounded one; `graph.zig`, section 14,
 explains the bounds that hold.
 
+## Language
+
+A program can be written as text and compiled once, at init, into the same nodes the builder
+would make, so text costs nothing at `eval`. Play's two signal tables are written in it. A file:
+
+```txt
+# Comments run to the end of the line.
+seed 7
+
+cue c0 = 0s
+cue c1 = 2s
+cue bar = 10s..600s every 2s # a series: bar[0] to bar[295], after c1
+track chase_s = 0.5 in 0.125..2 # a track: its value before a write, then its bounds
+
+moves = [c1: 1, bar[0]: -0.5] # a path: goals at cues
+noise = noise(smooth, 1hz, seed: 1)
+spring = spring(moves, time: 0.5s, overshoot: 0.2)
+chase = chase(noise, time: chase_s) # a signal sets a parameter, read at each step
+sum = noise + spring * 0.5 - 1
+glide = follow(
+    [0..1], # regions to draw goals from
+    by: newtonian(speed: 1, accel: 16, decel: 16),
+    pause: 0s..500ms,
+)
+fb = delay(0)
+loop = chase(1 + fb * -0.8, time: 0.5s)
+fb <- loop # a cycle goes through a delay
+```
+
+```zig
+var compiled: weft.lang.Compiled(.{ .nodes = 24, .slab = 112, .cues = 6, .tracks = 4 }) = undefined;
+compiled.compile(source) catch {
+    for (compiled.errors()) |found| try found.render(source, "signals.weft", writer);
+};
+const program = compiled.program;
+const chase = compiled.signal("chase").?;    // a node
+const knob = compiled.track("chase_s").?;    // a track to write
+const goal = compiled.goal("spring");        // a path and its from, a chase's target, or none
+```
+
+- **Calls match the builder**, by name and parameter, as a table of primitives the checker reads.
+  Up to two leading arguments go by position; the rest are named and have defaults where the
+  builder's documentation gives one.
+- **Times and frequencies carry units**: `2s`, `500ms`, `0.5hz`. A time is a whole number of
+  flicks, so seconds are exact to five places and milliseconds to two; anything finer is an error
+  naming the nearest flick.
+- **A name is declared above its use**, so the node order is the text order. Calls and names never
+  clash, so `tween = tween(...)` is fine. A cycle goes through a delay, fed below by `<-`.
+- **Arithmetic** is `+`, `-`, `*`, and parentheses. `a - b` is `a + b * -1`, exact, so no new op.
+- **Seeds**: an explicit `seed:` wins; otherwise it is a hash of the declaration's name, so a new
+  line never reshuffles another.
+- **Errors** give a line, a column, a reason, and a hint, as Zig prints its own:
+
+```txt
+signals.weft:14:22: error: chase has no parameter `tme`
+    chase = chase(noise, tme: chase_s)
+                         ^^^
+    hint: did you mean `time`?
+```
+
+There is one canonical format, which `lang.Syntax` writes: one declaration a line, no lining up,
+named arguments in the table's order, and a call written one argument a line exactly when its last
+argument has a trailing comma, as `zig fmt` does. `src/lang/lang.zig` explains the stages.
+
 ## Regress
 
 `zig build regress` renders `test/catalog.zig` on native and on wasm and compares both with
@@ -505,13 +579,14 @@ Bless only for a change the step means to make, in that step's commit.
 `zig build bench -Doptimize=ReleaseFast` prints its build mode and one line per case: a pure
 graph of 16 waves summed, per eval; four chases on a wave plus noise playing forwards at 60 Hz, per
 frame; that graph from a fresh state, the first eval at 60 s and at 600 s; a bounce and cues,
-`events` per 128-frame block at 48 kHz; and a track write at the playhead at 600 s, then the
-frame's eval, which is what a knob costs from now on. It is native only and needs no GPU. Its
+`events` per 128-frame block at 48 kHz; a track write at the playhead at 600 s, then the
+frame's eval, which is what a knob costs from now on; and a compile of Play's `signals.weft`. It is native only and needs no GPU. Its
 numbers depend on the machine, so it has no thresholds and is not part of `test` or `regress`.
 
 ## Play
 
-Play is Weft's first client: a Patchwork app with three pages on one 600 s clock.
+Play is Weft's first client: a Patchwork app with three pages on one 600 s clock. Its signals are
+text, `play/signals.weft` and `play/bouncers.weft`, compiled once at start.
 
 - **scope** plots eight signals, one or more of each class but live, over a window from one second
   before the playhead to three after it, with each signal's range, its goal where it has one, the

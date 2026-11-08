@@ -17,6 +17,8 @@
         "patch.zig",
         "shapes.zig",
         "bouncers.zig",
+        "signals.weft",
+        "bouncers.weft",
         "test",
     },
 }

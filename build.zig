@@ -84,6 +84,9 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "weft", .module = weft }},
         }),
     });
+    bench.root_module.addAnonymousImport("play_signals", .{
+        .root_source_file = b.path("play/signals.weft"),
+    });
     const bench_run = b.addRunArtifact(bench);
     bench_run.has_side_effects = true;
     const bench_step = b.step("bench", "Time reads on this machine (use -Doptimize=ReleaseFast)");
