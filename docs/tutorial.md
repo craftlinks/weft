@@ -305,8 +305,11 @@ echo <- ring                                # feed it, below
 A delay holds one number: a 2D loop is two delays and two feeds. Inside `lanes(n, …)` a delay has
 n lanes and is fed once.
 
-**Keep a loop's gain below 1.** A loop that grows, such as `echo * 1.5`, passes `check`, runs
-away, and in Weft 0.1 ends in a panic in a safe build or NaN in a fast one (section 16).
+**Keep a loop's gain below 1.** A loop that grows, such as `echo * 1.5`, passes `check` and runs
+away. Since 0.1.1 it saturates near 2^256 and holds there, the same in every build mode, and comes
+back down if a knob turns its gain back. Values computed from it can still overflow, so after
+`state.eval(now)` on a program with a loop, check `state.finite()` and show a false rather than
+drawing it (section 16).
 
 ### Parameters from signals
 
@@ -884,9 +887,9 @@ The limits worth knowing before you design around Weft:
   A six-second events window cost 2 µs on a pure program and 1.6 ms once a chase was added. Keep
   event timelines and simulated motion in separate programs, and on a simulated program read
   events as `(last, now]` (section 12).
-- **A feedback loop that grows is not caught.** `check` passes it, its range is reported as
-  unbounded (as every loop's is, stable or not), and when the value overflows the reader panics
-  in Debug and ReleaseSafe and turns to NaN in ReleaseFast, where it stays NaN.
+- **A feedback loop that grows is not caught.** `check` passes it, and its range is reported as
+  unbounded (as every loop's is, stable or not). Since 0.1.1 its state saturates near 2^256 in
+  every build mode, and `state.finite()` says when a value computed from it has overflowed.
 - **A `Compiled` is about 1 MB at the default `Limits`**, however small the file, because the
   token and tree tables default to 4,096 entries. `check` prints six of the limits; `tokens`,
   `tree`, `names`, and `modules` are found by trial. A library is parsed under the same limits as
@@ -941,7 +944,7 @@ target).
 | A knob stops responding after a while | `error.TrackFull`: 1,024 writes | Write on change, thin a drag, raise `Limits.track_samples` |
 | A knob turned while scrubbed back erases later turns | A write removes every later write | Save the samples and `restore` them to undo |
 | A puppet on a live `input` jumps when a cue is dragged | The reader replays its steps with today's input | Give it checkpoints; do not move cues during a take |
-| A panic in `motion.zig`, or NaN that never clears | A feedback loop with gain above 1 | Keep loop gain below 1; bound a knob that sets it |
+| Values stuck near 1.16e77, or `state.finite()` false | A feedback loop with gain above 1 | Keep loop gain below 1; bound a knob that sets it |
 | A spring's arrival event never fires | The next goal came before it settled | Use `newtonian`, or a `crossing` on the spring |
 
 ---

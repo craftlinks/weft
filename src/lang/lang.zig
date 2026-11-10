@@ -646,9 +646,12 @@ const fuzz_seeds = [_][]const u8{
     "cue c0 = 0s\nb = lanes(8, tween(from: 0, to: lane * 0.1, at: c0, over: 1s, stagger: 5ms))\n" ++
         "n = lanes(8, noise(smooth, 1hz) + lane)\nh = lanes(8, bounce(0..1, speed: 1, at: c0, stagger: -2ms))\n" ++
         "fb = lanes(8, delay(0))\nfb <- n * 0.5 + fb * 0.25\nv = lanes(8, vec2(lane, 1)) + b\n",
+    // A loop that runs away within half a second, so the reader meets the bound (step 19).
+    "cue c0 = 0s\nfb = delay(0)\nloop = chase(1 + fb * 1e100, time: 0.01s)\nfb <- loop\nx = loop * loop * loop\n",
 };
 
 var fuzz_syntax: Syntax(.{}) = undefined;
+var fuzz_slab: [1024]f64 = undefined;
 var fuzz_out: [1 << 16]u8 = undefined;
 var fuzz_again: [1 << 16]u8 = undefined;
 
@@ -656,7 +659,15 @@ var fuzz_again: [1 << 16]u8 = undefined;
 /// format idempotently or refuse a comment.
 fn fuzz_one(input: []const u8) !void {
     const compiled = small.compile(input);
-    if (compiled) |_| {} else |_| try testing.expect(small.errors().len > 0);
+    if (compiled) |_| {
+        // A file that compiles also reads, at its start and half a second in, and a loop that
+        // runs away saturates rather than crashing (step 19).
+        var state = State.init(small.program, fuzz_slab[0..small.program.slab_count]);
+        for ([_]i64{ 0, @divExact(time_module.flicks_per_second, 2) }) |flicks| {
+            state.eval(.{ .flicks = flicks });
+            _ = state.finite();
+        }
+    } else |_| try testing.expect(small.errors().len > 0);
     if (!fuzz_syntax.parse_source(input) or !fuzz_syntax.tree.complete) return;
     const formatted = fuzz_syntax.format_into(&fuzz_out) catch |err| {
         try testing.expectEqual(error.CommentPlacement, err);

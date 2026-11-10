@@ -45,6 +45,21 @@
 //!   step of a shift register crosses at most one boundary.
 //! - The region table is immutable once built, and a refused `add` leaves it as it was.
 //! - Every counter a slab holds as an f64 stays below 2^53, so it is exact.
+//!
+//! ## 7. Bounded State
+//! A loop through a delay can grow without end: `chase(1 + fb * 1.5, ...)` doubles about every
+//! quarter second. So every value a simulated node reads from another node, and every value it
+//! stores, passes through `bounded`: NaN reads as 0, and anything else is clamped to
+//! `state_bound`. A runaway loop climbs to the bound and stays there, the same bits in every build
+//! mode, and comes back down when a track turns its gain back. The builder keeps every constant
+//! that becomes a moving value or a goal within the bound too, so no motion starts outside it.
+//!
+//! The bound is 2^256, so that one step from a state at the bound cannot overflow:
+//! - A spring step from an offset of at most 2^257 and a velocity of at most 2^256, with omega
+//!   below 2^33 (a time of one flick), stays below about 2^330.
+//! - A Newtonian plan forms `2 accel decel ahead`, at most about 2^770.
+//! - A pure product of two saturated values is 2^512, still finite. Four can overflow, so a client
+//!   checks `State.finite` after an `eval` of a program with a loop.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -72,6 +87,30 @@ pub const period_flicks_max: u64 = 1 << 53;
 pub const pause_steps_max: u64 = std.math.maxInt(u32);
 
 const step_flicks: u64 = @intCast(step.flicks);
+
+/// The most a simulated value can hold, either way, as section 7 explains.
+pub const state_bound: f64 = 0x1p256;
+
+/// A value as a simulated node reads or stores it: NaN as 0, and anything else clamped to
+/// `state_bound` (section 7).
+pub inline fn bounded(value: f64) f64 {
+    // A simulated node reads and stores through this every step, and almost every value is
+    // inside, so that is one compare that the branch predictor gets right. NaN fails it.
+    if (@abs(value) <= state_bound) return value;
+    if (value > 0) return state_bound;
+    if (value < 0) return -state_bound;
+    return 0;
+}
+
+/// Whether a builder constant may become a moving value or a goal (section 7).
+pub fn within_bound(value: f64) bool {
+    return std.math.isFinite(value) and @abs(value) <= state_bound;
+}
+
+/// `kinematics` with its position and velocity bounded.
+pub fn bounded_kinematics(kinematics: motion.Kinematics) motion.Kinematics {
+    return .{ .position = bounded(kinematics.position), .velocity = bounded(kinematics.velocity) };
+}
 
 comptime {
     assert(step.flicks * 480 == time_module.flicks_per_second);
@@ -104,7 +143,7 @@ pub const Regions = struct {
         RegionCapacityExceeded,
         /// A span with no regions.
         NoRegions,
-        /// A region end that is infinite or NaN.
+        /// A region end that is infinite, NaN, or past `state_bound`.
         NotFinite,
     };
 
@@ -119,8 +158,8 @@ pub const Regions = struct {
         if (run.len == 0) return error.NoRegions;
         if (run.len > regions.entries.len - regions.count) return error.RegionCapacityExceeded;
         for (run) |region| {
-            if (!std.math.isFinite(region.low)) return error.NotFinite;
-            if (!std.math.isFinite(region.high)) return error.NotFinite;
+            if (!within_bound(region.low)) return error.NotFinite;
+            if (!within_bound(region.high)) return error.NotFinite;
         }
         const span: Span = .{ .first = regions.count, .count = @intCast(run.len) };
         @memcpy(regions.entries[span.first..][0..span.count], run);
@@ -263,7 +302,7 @@ pub fn follower_step(
     assert(state.drawn > 0);
     assert(state.pause_left <= pause_steps_max);
     var next = state;
-    next.kinematics = motion.advance(law, state.kinematics, state.goal, step_seconds);
+    next.kinematics = bounded_kinematics(motion.advance(law, state.kinematics, state.goal, step_seconds));
     if (state.pause_left > 0) {
         next.pause_left = state.pause_left - 1;
         if (next.pause_left == 0) next = follower_retarget(follower, regions, next);
@@ -567,4 +606,46 @@ test "a random follower draws goals in its regions and pauses within bounds" {
     const drawn_count = drawn_per_region[0] + drawn_per_region[1];
     try testing.expect(arrivals >= drawn_count);
     try testing.expect(arrivals <= drawn_count + 1);
+}
+
+// Locks section 7's reading rule: NaN reads as 0, the infinities as the bound, and a finite value
+// inside it unchanged, the sign of zero included.
+test "a bounded value is finite and keeps what fits" {
+    try testing.expectEqual(@as(f64, 0), bounded(std.math.nan(f64)));
+    try testing.expectEqual(state_bound, bounded(std.math.inf(f64)));
+    try testing.expectEqual(-state_bound, bounded(-std.math.inf(f64)));
+    try testing.expectEqual(state_bound, bounded(std.math.floatMax(f64)));
+    for ([_]f64{ 0, 1, -1, 1e77, -1e77, state_bound, -state_bound }) |value| {
+        try testing.expectEqual(value, bounded(value));
+    }
+    try testing.expect(std.math.signbit(bounded(-0.0)));
+    try testing.expect(within_bound(state_bound));
+    try testing.expect(!within_bound(state_bound * 2));
+    try testing.expect(!within_bound(std.math.nan(f64)));
+}
+
+// Locks why section 7's bound is 2^256: one step of a spring or a Newtonian move from a state at
+// the bound, at the fastest and slowest laws a builder or a parameter node can give, is finite.
+test "a step from the bound stays finite" {
+    const ends = [_]f64{ -state_bound, state_bound };
+    var laws: [12]motion.Law = undefined;
+    var count: usize = 0;
+    const omegas = [_]f64{ std.math.tau * @as(f64, @floatFromInt(time_module.flicks_per_second)), std.math.tau, std.math.tau / state_bound };
+    const zetas = [_]f64{ 1, motion.SpringLaw.zeta_of(0x1p-1074), motion.SpringLaw.zeta_of(0.99) };
+    for (omegas) |omega| for (zetas) |zeta| {
+        laws[count] = .{ .spring = motion.SpringLaw.from_omega_zeta(omega, zeta) };
+        count += 1;
+    };
+    const limit_min: f64 = 0x1p-20;
+    laws[count] = .{ .newtonian = .{ .speed = state_bound, .accel = state_bound, .decel = state_bound } };
+    laws[count + 1] = .{ .newtonian = .{ .speed = state_bound, .accel = state_bound, .decel = limit_min } };
+    laws[count + 2] = .{ .newtonian = .{ .speed = limit_min, .accel = limit_min, .decel = state_bound } };
+    count += 3;
+    for (laws[0..count]) |law| {
+        for (ends) |position| for (ends) |velocity| for (ends) |goal| {
+            const next = motion.advance(law, .{ .position = position, .velocity = velocity }, goal, step_seconds);
+            try testing.expect(std.math.isFinite(next.position));
+            try testing.expect(std.math.isFinite(next.velocity));
+        };
+    }
 }

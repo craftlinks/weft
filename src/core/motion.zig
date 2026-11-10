@@ -412,6 +412,7 @@ pub fn seconds_between(earlier: Time, later: Time) f64 {
 pub fn advance(law: Law, start: Kinematics, goal: f64, seconds: f64) Kinematics {
     assert(seconds >= 0);
     assert(std.math.isFinite(start.position));
+    assert(std.math.isFinite(start.velocity));
     const result = switch (law) {
         .spring => |spring| spring_advance(spring, start, goal, seconds),
         .newtonian => |limits| newtonian_advance(limits, start, goal, seconds),

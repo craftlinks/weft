@@ -59,7 +59,15 @@
 //! from its parameter nodes. They come after the recorded graph, so every line before them is a
 //! line of step 8.
 //!
-//! ## 10. TigerStyle Invariants
+//! ## 10. Runaway
+//! A loop through a delay whose gain is above 1 runs away, and its state saturates near
+//! `simulation.state_bound` (step 19), so these lines lock that it does so with the same bits on
+//! native and wasm and in every build mode. Two graphs, a chase of 1 + gain times its own delay,
+//! run at the zero epoch only, sampled every 10 s for 300 s: one with a gain of 1.5 throughout,
+//! and one whose gain is a track turned back to 0.5 at 150 s, which comes back down to 2. They
+//! come last, so every line before them is a line of step 9.
+//!
+//! ## 11. TigerStyle Invariants
 //! - The text fits in `text_size_max` by construction, so `render` cannot fail.
 
 const std = @import("std");
@@ -205,7 +213,12 @@ const wave_sample_count = shapes.len * signals.len * epochs.len * samples_per_ru
 const noise_sample_count = noise_shapes.len * signals.len * epochs.len * samples_per_run;
 const graph_sample_count = (graphs.len + graphs_after_events.len) * epochs.len * samples_per_run;
 
-pub const sample_count = wave_sample_count + noise_sample_count + graph_sample_count;
+/// The runaway section's samples (section 10): two graphs, every 10 s from 0 to 300 s.
+const runaway_samples_per_run = 31;
+const runaway_stride_seconds = 10;
+const runaway_sample_count = 2 * runaway_samples_per_run;
+
+pub const sample_count = wave_sample_count + noise_sample_count + graph_sample_count + runaway_sample_count;
 
 pub const event_count = count: {
     var count: u32 = 0;
@@ -257,6 +270,8 @@ pub fn render(text: *[text_size_max]u8) []const u8 {
     for (graphs_after_events) |graph| {
         for (&epochs) |*epoch| render_graph_run(&writer, graph, epoch);
     }
+    render_runaway(&writer, false);
+    render_runaway(&writer, true);
     assert(writer.buffered().len > line_count);
     assert(writer.buffered()[writer.buffered().len - 1] == '\n');
     return writer.buffered();
@@ -411,6 +426,49 @@ fn render_graph_run(writer: *std.Io.Writer, graph: Graph, epoch: *const Epoch) v
         }) catch unreachable;
         assert(writer.buffered().len - size_before <= line_size_max);
     }
+}
+
+/// Samples a runaway loop at the zero epoch, its gain 1.5 throughout, or turned back to 0.5 at
+/// 150 s by a track when `turned_back`, as section 10 explains.
+fn render_runaway(writer: *std.Io.Writer, turned_back: bool) void {
+    var cue_times: [1]weft.Time = undefined;
+    var cues = weft.Cues.init(&cue_times);
+    _ = cues.add(.{ .flicks = 0 }) catch unreachable;
+    var track_entries: [1]weft.Track = undefined;
+    var track_samples: [1]weft.Sample = undefined;
+    var tracks = weft.Tracks.init(&track_entries);
+    const gain_track = tracks.add(&track_samples, 0, 2, 1.5) catch unreachable;
+    if (turned_back) {
+        tracks.write(gain_track, .{ .flicks = 150 * weft.time.flicks_per_second }, 0.5) catch unreachable;
+    }
+    var nodes: [6]weft.Node = undefined;
+    var slab: [16]f64 = undefined;
+    var builder = weft.Builder.init(&nodes, .{ .slab_count_max = slab.len, .cues = &cues, .tracks = &tracks });
+    const loop = runaway_build(&builder, gain_track) catch unreachable;
+    var state = weft.State.init(builder.finish(), &slab);
+    const name = if (turned_back) "turned_back" else "held";
+    for (0..runaway_samples_per_run) |index| {
+        const seconds: i64 = @intCast(index * runaway_stride_seconds);
+        state.eval(.{ .flicks = seconds * weft.time.flicks_per_second });
+        const size_before = writer.buffered().len;
+        writer.print("runaway {s} zero {d} {x}\n", .{ name, index, state.value(loop) }) catch unreachable;
+        assert(writer.buffered().len - size_before <= line_size_max);
+    }
+}
+
+/// A chase of 1 + gain times its own delay, the gain read from `gain_track`.
+fn runaway_build(builder: *weft.Builder, gain_track: weft.TrackId) weft.Builder.Error!weft.Id {
+    const feedback = try builder.delay(0);
+    const gain = try builder.track(gain_track);
+    const target = try builder.add(try builder.constant(1), try builder.multiply(feedback, gain));
+    const loop = try builder.chase(.{
+        .target = target,
+        .from = 0,
+        .time = .{ .flicks = flicks_per_half_second },
+        .overshoot = 0,
+    });
+    try builder.close(feedback, loop);
+    return loop;
 }
 
 /// Lists the events of the first `event_range_seconds` of `graph` at `epoch`, as section 7
@@ -832,4 +890,37 @@ test "compare finds the end of a shorter text" {
     const long = compare("a\n", "a\n\n").?;
     try testing.expectEqual(@as(u32, 3), long.line);
     try testing.expectEqualStrings(text_end, long.expected);
+}
+
+// Locks section 10: held at a gain of 1.5, the loop is near the bound from 100 s on and holds the
+// same bits; turned back to 0.5 at 150 s, it is back at 2 by 300 s.
+test "the runaway graphs saturate, hold, and come back" {
+    for ([_]bool{ false, true }) |turned_back| {
+        var cue_times: [1]weft.Time = undefined;
+        var cues = weft.Cues.init(&cue_times);
+        _ = try cues.add(.{ .flicks = 0 });
+        var track_entries: [1]weft.Track = undefined;
+        var track_samples: [1]weft.Sample = undefined;
+        var tracks = weft.Tracks.init(&track_entries);
+        const gain_track = try tracks.add(&track_samples, 0, 2, 1.5);
+        if (turned_back) try tracks.write(gain_track, .{ .flicks = 150 * weft.time.flicks_per_second }, 0.5);
+        var nodes: [6]weft.Node = undefined;
+        var slab: [16]f64 = undefined;
+        var builder = weft.Builder.init(&nodes, .{ .slab_count_max = slab.len, .cues = &cues, .tracks = &tracks });
+        const loop = try runaway_build(&builder, gain_track);
+        var state = weft.State.init(builder.finish(), &slab);
+        var held: ?f64 = null;
+        for ([_]i64{ 100, 120, 140 }) |seconds| {
+            state.eval(.{ .flicks = seconds * weft.time.flicks_per_second });
+            try std.testing.expectApproxEqRel(weft.simulation.state_bound, state.value(loop), 1e-12);
+            if (held) |value| try std.testing.expectEqual(value, state.value(loop));
+            held = state.value(loop);
+        }
+        state.eval(.{ .flicks = 300 * weft.time.flicks_per_second });
+        if (turned_back) {
+            try std.testing.expectApproxEqAbs(@as(f64, 2), state.value(loop), 1e-9);
+        } else {
+            try std.testing.expectEqual(held.?, state.value(loop));
+        }
+    }
 }

@@ -117,7 +117,7 @@ v0.1 means a client can depend on these, not that Weft is finished. Within 0.1, 
 them is a bug or a new minor version, named in this README:
 
 - **The library's exports**, `src/weft.zig`: `Builder` and its calls, `Program`, `State` and its
-  `eval`, `events`, `values`, `extent`, `set_input`, `record`, and `adopt`, the op structs, `Cues`,
+  `eval`, `events`, `values`, `extent`, `finite`, `set_input`, `record`, and `adopt`, the op structs, `Cues`,
   `Goals`, `Regions`, `Tracks`, `Time`, `Rate`, `Event`, and `weft.colour`.
 - **The language**: every call and parameter `weft describe` lists, the syntax, the canonical
   format, and the seeds a file's names derive, so a file samples the same values in every 0.1.
@@ -412,6 +412,14 @@ forward, at most 479 steps once the checkpoints are filled; evaluating the lates
 loading, fills them all. The checkpoints only change what a read costs, never its value, and a cue
 move drops them. `program.simulated` says whether a program has such nodes. `simulation.zig` and
 `graph.zig`, sections 9 and 10, explain the step, the draws, and why a cycle needs a delay.
+
+**A runaway loop.** A loop whose gain is above 1 grows without end. Every value a simulated node
+reads or stores is clamped to `weft.simulation.state_bound`, 2^256 either way, with NaN read as 0,
+so a runaway saturates there and holds, with the same bits in every build mode, and comes back
+down if a track turns its gain back. The builder refuses a moving value or a goal that starts past
+the bound. Pure nodes downstream of a saturated one can still overflow, so after an `eval` of a
+program with a loop, `state.finite()` says whether every value is finite: show a false, and do not
+draw it or pass it to `weft.colour`. `simulation.zig`, section 7, explains the bound.
 
 ## Events
 

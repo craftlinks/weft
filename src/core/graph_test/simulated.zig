@@ -569,3 +569,72 @@ test "the builder refuses a follower or a shift register it cannot evaluate" {
     follow.pause_max = .{ .flicks = simulation.pause_steps_max * step_flicks };
     _ = try builder.follow(follow);
 }
+
+// Locks `simulation.zig` section 7 on the showcase's runaway loop, a chase of 1 + gain times its
+// own delay: at a gain of 1.5 it saturates at the bound and holds, `finite` still holds for the loop
+// but not for twice its fourth power, and a track that turns the gain back to 0.5 brings it down to
+// 2, where 1 + 0.5 x = x settles.
+test "a runaway loop saturates at the bound and comes back" {
+    var times: [1]Time = undefined;
+    var cues = Cues.init(&times);
+    _ = try cues.add(.{ .flicks = 0 });
+    var track_entries: [1]@import("../track.zig").Track = undefined;
+    var samples: [4]@import("../recording.zig").Sample = undefined;
+    var tracks = @import("../track.zig").Tracks.init(&track_entries);
+    const gain_track = try tracks.add(&samples, 0, 2, 1.5);
+    var nodes: [11]Node = undefined;
+    var builder = Builder.init(&nodes, .{ .slab_count_max = 32, .cues = &cues, .tracks = &tracks });
+    const feedback = try builder.delay(0);
+    const gain = try builder.track(gain_track);
+    const scaled = try builder.multiply(feedback, gain);
+    const one = try builder.constant(1);
+    const target = try builder.add(one, scaled);
+    const loop = try builder.chase(.{ .target = target, .from = 0, .time = .{ .flicks = flicks_per_second / 2 }, .overshoot = 0 });
+    try builder.close(feedback, loop);
+    const square = try builder.multiply(loop, loop);
+    const fourth = try builder.multiply(square, square);
+    const over = try builder.multiply(fourth, try builder.constant(2));
+    var slab: [32]f64 = undefined;
+    var state = State.init(builder.finish(), &slab);
+
+    state.eval(.{ .flicks = flicks_per_second });
+    try testing.expect(state.finite());
+    try testing.expect(state.value(loop) < simulation.state_bound);
+    // The spring reaches a fixed point of its rounding a few units of the last place below the
+    // bound, and stays there, the same bits at every read.
+    var held: ?f64 = null;
+    for ([_]i64{ 100, 120, 150 }) |seconds| {
+        state.eval(.{ .flicks = seconds * flicks_per_second });
+        try testing.expectApproxEqRel(simulation.state_bound, state.value(loop), 1e-12);
+        try testing.expectEqual(state.value(loop), state.value(feedback));
+        if (held) |value| try testing.expectEqual(value, state.value(loop));
+        held = state.value(loop);
+        try testing.expect(std.math.isInf(state.value(over)));
+        try testing.expect(!state.finite());
+    }
+    try tracks.write(gain_track, .{ .flicks = 150 * flicks_per_second }, 0.5);
+    state.eval(.{ .flicks = 300 * flicks_per_second });
+    try testing.expectApproxEqAbs(@as(f64, 2), state.value(loop), 1e-9);
+    try testing.expect(state.finite());
+}
+
+// Locks that a moving value or a goal cannot start past `simulation.state_bound`.
+test "the builder keeps a moving constant within the bound" {
+    var times: [1]Time = undefined;
+    var cues = Cues.init(&times);
+    _ = try cues.add(.{ .flicks = 0 });
+    var nodes: [4]Node = undefined;
+    var builder = Builder.init(&nodes, .{ .slab_count_max = 64, .cues = &cues });
+    const past = simulation.state_bound * 2;
+    try testing.expectError(error.NotFinite, builder.delay(past));
+    const target = try builder.constant(past);
+    const second: Time = .{ .flicks = flicks_per_second };
+    try testing.expectError(error.NotFinite, builder.chase(.{ .target = target, .from = past, .time = second, .overshoot = 0 }));
+    _ = try builder.chase(.{ .target = target, .from = simulation.state_bound, .time = second, .overshoot = 0 });
+    const echo = try builder.delay(-simulation.state_bound);
+    try builder.close(echo, echo);
+    var regions_entries: [1]simulation.Region = undefined;
+    var regions = simulation.Regions.init(&regions_entries);
+    try testing.expectError(error.NotFinite, regions.add(&.{.{ .low = 0, .high = past }}));
+    _ = builder.finish();
+}
