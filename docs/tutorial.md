@@ -892,9 +892,9 @@ The limits worth knowing before you design around Weft:
   unbounded (as every loop's is, stable or not). Since 0.1.1 its state saturates near 2^256 in
   every build mode, and `state.finite()` says when a value computed from it has overflowed.
 - **A `Compiled` is about 1 MB at the default `Limits`**, however small the file, because the
-  token and tree tables default to 4,096 entries. `check` prints six of the limits; `tokens`,
-  `tree`, `names`, and `modules` are found by trial. A library is parsed under the same limits as
-  the file. Where an error says to raise `Limits.declarations`, the field is `names`.
+  token and tree tables default to 4,096 entries. Since 0.1.1 `check` prints the least `Limits`
+  the file compiles with, every field, ready to paste, so size a `Compiled` from that line. A
+  library is parsed under the same limits as the file, and the line accounts for it.
 - **Lane counts are fixed at compile.** Data that changes size means a recompile.
 - **Lanes cannot read each other**, and a number parameter or a cue cannot vary by lane
   (section 11). A region is a line, with no rows and columns, and the client cannot hand it a

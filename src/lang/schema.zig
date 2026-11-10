@@ -123,6 +123,20 @@ pub const Op = enum {
     client,
 };
 
+/// How a call takes lanes (step 17), which `describe` prints and the checker follows.
+pub const LaneRule = enum {
+    /// The lanes of the region it is in, one inside none.
+    region,
+    /// The region's lanes when given a `stagger:`, otherwise as `inputs`.
+    stagger,
+    /// The most lanes of the signals it reads.
+    inputs,
+    /// One: it reads no signal.
+    one,
+    /// The count it is given: `lanes(n, …)`.
+    makes,
+};
+
 pub const Entry = struct {
     name: []const u8,
     op: Op,
@@ -138,6 +152,29 @@ pub const Entry = struct {
             if (std.mem.eql(u8, candidate.name, name)) return @intCast(index);
         }
         return null;
+    }
+
+    pub fn lane_rule(entry: *const Entry) LaneRule {
+        return switch (entry.op) {
+            .noise, .follow, .shift, .delay => .region,
+            .wave, .tween, .spring, .newtonian, .bounce => .stagger,
+            .chase, .crossing, .map, .oscillator, .pack, .srgb, .client => .inputs,
+            .cues, .input, .spring_mover, .newtonian_mover => .one,
+            .lanes => .makes,
+        };
+    }
+
+    /// What an event of this call carries in its `value`, as `event.zig` says, or null for a call
+    /// with no events.
+    pub fn event_value(entry: *const Entry) ?[]const u8 {
+        return switch (entry.op) {
+            .bounce => "the velocity just before the hit: +speed at the top, -speed at the bottom",
+            .crossing => "the slope over the step of the crossing, in units a second",
+            .cues => "the index of the cue in its table",
+            .spring, .newtonian, .follow => "the goal reached",
+            .shift => "the value of the bucket entered",
+            else => null,
+        };
     }
 
     pub fn positional_count(entry: *const Entry) u32 {

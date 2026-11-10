@@ -1,1 +1,2 @@
 ok: 8 nodes, a slab of 20, 2 cues, 1 goals, 1 regions, 0 tracks, seekable, stepped
+limits: .{ .tokens = 97, .tree = 44, .names = 8, .nodes = 8, .slab = 20, .cues = 2, .goals = 1, .regions = 1, .tracks = 0, .modules = 4, .libraries = 1 }

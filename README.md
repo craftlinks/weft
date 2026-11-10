@@ -133,6 +133,13 @@ and the node array, `Limits`' defaults, diagnostics' wording, Play, and the benc
 A file that 0.1.0 accepted and should not have is a bug, so 0.1.1 refuses it: a tween from a
 colour to a number, a product of two colours, and a module with two parameters of one name.
 
+**0.1.1** (steps 19 to 22) adds and fixes, and changes no promise: a loop that runs away
+saturates and `State.finite` says so; `State.events_since`, and a reader given
+`Program.reader_slab_count()` of slab replays one step where it restored a checkpoint; the
+checker's holes above, and hints that name real `Limits` fields; `check` prints the least
+`Limits` a file needs, `sample` takes `--events` and `--lanes` and any slab size, and `describe`
+says how each call takes lanes and what its events carry.
+
 ## Requirements
 
 | | |
@@ -724,20 +731,34 @@ the compiler already vectorizes them.
 needs no window, no GPU, and no Patchwork, and each command is a thin call into the library:
 
 ```bash
-weft check FILE [--use NAME=PATH]...            # diagnostics, or a one-line summary
+weft check FILE [--use NAME=PATH]...            # diagnostics, or a summary and its limits
 weft describe [--use NAME=PATH]...              # primitives and modules, as JSON
 weft sample FILE [--from S] [--to S] [--step S] [--signal NAME]...   # values and events, as JSON
+          [--events NAME]... [--lanes A..B]     # only these sources' events, only these lanes
 weft parse FILE --json                          # the flat tree, as JSON
 ```
 
 ```txt
 $ weft check play/signals.weft
-ok: 21 nodes, 6 cues, 4 tracks, seekable, stepped
+ok: 21 nodes, a slab of 112, 6 cues, 3 goals, 4 regions, 4 tracks, seekable, stepped
+limits: .{ .tokens = 561, .tree = 268, .names = 29, .nodes = 21, .slab = 112, .cues = 6, .goals = 3, .regions = 4, .tracks = 4, .modules = 0, .libraries = 0 }
 $ weft sample play/signals.weft --to 1 --step 0.5 --signal wave
-{"from":0,"to":705600000,"step":352800000,"signals":[{"name":"wave","range":[-1,1],"values":[0,1,0]}],"events":[{"t":22050000,"source":19,"instance":0},…]}
+{"from":0,"to":705600000,"step":352800000,"signals":[{"name":"wave","range":[-1,1],"bounded":true,"values":[0,1,0]}],"events":[{"t":22050000,"source":19,"instance":0,"name":"glide_a","value":0.496…},…]}
 ```
 
 - **Times** on the command line are seconds; in the output they are flicks, so a grid is exact.
+- **`check`'s limits line** is the least `Limits` the file compiles with, ready to paste, from
+  `Compiled.needs()`: `track_samples` and `errors` are left to the client. A file with a lane
+  region adds `a lane costs N of the slab`. A `Compiled` at the default `Limits` is about 1 MB
+  whatever the file, so a client short of static memory sizes one from this line.
+- **`sample`** allocates its reader's slab, so a file of any slab size can be sampled (v0.1.0's
+  command held 262,144 values). `--events NAME` keeps the events of the signal bound to NAME,
+  and `--lanes A..B` keeps lanes A to B, both included, of every signal and event of a region:
+  each such signal gains `"lane_first"`. Every signal says `"bounded"`, false when its range has
+  an infinite end, which prints as `null`.
+- **`describe`** gives each primitive's `"lanes"`, how it takes them (`region`, `stagger`,
+  `inputs`, `one`, or `makes`), and its `"events"`, what an event's `value` carries, or `null`.
+- **At most two `--use`**; a third is an error that says so.
 - **JSON** has its keys in a fixed order and no whitespace, and a value that is not finite, such
   as an unbounded range, is `null`. The output of every command is locked by a golden in
   `test/golden/cli`, so a change to it is a reviewed change.
@@ -745,7 +766,8 @@ $ weft sample play/signals.weft --to 1 --step 0.5 --signal wave
   cannot be read.
 - **A client's nouns**: `Compiled.compile_client` takes entries beside the table of primitives.
   The checker accepts them and Weft's back end refuses them, so the client builds them from
-  `compiled.checked.calls`, and `describe` lists them under `nouns`.
+  `compiled.checked.calls`, and `describe` lists them under `nouns`. A noun no client builds
+  refuses the whole file, since the back end has no node for it.
 
 ## Regress
 
@@ -781,8 +803,11 @@ no GPU. Its numbers depend on the machine, so it has no thresholds and is not pa
 
 ## Costs
 
-Measured with `zig build bench -Doptimize=ReleaseFast` on an i5-13600K, at step 18. A frame at
-60 Hz has 16.7 ms; an audio block of 128 frames at 48 kHz has 2.667 ms.
+Measured with `zig build bench -Doptimize=ReleaseFast` on an i5-13600K, at step 18; step 19's
+bound adds about 5% to a stepped node's step. The numbers are ReleaseFast: Debug is about ten
+times slower. Play's simulated file is `signals.weft`, 21 nodes: four chases, a follower, a
+shift register, an oscillator, tracks, cues, and pure nodes around them. A frame at 60 Hz has
+16.7 ms; an audio block of 128 frames at 48 kHz has 2.667 ms.
 
 | What | Cost |
 | --- | --- |
@@ -790,6 +815,8 @@ Measured with `zig build bench -Doptimize=ReleaseFast` on an i5-13600K, at step 
 | … wave, tween, Newtonian move, spring, noise, bounce | 6, 10, 14, 22, 20, and 27 ns |
 | … simulated, with its 8 steps a frame: crossing, delay, shift, oscillator, chase, follower | 41, 52, 94, 105, 181, and 235 ns |
 | A lane, in a region of a noise, a staggered tween, a map, a product, and a bounce | 25 to 44 ns a frame |
+| … so a node of a lane, at 100,000 lanes | about 5 ns |
+| A step of Play's file, from cold: 288,000 steps to 600 s | about 0.12 µs, 6 ns a node |
 | 1,000 and 100,000 such lanes, an eval | 44 µs and 2.5 ms |
 | Play's simulated file (21 nodes) from cold, the first eval at 60 s and at 600 s | 3.4 ms and 34 ms |
 | The same reader, checkpoints filled, a seek back from 600 s to 300.99 s | 151 µs |
@@ -832,7 +859,10 @@ compiled at start, and the first can be edited while it runs.
   good program running and marks its errors, with the first named under the editor. A program
   that compiles runs from the playhead on, and its readers keep their steps when no simulated
   node changed (Recompiling and Carry, `src/lang/lang.zig`), so such an edit costs under a
-  millisecond even at 600 s, and a spring in flight does not jump. The knobs here are bound to
+  millisecond even at 600 s. A fresh reader would give the same bits, so a spring in flight never
+  jumps either way: the carry saves the replay, not the motion. A `seed`, `start`, `use`, or
+  `module` line, or a library's text, is global to the carry, so changing one starts every
+  stepped node from the start. The knobs here are bound to
   the numbers of the `track` lines: turning one rewrites the number, one undo entry a drag, and
   with it the track's history, unlike the shapes page's knobs, which apply from now on. While a
   knob is dragged, its value is a preview from the playhead on, under a millisecond a step; the

@@ -7,16 +7,20 @@
 //! ```text
 //! weft check FILE [--use NAME=PATH]...
 //! weft describe [--use NAME=PATH]...
-//! weft sample FILE [--from S] [--to S] [--step S] [--signal NAME]... [--use NAME=PATH]...
+//! weft sample FILE [--from S] [--to S] [--step S] [--signal NAME]... [--events NAME]...
+//!                   [--lanes A..B] [--use NAME=PATH]...
 //! weft parse FILE --json
 //! ```
+//! At most two `--use`. `--events NAME` keeps the events of the signal bound to NAME, and
+//! `--lanes A..B` keeps lanes A to B of every signal and event, both included.
 //! Times are seconds, read as decimals and turned into flicks, as the library's times are.
 //! Exit 0 on success, 1 when the file has errors, and 2 on bad arguments or a file that cannot be
 //! read.
 //!
 //! ## 2. Memory
 //! Each file is read into a buffer of its own, `file_buffers`, and the output is written into one
-//! buffer, `out_buffer`, then printed in one write. The CLI allocates nothing.
+//! buffer, `out_buffer`, then printed in one write. `sample` allocates its reader's slab, sized to
+//! the file, so a file of any slab can be sampled; nothing else allocates.
 
 const std = @import("std");
 const weft = @import("weft");
@@ -25,7 +29,8 @@ const commands = @import("commands");
 const usage_text =
     \\usage: weft check FILE [--use NAME=PATH]...
     \\       weft describe [--use NAME=PATH]...
-    \\       weft sample FILE [--from S] [--to S] [--step S] [--signal NAME]... [--use NAME=PATH]...
+    \\       weft sample FILE [--from S] [--to S] [--step S] [--signal NAME]... [--events NAME]...
+    \\                         [--lanes A..B] [--use NAME=PATH]...
     \\       weft parse FILE --json
     \\
 ;
@@ -34,7 +39,7 @@ const libraries_max = 2;
 const names_max = commands.signals_max;
 
 var file_buffers: [1 + libraries_max][file_bytes_max]u8 = undefined;
-var out_buffer: [1 << 20]u8 = undefined;
+var out_buffer: [16 << 20]u8 = undefined;
 var compiled: commands.Compiled = undefined;
 
 pub fn main(init: std.process.Init) !u8 {
@@ -48,13 +53,19 @@ pub fn main(init: std.process.Init) !u8 {
     var library_count: usize = 0;
     var names: [names_max][]const u8 = undefined;
     var name_count: usize = 0;
+    var event_names: [names_max][]const u8 = undefined;
+    var event_count: usize = 0;
+    var lanes: ?[2]u32 = null;
     var window: commands.Window = .{ .from = 0, .to = 705_600_000, .step = 70_560_000 };
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--json")) continue;
         if (std.mem.eql(u8, arg, "--use")) {
             const spec = args.next() orelse return usage();
             const equal = std.mem.indexOfScalar(u8, spec, '=') orelse return usage();
-            if (library_count == libraries_max) return usage();
+            if (library_count == libraries_max) {
+                std.debug.print("error: at most {d} libraries, given {d}\n", .{ libraries_max, library_count + 1 });
+                return 2;
+            }
             const text = read(io, spec[equal + 1 ..], &file_buffers[1 + library_count]) orelse return 2;
             libraries[library_count] = .{ .name = spec[0..equal], .text = text };
             library_count += 1;
@@ -64,6 +75,12 @@ pub fn main(init: std.process.Init) !u8 {
             window.to = flicks(args.next() orelse return usage()) orelse return usage();
         } else if (std.mem.eql(u8, arg, "--step")) {
             window.step = flicks(args.next() orelse return usage()) orelse return usage();
+        } else if (std.mem.eql(u8, arg, "--events")) {
+            if (event_count == names_max) return usage();
+            event_names[event_count] = args.next() orelse return usage();
+            event_count += 1;
+        } else if (std.mem.eql(u8, arg, "--lanes")) {
+            lanes = lane_range(args.next() orelse return usage()) orelse return usage();
         } else if (std.mem.eql(u8, arg, "--signal")) {
             if (name_count == names_max) return usage();
             names[name_count] = args.next() orelse return usage();
@@ -92,7 +109,8 @@ pub fn main(init: std.process.Init) !u8 {
                 std.debug.print("weft: --step must be above 0, --to at or after --from, and at most {d} times\n", .{commands.samples_max});
                 return 2;
             }
-            const ok = try commands.sample(&compiled, &writer, source, libraries[0..library_count], names[0..name_count], window);
+            const filter: commands.Filter = .{ .events = event_names[0..event_count], .lanes = lanes };
+            const ok = try commands.sample(init.gpa, &compiled, &writer, source, libraries[0..library_count], names[0..name_count], window, filter);
             if (!ok) status = 1;
         } else if (std.mem.eql(u8, command, "parse")) {
             const ok = try commands.parse(&writer, source);
@@ -115,6 +133,15 @@ fn flicks(text: []const u8) ?i64 {
     const seconds = std.fmt.parseFloat(f64, text) catch return null;
     if (!(@abs(seconds) <= 86_400)) return null;
     return @intFromFloat(@round(seconds * @as(f64, @floatFromInt(weft.time.flicks_per_second))));
+}
+
+/// `A..B`, two lane indices with A at most B; null otherwise.
+fn lane_range(text: []const u8) ?[2]u32 {
+    const dots = std.mem.indexOf(u8, text, "..") orelse return null;
+    const first = std.fmt.parseInt(u32, text[0..dots], 10) catch return null;
+    const last = std.fmt.parseInt(u32, text[dots + 2 ..], 10) catch return null;
+    if (first > last) return null;
+    return .{ first, last };
 }
 
 fn usage() u8 {

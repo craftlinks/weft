@@ -38,7 +38,8 @@ pub const limits: lang.Limits = .{
     .tree = 16384,
     .names = 512,
     .nodes = 1024,
-    .slab = 1 << 18,
+    // Only a number the builder compares against, never an array: `sample` allocates the slab.
+    .slab = std.math.maxInt(u32),
     .cues = 512,
     .goals = 256,
     .regions = 64,
@@ -80,7 +81,6 @@ pub const Window = struct {
 };
 
 var scratch: Syntax = undefined;
-var slab: [limits.slab]f64 = undefined;
 var ranges: [limits.nodes]weft.Range = undefined;
 var events: [events_max]weft.Event = undefined;
 
@@ -92,7 +92,7 @@ pub fn check(compiled: *Compiled, writer: *std.Io.Writer, source: Source, librar
     };
     const program = compiled.program;
     const report = program.report();
-    // Every count a client's `Limits` must hold, beside the nodes (step 18).
+    // The counts of step 18, then every field a client's `Limits` must hold.
     try writer.print("ok: {d} nodes, a slab of {d}, {d} cues, {d} goals, {d} regions, {d} tracks, {s}, {s}\n", .{
         program.nodes.len,
         program.slab_count,
@@ -103,7 +103,29 @@ pub fn check(compiled: *Compiled, writer: *std.Io.Writer, source: Source, librar
         if (report.seekable) "seekable" else "live",
         if (report.stepped) "stepped" else "closed form",
     });
+    // The least `Limits` the file compiles with, to paste (step 22).
+    const needs = compiled.needs();
+    try writer.writeAll("limits: .{");
+    inline for (@typeInfo(lang.Limits).@"struct".field_names, 0..) |name, at| {
+        if (comptime std.mem.eql(u8, name, "track_samples") or std.mem.eql(u8, name, "errors")) continue;
+        try writer.print("{s} .{s} = {d}", .{ if (at == 0) "" else ",", name, @field(needs, name) });
+    }
+    try writer.writeAll(" }\n");
+    const lane_cost = slab_per_lane(program);
+    if (lane_cost > 0) try writer.print("a lane costs {d} of the slab\n", .{lane_cost});
     return true;
+}
+
+/// The f64 each lane of a region adds to the slab: each node of more than one lane's values and
+/// caches over its lanes, rounded up, summed. 0 for a file with no region.
+fn slab_per_lane(program: weft.Program) u64 {
+    var total: u64 = 0;
+    for (program.nodes) |node| {
+        if (node.extent.lanes <= 1) continue;
+        const region = node.extent.count() + node.op.cache_count(node.extent.count());
+        total += (region + node.extent.lanes - 1) / node.extent.lanes;
+    }
+    return total;
 }
 
 /// The diagnostics of a failed compile, against the text they are about: a library's own when
@@ -175,6 +197,9 @@ fn json_entry(writer: *std.Io.Writer, entry: *const schema.Entry) !void {
     try json_string(writer, entry.name);
     try writer.print(",\"role\":\"{s}\",\"op\":\"{s}\",\"summary\":", .{ @tagName(entry.role), @tagName(entry.op) });
     try json_string(writer, entry.summary);
+    // How it takes lanes, and what its events carry (step 22).
+    try writer.print(",\"lanes\":\"{s}\",\"events\":", .{@tagName(entry.lane_rule())});
+    if (entry.event_value()) |value| try json_string(writer, value) else try writer.writeAll("null");
     try writer.writeAll(",\"outputs\":[");
     for (entry.outputs, 0..) |output, index| {
         if (index > 0) try writer.writeAll(",");
@@ -249,16 +274,27 @@ pub fn parse(writer: *std.Io.Writer, source: Source) !bool {
 /// `weft sample`: each named signal's range and its value at each time of `window`, then the
 /// events in the window, as JSON (section 3). With no names, every top-level signal in text
 /// order, up to `signals_max`. False, with a message, when the file or a name is wrong.
+/// What `sample` keeps: the events of the sources bound to `events`, all when it is empty, and
+/// lanes `lanes[0]` to `lanes[1]`, both included, all when it is null (step 22).
+pub const Filter = struct {
+    events: []const []const u8 = &.{},
+    lanes: ?[2]u32 = null,
+};
+
 pub fn sample(
+    gpa: std.mem.Allocator,
     compiled: *Compiled,
     writer: *std.Io.Writer,
     source: Source,
     libraries: []const lang.Source,
     names: []const []const u8,
     window: Window,
+    filter: Filter,
 ) !bool {
     assert(window.valid());
     assert(names.len <= signals_max);
+    assert(filter.events.len <= signals_max);
+    if (filter.lanes) |lanes| assert(lanes[0] <= lanes[1]);
     compiled.compile_with(libraries, source.text) catch {
         try render_errors(compiled, writer, source, libraries);
         return false;
@@ -267,14 +303,18 @@ pub fn sample(
     const list = if (names.len > 0) names else default_signals(compiled, &default_names);
     var ids: [signals_max]weft.Id = undefined;
     for (list, 0..) |name, at| {
-        ids[at] = compiled.signal(name) orelse {
-            try writer.writeAll("error: ");
-            try json_string(writer, name);
-            try writer.writeAll(" is not a signal of the file\n");
-            return false;
-        };
+        ids[at] = compiled.signal(name) orelse return not_a_signal(writer, name);
+    }
+    var event_ids: [signals_max]weft.Id = undefined;
+    for (filter.events, 0..) |name, at| {
+        event_ids[at] = compiled.signal(name) orelse return not_a_signal(writer, name);
     }
     const program = compiled.program;
+    const slab = gpa.alloc(f64, @intCast(program.reader_slab_count())) catch {
+        try writer.print("error: a slab of {d} values does not fit in memory\n", .{program.reader_slab_count()});
+        return false;
+    };
+    defer gpa.free(slab);
     program.ranges(ranges[0..program.nodes.len]);
     const count = window.count();
 
@@ -284,23 +324,27 @@ pub fn sample(
         try writer.writeAll("{\"name\":");
         try json_string(writer, name);
         const extent = program.nodes[id.index].extent;
+        const kept = kept_lanes(extent.lanes, filter.lanes);
         if (extent.lanes > 1) try writer.print(",\"lanes\":{d}", .{extent.lanes});
+        if (extent.lanes > 1 and filter.lanes != null) try writer.print(",\"lane_first\":{d}", .{kept[0]});
+        assert(kept[1] > kept[0] or (extent.lanes > 1 and filter.lanes != null));
         if (extent.components > 1) try writer.print(",\"components\":{d}", .{extent.components});
+        const range = ranges[id.index];
         try writer.writeAll(",\"range\":[");
-        try json_number(writer, ranges[id.index].low);
+        try json_number(writer, range.low);
         try writer.writeAll(",");
-        try json_number(writer, ranges[id.index].high);
-        try writer.writeAll("],\"values\":[");
+        try json_number(writer, range.high);
+        try writer.print("],\"bounded\":{},\"values\":[", .{std.math.isFinite(range.low) and std.math.isFinite(range.high)});
         // Each signal reads the window from a fresh state, which a read cannot tell apart from one
         // that read the others too, so no lane array needs keeping.
-        var state = weft.State.init(program, slab[0..@min(slab.len, program.reader_slab_count())]);
+        var state = weft.State.init(program, slab);
         for (0..count) |index| {
             if (index > 0) try writer.writeAll(",");
             state.eval(.{ .flicks = window.from + @as(i64, @intCast(index)) * window.step });
             const read = state.values(id);
             if (extent.lanes > 1) try writer.writeAll("[");
-            for (0..extent.lanes) |lane| {
-                if (lane > 0) try writer.writeAll(",");
+            for (kept[0]..kept[1]) |lane| {
+                if (lane > kept[0]) try writer.writeAll(",");
                 try json_value(writer, read[lane * extent.components ..][0..extent.components]);
             }
             if (extent.lanes > 1) try writer.writeAll("]");
@@ -308,10 +352,13 @@ pub fn sample(
         try writer.writeAll("]}");
     }
     try writer.writeAll("],\"events\":[");
-    var state = weft.State.init(program, slab[0..@min(slab.len, program.reader_slab_count())]);
+    var state = weft.State.init(program, slab);
     const found = state.events(.{ .flicks = window.from }, .{ .flicks = window.to }, &events);
-    for (events[0..found.count], 0..) |event, at| {
-        if (at > 0) try writer.writeAll(",");
+    var written: u32 = 0;
+    for (events[0..found.count]) |event| {
+        if (!event_kept(program, event, event_ids[0..filter.events.len], filter.lanes)) continue;
+        if (written > 0) try writer.writeAll(",");
+        written += 1;
         try writer.print("{{\"t\":{d},\"source\":{d},\"instance\":{d}", .{
             event.time.flicks,
             event.source.index,
@@ -327,6 +374,34 @@ pub fn sample(
     }
     try writer.writeAll("]}\n");
     return true;
+}
+
+fn not_a_signal(writer: *std.Io.Writer, name: []const u8) !bool {
+    try writer.writeAll("error: ");
+    try json_string(writer, name);
+    try writer.writeAll(" is not a signal of the file\n");
+    return false;
+}
+
+/// The lanes of a node of `lanes` that `sample` prints, as `[first, end)`. `--lanes` picks among
+/// the lanes of a region, so a node of one lane keeps it.
+fn kept_lanes(lanes: u32, wanted: ?[2]u32) [2]u32 {
+    if (lanes == 1) return .{ 0, 1 };
+    const range = wanted orelse return .{ 0, lanes };
+    const first = @min(range[0], lanes);
+    const end = @min(range[1] + 1, lanes);
+    return .{ first, @max(first, end) };
+}
+
+/// Whether an event passes `--events` and `--lanes`, which only picks among a region's lanes.
+fn event_kept(program: weft.Program, event: weft.Event, sources: []const weft.Id, lanes: ?[2]u32) bool {
+    if (lanes) |range| {
+        const laned = program.nodes[event.source.index].extent.lanes > 1;
+        if (laned and (event.instance < range[0] or event.instance > range[1])) return false;
+    }
+    if (sources.len == 0) return true;
+    for (sources) |source| if (source.index == event.source.index) return true;
+    return false;
 }
 
 /// The name of the signal whose node fired an event, if a name is bound to it (step 18).
