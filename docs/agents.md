@@ -54,6 +54,7 @@ One declaration a line, a name above its use. Times carry units (`2s`, `500ms`),
 seed 7                                   # the file's seed; every noise draws from it
 cue c0 = 0s                              # a named time
 cue bar = 0s..60s every 2s               # a series: bar[0] to bar[30]
+cue late = bar[30] + 500ms               # a cue after a cue, summed when the file compiles
 track speed = 0.5 in 0..2                # a value a client writes, from a time on
 
 wave = wave(sine, 0.5hz)                 # pure: a function of t

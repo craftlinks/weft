@@ -81,7 +81,7 @@ pub fn build(b: *std.Build) void {
 
     // The `weft` command (step 14): its commands are a module of their own, so the tests call
     // the same functions and compare the bytes with the goldens in test/golden/cli.
-    const commands = b.createModule(.{
+    const commands = b.addModule("commands", .{
         .root_source_file = b.path("cli/commands.zig"),
         .target = target,
         .optimize = optimize,

@@ -691,6 +691,36 @@ test "series, outputs, delays, and shared regions" {
     try testing.expectEqual(expected.derive(0).seed, n.seed);
 }
 
+// Locks a cue after a cue (`check.zig`, section 4a): the table holds the sums, a series may
+// start from one, and the order rule still holds.
+test "a cue is a time, or a cue and a time after it" {
+    const compiled = try compile_ok(
+        \\cue b1 = 2s
+        \\cue hit = b1 + 500ms
+        \\cue same = hit
+        \\cue tick = hit + 1s..hit + 3s every 500ms
+        \\cue last = tick[4] + 250ms
+        \\rise = tween(from: 0, to: 1, at: hit, over: 1s)
+        \\
+    );
+    const second = time_module.flicks_per_second;
+    const times = compiled.tables.cues.times[0..compiled.tables.cues.count];
+    try testing.expectEqual(@as(usize, 9), times.len);
+    try testing.expectEqual(@as(i64, 2 * second + second / 2), times[1].flicks);
+    try testing.expectEqual(times[1].flicks, times[2].flicks);
+    try testing.expectEqual(@as(i64, 3 * second + second / 2), times[3].flicks);
+    try testing.expectEqual(@as(i64, 5 * second + 3 * second / 4), times[8].flicks);
+    try testing.expectEqual(diagnostic.Code.cue_out_of_order, (try first_error("cue a = 1s\ncue b = a - 500ms\n")).code);
+    try testing.expectEqual(diagnostic.Code.cue_out_of_order, (try first_error("cue a = 1s\ncue b = 2s\ncue c = a + 500ms\n")).code);
+    try testing.expectEqual(diagnostic.Code.wrong_type, (try first_error("cue a = 1s\ncue b = 500ms + a\n")).code);
+    try testing.expectEqual(diagnostic.Code.wrong_type, (try first_error("cue a = 1s\ncue b = a + 2\n")).code);
+    try testing.expectEqual(diagnostic.Code.used_before_declared, (try first_error("cue b = a + 1s\ncue a = 1s\n")).code);
+    // The canonical format keeps the sum as it was written.
+    var buffer: [256]u8 = undefined;
+    _ = try compile_ok("cue b1=2s\ncue hit=b1+500ms\n");
+    try testing.expectEqualStrings("cue b1 = 2s\ncue hit = b1 + 500ms\n", try small.syntax.format_into(&buffer));
+}
+
 // Locks the errors with their suggestions, one each.
 test "errors name the problem and suggest the fix" {
     const Case = struct { source: []const u8, code: diagnostic.Code, hint: []const u8 };

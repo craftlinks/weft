@@ -235,6 +235,12 @@ Cues are kept in time order, which gives the file three rules:
 - **A move cannot pass a neighbour.** It is refused whole, not clamped, so a drag handle clamps
   for itself.
 
+A cue may also be written **after another cue**: `cue hit = drop + 500ms`, or a series from one,
+`cue tick = drop + 1s..drop + 3s every 500ms`. Then the parts of a beat follow the beat when its
+one literal is edited. There is no minus, since a cue comes at or after the cue it names. The sum
+is worked out when the file compiles, so `Cues.move` on `drop` does not move `hit`: move both, or
+edit the text and recompile.
+
 The first cue is also where simulated signals start (section 8). If you plan to move cues, begin
 the file with a cue at 0 that you never move.
 

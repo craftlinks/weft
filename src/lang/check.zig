@@ -31,6 +31,14 @@
 //! are exact to 5 decimal places and milliseconds to 2, since 705,600,000 = 2^9 3^2 5^5 7^2.
 //! Anything finer is refused with the nearest whole flick, so a bounce's hits stay exact.
 //!
+//! ## 4a. A Cue After a Cue
+//! A cue's time is a time literal, or an earlier cue plus one: `cue hit = b2 + 500ms` (step 29).
+//! So a beat's parts are written against the beat, and an edit of the beat's one literal moves
+//! them all. The sum is worked out here, in whole flicks, and the cue table holds plain times as
+//! before: `Cues.move` on the first cue does not move the second, since the program keeps no
+//! link between them. Cues stay in time order however they are written, which is why there is
+//! no minus: a cue before the cue it names would be above it in the file.
+//!
 //! ## 5. Seeds
 //! An explicit `seed:` wins. Otherwise a call's seed is the FNV-1a hash of its declaration's name,
 //! and the second seeded call in one declaration hashes that with its ordinal, so adding a line
@@ -614,7 +622,7 @@ const Checker = struct {
                 checker.start_item = index;
             },
             .cue => {
-                const time = try checker.literal_time(it.a);
+                const time = try checker.cue_time(it.a);
                 const cue = try checker.add_cue(index, time);
                 _ = try checker.declare(index, .{ .name = name, .item = index, .kind = .cue, .index = cue });
             },
@@ -659,10 +667,39 @@ const Checker = struct {
         return cue;
     }
 
+    /// A cue's time (section 4a): a time literal, an earlier cue, or that cue plus a time
+    /// literal.
+    fn cue_time(checker: *Checker, index: u32) Fail!i64 {
+        const it = checker.item(index);
+        switch (it.tag) {
+            .name, .element => return checker.memory.cue_times[try checker.cue_of(index)],
+            .subtract => {
+                const diagnostic = checker.fail(index, .cue_out_of_order, "a cue comes at or after the cue it names, so there is no minus", .{});
+                error_module.hint(diagnostic, "declare this cue first, and write the other as this one plus a time", .{});
+                return error.Checked;
+            },
+            .add => {
+                const base_tag = checker.item(it.a).tag;
+                if (base_tag != .name and base_tag != .element) {
+                    const diagnostic = checker.fail(it.a, .wrong_type, "a cue's time is a time, or a cue and a time after it", .{});
+                    error_module.hint(diagnostic, "for example `cue hit = beat + 500ms`", .{});
+                    return error.Checked;
+                }
+                const base = checker.memory.cue_times[try checker.cue_of(it.a)];
+                const offset = try checker.literal_time(it.b);
+                return std.math.add(i64, base, offset) catch {
+                    _ = checker.fail(index, .out_of_range, "this cue's time is past what a time holds", .{});
+                    return error.Checked;
+                };
+            },
+            else => return checker.literal_time(index),
+        }
+    }
+
     fn cue_series(checker: *Checker, index: u32) Fail!void {
         const it = checker.item(index);
-        const from = try checker.literal_time(it.a);
-        const to = try checker.literal_time(checker.tree.extra[it.b]);
+        const from = try checker.cue_time(it.a);
+        const to = try checker.cue_time(checker.tree.extra[it.b]);
         const every = try checker.literal_time(checker.tree.extra[it.b + 1]);
         if (every <= 0 or to < from or @rem(to - from, every) != 0) {
             const diagnostic = checker.fail(index, .bad_series, "a series' step must be above 0s and divide its span exactly", .{});

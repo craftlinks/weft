@@ -141,8 +141,10 @@ checker's holes above, and hints that name real `Limits` fields; `check` prints 
 says how each call takes lanes and what its events carry.
 
 **Unreleased, for 0.2** (step 27) adds language surface, so it waits for a minor version: a string
-literal, and a client's nouns that only describe (see A Client's Nouns). No file 0.1 accepted
-changes its values. `schema.params_max` is 16, where it was 8.
+literal, and a client's nouns that only describe (see A Client's Nouns), and a cue written after
+another cue, `cue hit = c1 + 500ms` (step 29). No file 0.1 accepted changes its values.
+`schema.params_max` is 16, where it was 8. The `weft` command's functions are the module
+`commands`, so a client's own command can print `describe` with its nouns.
 
 ## Requirements
 
@@ -604,6 +606,8 @@ const goal = compiled.goal("spring");        // a path and its from, a chase's t
 - **Times and frequencies carry units**: `2s`, `500ms`, `0.5hz`. A time is a whole number of
   flicks, so seconds are exact to five places and milliseconds to two; anything finer is an error
   naming the nearest flick.
+- **A cue is a time, or an earlier cue plus one**: `cue hit = c1 + 500ms`. The sum is worked out
+  at compile, so the table holds plain times and `Cues.move` moves one cue.
 - **A name is declared above its use**, so the node order is the text order. Calls and names never
   clash, so `tween = tween(...)` is fine. A cycle goes through a delay, fed below by `<-`.
 - **Arithmetic** is `+`, `-`, `*`, and parentheses. `a - b` is `a + b * -1`, exact, so no new op.
