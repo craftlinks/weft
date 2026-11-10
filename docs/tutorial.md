@@ -908,7 +908,8 @@ The limits worth knowing before you design around Weft:
   spring's goals, and a bounce's walls are fixed when the program is built.
 - **No division, no comparison, no `if`, no `min`/`max`, no `abs`.** A `crossing` is the one way to
   make a gate; a `map` is the one way to rescale.
-- **No strings.** A value is one to four numbers.
+- **No strings in a signal.** A value is one to four numbers. Since step 27 a string literal,
+  `"text"`, exists for one use: a parameter of a client's noun (README, A Client's Nouns).
 - **A track holds a bounded number of writes** (`Limits.track_samples`, 1,024 by default).
 - **`crossing` events** can miss a there-and-back inside 1/480 s.
 - **Ranges are conservative.** A declared module range such as `in -1..1` can be refused because

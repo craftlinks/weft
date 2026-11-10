@@ -18,6 +18,17 @@
 //! Every entry is one builder call with the builder's own names, so the table, the builder, and
 //! its documentation say the same thing. Shorter names come from modules (step 13).
 //!
+//! ## 3a. Nouns That Only Describe
+//! A client has two ways to add a call (steps 14 and 27). `Op.client` is a signal the client
+//! builds: the checker accepts it and Weft's back end refuses the file, so the client reads
+//! `Checked.calls` and builds its own program. `Op.noun` is not a signal at all: it describes
+//! something the client owns, an axis, a caption, a typeface, and stands only as a whole
+//! declaration, `ax = axes(x: -3..3)`. The back end builds the signals among its arguments and
+//! nothing for the noun, so the file compiles to a program and the client reads each noun's
+//! values beside it. Two kinds exist for nouns: `string`, a literal's text, and `noun`, the name
+//! of a noun declared above, of one of the entries the parameter's `words` lists, or of any when
+//! `words` is empty. A noun's signals each keep their own lanes and shape.
+//!
 //! ## 4. TigerStyle Invariants
 //! - The table is comptime and checked: positional parameters come first, names are unique in an
 //!   entry, a default suits its kind, and an entry has at most `params_max` parameters.
@@ -29,7 +40,7 @@ const noise = @import("../core/noise.zig");
 const simulation = @import("../core/simulation.zig");
 const graph = @import("../core/graph.zig");
 
-pub const params_max = 8;
+pub const params_max = 16;
 
 pub const Kind = enum {
     /// A number literal.
@@ -60,6 +71,10 @@ pub const Kind = enum {
     mover,
     /// A whole number; by default worked out from the declaration's name.
     seed,
+    /// A string literal, for a client's nouns (section 3a).
+    string,
+    /// The name of a noun declared above, one of the entries in `words` when it lists any.
+    noun,
 };
 
 pub const Default = union(enum) {
@@ -77,6 +92,8 @@ pub const Default = union(enum) {
     seed,
     /// The whole series, or one cue.
     whole,
+    /// A string's text.
+    text: []const u8,
 };
 
 pub const Param = struct {
@@ -119,8 +136,12 @@ pub const Op = enum {
     srgb,
     /// `lanes(n, body)`: its body over a region of n lanes (step 17).
     lanes,
-    /// A client's noun: checked like the rest, built by the client from `Checked.calls`.
+    /// A client's signal: checked like the rest, refused by Weft's back end, and built by the
+    /// client from `Checked.calls`.
     client,
+    /// A client's noun that only describes (section 3a): a declaration of its own, whose signal
+    /// arguments the back end builds and whose call it skips.
+    noun,
 };
 
 /// How a call takes lanes (step 17), which `describe` prints and the checker follows.
@@ -135,6 +156,8 @@ pub const LaneRule = enum {
     one,
     /// The count it is given: `lanes(n, …)`.
     makes,
+    /// None of its own: a noun, each of whose signals keeps its lanes.
+    apart,
 };
 
 pub const Entry = struct {
@@ -161,6 +184,7 @@ pub const Entry = struct {
             .chase, .crossing, .map, .oscillator, .pack, .srgb, .client => .inputs,
             .cues, .input, .spring_mover, .newtonian_mover => .one,
             .lanes => .makes,
+            .noun => .apart,
         };
     }
 
@@ -353,6 +377,7 @@ comptime {
                 .seed => assert(param_a.kind == .seed),
                 .whole => assert(param_a.kind == .integer),
                 .absent => assert(param_a.kind == .signal),
+                .text => assert(param_a.kind == .string),
                 .required => {},
             }
             for (entry.params[index_a + 1 ..]) |param_b| assert(!std.mem.eql(u8, param_a.name, param_b.name));

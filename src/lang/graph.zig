@@ -42,6 +42,12 @@
 //! lane is spread to its count, a component at a time for a vector, so a binding of
 //! `lanes(n, …)` always has n lanes.
 //!
+//! ## 9. Nouns That Only Describe
+//! A `noun` declaration (step 27, `check.zig` section 6a) builds each signal among its call's
+//! arguments, in parameter order, and nothing for the call: the client reads the values from
+//! `Checked` and each signal's node from `expr_ids`. The nodes are the binding's, so a recompile
+//! carries a simulated signal inside a noun as it carries any other.
+//!
 //! ## 7. TigerStyle Invariants
 //! - Every table is the caller's and sized by `Limits`; the checker already refused what would
 //!   not fit, except the node array and the slab, whose refusals are errors naming their limit.
@@ -287,6 +293,8 @@ const Back = struct {
         const item = checked.calls[call].item;
         const builder = &back.builder;
         switch (entry.op) {
+            // The checker binds a noun as a declaration, never as an expression.
+            .noun => unreachable,
             .client => {
                 const diagnostic = back.fail(item, .refused, "`{s}` has no back end in Weft", .{entry.name});
                 error_module.hint(diagnostic, "a client builds its own nodes from `Checked.calls`", .{});
@@ -743,6 +751,14 @@ pub fn build(
                 memory.node_ranges[signal.binding] = .{ .first = first, .end = back.builder.node_count };
                 memory.ids[signal.binding] = ids;
                 memory.goal_sources[signal.binding] = goal_source(&back, signal.expr);
+            },
+            .noun => |noun| {
+                const first = back.builder.node_count;
+                for (checked.call_values(noun.call)) |value| {
+                    if (value == .signal) _ = back.eval(value.signal) catch return null;
+                }
+                memory.node_ranges[noun.binding] = .{ .first = first, .end = back.builder.node_count };
+                memory.goal_sources[noun.binding] = .none;
             },
             .feed => |feed| {
                 const input = (back.eval(feed.expr) catch return null).first;

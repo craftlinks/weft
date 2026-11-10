@@ -14,6 +14,13 @@
 //! not a number followed by a name. A `.` only continues a number when a digit follows it, so
 //! `0..1` is a number, `..`, and a number.
 //!
+//! ## 2a. Strings
+//! A string is the bytes between two double quotes on one line: `"f'(x) = 2ax"`. There are no
+//! escapes, so a string holds no double quote and no newline, and its text is a slice of the
+//! source with nothing to decode: a formula's backslashes stay as they are written. A quote with
+//! no partner on its line is one `bad_string` token to the end of the line, so it is one error.
+//! Only a client's nouns take a string (`schema.zig`); Weft's own calls have no use for one.
+//!
 //! ## 3. Keywords Are Names
 //! `seed`, `start`, `cue`, and `track` are names here. The parser gives them their meaning at the
 //! start of a line, and `in` and `every` only in their place in a declaration, so `ease: in` stays
@@ -33,6 +40,10 @@ pub const Tag = enum(u8) {
     frequency,
     /// A number followed by letters that are not a unit.
     bad_unit,
+    /// `"…"`, quotes included, on one line (section 2a).
+    string,
+    /// A `"` with no closing quote on its line, to the end of the line.
+    bad_string,
     equal,
     /// `<-`, which feeds a delay.
     feed,
@@ -64,6 +75,13 @@ pub const Token = struct {
         return source[token.start..][0..token.len];
     }
 };
+
+/// The text of a string token, without its quotes.
+pub fn string_of(token: Token, source: []const u8) []const u8 {
+    assert(token.tag == .string);
+    assert(token.len >= 2);
+    return source[token.start + 1 ..][0 .. token.len - 2];
+}
 
 /// The units a literal can carry, and the tag each gives.
 pub const Unit = enum { none, s, ms, hz };
@@ -155,6 +173,12 @@ pub fn next(source: []const u8, start: u32) Token {
         if (rest.len > 1 and rest[1] == '.') return .{ .tag = .dot_dot, .start = start, .len = 2 };
         return .{ .tag = .dot, .start = start, .len = 1 };
     }
+    if (byte == '"') {
+        var len: u32 = 1;
+        while (len < rest.len and rest[len] != '\n' and rest[len] != '"') len += 1;
+        if (len < rest.len and rest[len] == '"') return .{ .tag = .string, .start = start, .len = len + 1 };
+        return .{ .tag = .bad_string, .start = start, .len = len };
+    }
     if (byte == '#') {
         var len: u32 = 1;
         while (len < rest.len and rest[len] != '\n') len += 1;
@@ -244,6 +268,22 @@ test "punctuation, comments, and invalid bytes" {
     const result = tokenize("a # é", &tokens);
     try testing.expectEqualStrings("# é", tokens[1].text("a # é"));
     try testing.expectEqual(@as(u32, 3), result.count);
+}
+
+// Locks section 2a: a string is one token with no escapes, a `#` inside it is text, and a quote
+// with no partner is one bad token that stops at the newline.
+test "a string is the bytes between two quotes on one line" {
+    var tags: [64]Tag = undefined;
+    const source = "say(\"f'(x) = \\frac{1}{2} # not a comment\", b)\nx = \"open\ny";
+    try testing.expectEqualSlices(Tag, &.{
+        .name, .l_paren, .string, .comma, .name, .r_paren, .newline, .name, .equal, .bad_string, .newline, .name, .eof,
+    }, tags_of(source, &tags));
+    var tokens: [16]Token = undefined;
+    _ = tokenize(source, &tokens);
+    try testing.expectEqualStrings("f'(x) = \\frac{1}{2} # not a comment", string_of(tokens[2], source));
+    try testing.expectEqualStrings("\"open", tokens[9].text(source));
+    _ = tokenize("\"\"", &tokens);
+    try testing.expectEqualStrings("", string_of(tokens[0], "\"\""));
 }
 
 // Locks the bound: a full array ends with `eof` and says it is full.

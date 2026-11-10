@@ -151,6 +151,28 @@ test "a client's noun is checked beside the primitives and refused by the back e
     try testing.expect(nouns > 0);
 }
 
+// Locks what `describe` says of a noun that only describes (step 27): its op, that its signals
+// keep their own lanes, a string's kind and default, and the entries a `noun` parameter takes.
+test "describe lists a describing noun with its string and noun parameters" {
+    const clients = [_]weft.lang.schema.Entry{.{
+        .name = "label",
+        .op = .noun,
+        .role = .signal,
+        .params = &.{
+            .{ .name = "of", .kind = .noun, .positional = true, .words = &.{ "axes", "plot" } },
+            .{ .name = "text", .kind = .string, .default = .{ .text = "?" } },
+        },
+        .summary = "a name beside a noun",
+    }};
+    var writer: std.Io.Writer = .fixed(&output);
+    try commands.describe(&writer, &.{}, &clients);
+    const expected = "\"nouns\":[{\"name\":\"label\",\"role\":\"signal\",\"op\":\"noun\",\"summary\":\"a name beside a noun\"," ++
+        "\"lanes\":\"apart\",\"events\":null,\"outputs\":[],\"params\":[" ++
+        "{\"name\":\"of\",\"kind\":\"noun\",\"live\":false,\"shaped\":false,\"positional\":true,\"default\":null,\"words\":[\"axes\",\"plot\"]}," ++
+        "{\"name\":\"text\",\"kind\":\"string\",\"live\":false,\"shaped\":false,\"positional\":false,\"default\":\"?\",\"words\":[]}]}]";
+    try testing.expect(std.mem.indexOf(u8, writer.buffered(), expected) != null);
+}
+
 /// A file with a library, a module, cues, goals, a region, a track, and lanes, for the least
 /// `Limits` that `check` prints (step 22).
 const least_source =

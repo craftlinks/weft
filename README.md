@@ -140,6 +140,10 @@ checker's holes above, and hints that name real `Limits` fields; `check` prints 
 `Limits` a file needs, `sample` takes `--events` and `--lanes` and any slab size, and `describe`
 says how each call takes lanes and what its events carry.
 
+**Unreleased, for 0.2** (step 27) adds language surface, so it waits for a minor version: a string
+literal, and a client's nouns that only describe (see A Client's Nouns). No file 0.1 accepted
+changes its values. `schema.params_max` is 16, where it was 8.
+
 ## Requirements
 
 | | |
@@ -206,6 +210,7 @@ test/
   lanes.zig           lanes in the language against the builder's region, and the lane errors
   rules.zig           every file's guide, and no allocator, thread, lock, or I/O in the library
   cli.zig             the weft command's output against its goldens, and a client's nouns
+  nouns.zig           a score: nouns that only describe beside a program, strings, and their errors
   golden/signals.txt  the committed samples
   golden/cli/         the weft command's committed output
 tools/
@@ -725,6 +730,60 @@ staggered tween, a map, a product, and a staggered bounce, an eval costs about 2
 i5-13600K, most of it in the noise; `@Vector` loops for the arithmetic made no difference, since
 the compiler already vectorizes them.
 
+## A Client's Nouns
+
+The language is a front end, and Weft's signal graph is one back end. A client adds its own
+calls to the table of primitives with `Compiled.compile_client(entries, libraries, source)`, in
+one of two ways, by the entry's `op`:
+
+| `op` | What it is | What Weft's back end does | What the client does |
+|---|---|---|---|
+| `client` | A signal the client computes | Refuses the file | Builds its own program from `compiled.checked.calls` |
+| `noun` | A thing the client owns: an axis, a caption, a typeface | Builds the signals among its arguments, skips the call | Reads `compiled.nouns()` beside the program |
+
+A `noun` is how one file holds a client's score and its motion. Tapestry's scenes are the case it
+was made for:
+
+```txt
+cue b1 = 0s
+track a = 1 in 0..3
+xs = lanes(121, lane * 0.05 - 3)
+ax = axes(x: -3..3, y: -1..9)
+f = plot(ax, xs, y: a * xs * xs, draw: tween(from: 0, to: 1, at: b1, over: 1s))
+n1 = say(b1, "Here is a parabola.")
+```
+
+```zig
+const nouns = [_]weft.lang.schema.Entry{ axes, plot, say };   // op = .noun
+try compiled.compile_client(&nouns, &.{}, source);
+var each = compiled.nouns();                                  // in the file's order
+while (each.next()) |noun| {
+    // noun.name ("f"), noun.entry (plot), noun.values: one for each of the entry's params
+    const on = compiled.noun_of(noun.values[0].noun);         // the axes it names
+    const y = compiled.node_of(noun.values[2]);               // a signal's node
+    const heights = state.values(y);                          // 121 lanes, after an eval
+}
+```
+
+- **A noun is a declaration, never a value.** It stands alone on a line, bound to a name, which
+  is the client's stable id for it. A noun's call or its name where a signal is wanted is an
+  error that says so. A module's body is a signal, so a module cannot make a noun.
+- **Two kinds are for nouns.** `string` is a literal in double quotes on one line, with no
+  escapes: its value is a slice of the source, so a formula's backslashes need no doubling and a
+  string cannot hold a double quote. `noun` is the name of a noun declared above; the
+  parameter's `words` list the entries it takes, or none for any.
+- **Every other kind works as in a primitive**: a number, a range, a cue, a word, a path, and
+  `signal`, with `shaped` for a vector or a colour. A `signal` with `.default = .absent` is
+  optional and reads as `Value.absent`; a `string` may default to `.{ .text = "…" }`.
+- **A noun's signals do not join.** One may have 121 lanes, the next one, and the next a colour's
+  three components: each is the client's to read, by `program.nodes[id.index].extent` or
+  `state.extent(id)`. `describe` prints its lanes as `apart`.
+- **Order is the client's dependency order.** A noun names only nouns above it, so a client that
+  resolves them in `nouns()`' order never meets one it has not seen.
+- **A recompile carries a noun's simulated signals** like any binding's. A noun's fingerprint
+  takes in the nouns it names, so editing an axis starts its plots' simulated signals fresh.
+- **An entry has at most 16 parameters** (`schema.params_max`).
+
 ## The weft Command
 
 `zig build` installs `zig-out/bin/weft`, the tool an agent uses in place of watching motion. It
@@ -764,10 +823,9 @@ $ weft sample play/signals.weft --to 1 --step 0.5 --signal wave
   `test/golden/cli`, so a change to it is a reviewed change.
 - **Exit codes**: 0 on success, 1 when the file has errors, 2 for bad arguments or a file that
   cannot be read.
-- **A client's nouns**: `Compiled.compile_client` takes entries beside the table of primitives.
-  The checker accepts them and Weft's back end refuses them, so the client builds them from
-  `compiled.checked.calls`, and `describe` lists them under `nouns`. A noun no client builds
-  refuses the whole file, since the back end has no node for it.
+- **A client's nouns**: `Compiled.compile_client` takes entries beside the table of primitives,
+  and `describe` lists them under `nouns`. The `weft` command itself registers none, so a
+  client's own command checks its files (see A Client's Nouns).
 
 ## Regress
 

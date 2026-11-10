@@ -35,8 +35,10 @@
 //! items are in its own tree. A module may declare the range its output stays in; that is
 //! checked after the build, against the instance's node, for an instance bound to a name.
 //!
-//! A client's nouns (step 14) join the table of primitives through `compile_client`. The checker
-//! accepts them, and the back end refuses them, so the client builds them from `checked`.
+//! A client's entries join the table of primitives through `compile_client`. A `client` entry
+//! (step 14) is a signal the checker accepts and the back end refuses, so the client builds it
+//! from `checked`. A `noun` entry (step 27) only describes: the file compiles, and the client
+//! walks `nouns()` for each one's name, entry, and values, with `node_of` for a signal's node.
 //!
 //! ## 5. Recompiling and Carry
 //! A client that recompiles a running program, as Play's editor does on each edit (step 15),
@@ -379,8 +381,8 @@ pub fn Compiled(comptime limits: Limits) type {
             assert(out.len == compiled.program.nodes.len);
             @memset(out, null);
             for (compiled.checked.bindings, 0..) |binding_entry, at| {
-                if (binding_entry.kind != .signal) continue;
-                const old_at = old.binding(binding_entry.name, .signal) orelse continue;
+                if (binding_entry.kind != .signal and binding_entry.kind != .noun) continue;
+                const old_at = old.binding(binding_entry.name, binding_entry.kind) orelse continue;
                 if (old.fingerprints[old_at] != compiled.fingerprints[at]) continue;
                 const range = compiled.node_ranges[at];
                 const old_range = old.node_ranges[old_at];
@@ -461,6 +463,69 @@ pub fn Compiled(comptime limits: Limits) type {
                 if (entry.kind == kind and std.mem.eql(u8, entry.name, name)) return @intCast(index);
             }
             return null;
+        }
+
+        /// A noun that only describes (step 27), as its declaration wrote it.
+        pub const Noun = struct {
+            /// The name it is bound to, the client's stable id for it.
+            name: []const u8,
+            entry: *const schema.Entry,
+            /// One value for each of `entry.params`, defaults filled in.
+            values: []const check.Value,
+            /// Its binding, which a `noun` value of another noun names.
+            binding: u32,
+            /// Its declaration's item in `syntax.tree`, for a client's own diagnostics.
+            item: u32,
+        };
+
+        pub const NounIterator = struct {
+            compiled: *const Self,
+            at: u32 = 0,
+
+            /// The next noun, in the file's order, so a noun comes after every noun it names.
+            pub fn next(iterator: *NounIterator) ?Noun {
+                const checked = &iterator.compiled.checked;
+                while (iterator.at < checked.declarations.len) {
+                    const declaration = checked.declarations[iterator.at];
+                    iterator.at += 1;
+                    if (declaration != .noun) continue;
+                    return iterator.compiled.noun_of(declaration.noun.binding);
+                }
+                return null;
+            }
+        };
+
+        /// The file's nouns, in its order.
+        pub fn nouns(compiled: *const Self) NounIterator {
+            assert(compiled.ok);
+            return .{ .compiled = compiled };
+        }
+
+        /// The noun `binding` holds, which a `noun` value names.
+        pub fn noun_of(compiled: *const Self, binding_index: u32) Noun {
+            assert(compiled.ok);
+            const entry = compiled.checked.bindings[binding_index];
+            assert(entry.kind == .noun);
+            return .{
+                .name = entry.name,
+                .entry = entry.entry.?,
+                .values = compiled.checked.call_values(entry.index),
+                .binding = binding_index,
+                .item = entry.item,
+            };
+        }
+
+        /// The noun bound to `name`.
+        pub fn noun(compiled: *const Self, name: []const u8) ?Noun {
+            const index = compiled.binding(name, .noun) orelse return null;
+            return compiled.noun_of(index);
+        }
+
+        /// The node of a `signal` value of a noun: one value, a vector's pack, or a region's lanes,
+        /// as `program.nodes[id.index].extent` says.
+        pub fn node_of(compiled: *const Self, value: check.Value) graph.Id {
+            assert(compiled.ok);
+            return compiled.expr_ids[value.signal].?.first;
         }
 
         /// The node of the signal `name`: a bounce's position.
