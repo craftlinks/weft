@@ -35,8 +35,10 @@
 //! items are in its own tree. A module may declare the range its output stays in; that is
 //! checked after the build, against the instance's node, for an instance bound to a name.
 //!
-//! A client's nouns (step 14) join the table of primitives through `compile_client`. The checker
-//! accepts them, and the back end refuses them, so the client builds them from `checked`.
+//! A client's entries join the table of primitives through `compile_client`. A `client` entry
+//! (step 14) is a signal the checker accepts and the back end refuses, so the client builds it
+//! from `checked`. A `noun` entry (step 27) only describes: the file compiles, and the client
+//! walks `nouns()` for each one's name, entry, and values, with `node_of` for a signal's node.
 //!
 //! ## 5. Recompiling and Carry
 //! A client that recompiles a running program, as Play's editor does on each edit (step 15),
@@ -379,8 +381,8 @@ pub fn Compiled(comptime limits: Limits) type {
             assert(out.len == compiled.program.nodes.len);
             @memset(out, null);
             for (compiled.checked.bindings, 0..) |binding_entry, at| {
-                if (binding_entry.kind != .signal) continue;
-                const old_at = old.binding(binding_entry.name, .signal) orelse continue;
+                if (binding_entry.kind != .signal and binding_entry.kind != .noun) continue;
+                const old_at = old.binding(binding_entry.name, binding_entry.kind) orelse continue;
                 if (old.fingerprints[old_at] != compiled.fingerprints[at]) continue;
                 const range = compiled.node_ranges[at];
                 const old_range = old.node_ranges[old_at];
@@ -461,6 +463,69 @@ pub fn Compiled(comptime limits: Limits) type {
                 if (entry.kind == kind and std.mem.eql(u8, entry.name, name)) return @intCast(index);
             }
             return null;
+        }
+
+        /// A noun that only describes (step 27), as its declaration wrote it.
+        pub const Noun = struct {
+            /// The name it is bound to, the client's stable id for it.
+            name: []const u8,
+            entry: *const schema.Entry,
+            /// One value for each of `entry.params`, defaults filled in.
+            values: []const check.Value,
+            /// Its binding, which a `noun` value of another noun names.
+            binding: u32,
+            /// Its declaration's item in `syntax.tree`, for a client's own diagnostics.
+            item: u32,
+        };
+
+        pub const NounIterator = struct {
+            compiled: *const Self,
+            at: u32 = 0,
+
+            /// The next noun, in the file's order, so a noun comes after every noun it names.
+            pub fn next(iterator: *NounIterator) ?Noun {
+                const checked = &iterator.compiled.checked;
+                while (iterator.at < checked.declarations.len) {
+                    const declaration = checked.declarations[iterator.at];
+                    iterator.at += 1;
+                    if (declaration != .noun) continue;
+                    return iterator.compiled.noun_of(declaration.noun.binding);
+                }
+                return null;
+            }
+        };
+
+        /// The file's nouns, in its order.
+        pub fn nouns(compiled: *const Self) NounIterator {
+            assert(compiled.ok);
+            return .{ .compiled = compiled };
+        }
+
+        /// The noun `binding` holds, which a `noun` value names.
+        pub fn noun_of(compiled: *const Self, binding_index: u32) Noun {
+            assert(compiled.ok);
+            const entry = compiled.checked.bindings[binding_index];
+            assert(entry.kind == .noun);
+            return .{
+                .name = entry.name,
+                .entry = entry.entry.?,
+                .values = compiled.checked.call_values(entry.index),
+                .binding = binding_index,
+                .item = entry.item,
+            };
+        }
+
+        /// The noun bound to `name`.
+        pub fn noun(compiled: *const Self, name: []const u8) ?Noun {
+            const index = compiled.binding(name, .noun) orelse return null;
+            return compiled.noun_of(index);
+        }
+
+        /// The node of a `signal` value of a noun: one value, a vector's pack, or a region's lanes,
+        /// as `program.nodes[id.index].extent` says.
+        pub fn node_of(compiled: *const Self, value: check.Value) graph.Id {
+            assert(compiled.ok);
+            return compiled.expr_ids[value.signal].?.first;
         }
 
         /// The node of the signal `name`: a bounce's position.
@@ -624,6 +689,36 @@ test "series, outputs, delays, and shared regions" {
     const noise_module = @import("../core/noise.zig");
     const expected: noise_module.Noise = .{ .shape = .smooth, .hz = 1, .seed = std.hash.Fnv1a_64.hash("n") };
     try testing.expectEqual(expected.derive(0).seed, n.seed);
+}
+
+// Locks a cue after a cue (`check.zig`, section 4a): the table holds the sums, a series may
+// start from one, and the order rule still holds.
+test "a cue is a time, or a cue and a time after it" {
+    const compiled = try compile_ok(
+        \\cue b1 = 2s
+        \\cue hit = b1 + 500ms
+        \\cue same = hit
+        \\cue tick = hit + 1s..hit + 3s every 500ms
+        \\cue last = tick[4] + 250ms
+        \\rise = tween(from: 0, to: 1, at: hit, over: 1s)
+        \\
+    );
+    const second = time_module.flicks_per_second;
+    const times = compiled.tables.cues.times[0..compiled.tables.cues.count];
+    try testing.expectEqual(@as(usize, 9), times.len);
+    try testing.expectEqual(@as(i64, 2 * second + second / 2), times[1].flicks);
+    try testing.expectEqual(times[1].flicks, times[2].flicks);
+    try testing.expectEqual(@as(i64, 3 * second + second / 2), times[3].flicks);
+    try testing.expectEqual(@as(i64, 5 * second + 3 * second / 4), times[8].flicks);
+    try testing.expectEqual(diagnostic.Code.cue_out_of_order, (try first_error("cue a = 1s\ncue b = a - 500ms\n")).code);
+    try testing.expectEqual(diagnostic.Code.cue_out_of_order, (try first_error("cue a = 1s\ncue b = 2s\ncue c = a + 500ms\n")).code);
+    try testing.expectEqual(diagnostic.Code.wrong_type, (try first_error("cue a = 1s\ncue b = 500ms + a\n")).code);
+    try testing.expectEqual(diagnostic.Code.wrong_type, (try first_error("cue a = 1s\ncue b = a + 2\n")).code);
+    try testing.expectEqual(diagnostic.Code.used_before_declared, (try first_error("cue b = a + 1s\ncue a = 1s\n")).code);
+    // The canonical format keeps the sum as it was written.
+    var buffer: [256]u8 = undefined;
+    _ = try compile_ok("cue b1=2s\ncue hit=b1+500ms\n");
+    try testing.expectEqualStrings("cue b1 = 2s\ncue hit = b1 + 500ms\n", try small.syntax.format_into(&buffer));
 }
 
 // Locks the errors with their suggestions, one each.

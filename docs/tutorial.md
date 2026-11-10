@@ -235,6 +235,12 @@ Cues are kept in time order, which gives the file three rules:
 - **A move cannot pass a neighbour.** It is refused whole, not clamped, so a drag handle clamps
   for itself.
 
+A cue may also be written **after another cue**: `cue hit = drop + 500ms`, or a series from one,
+`cue tick = drop + 1s..drop + 3s every 500ms`. Then the parts of a beat follow the beat when its
+one literal is edited. There is no minus, since a cue comes at or after the cue it names. The sum
+is worked out when the file compiles, so `Cues.move` on `drop` does not move `hit`: move both, or
+edit the text and recompile.
+
 The first cue is also where simulated signals start (section 8). If you plan to move cues, begin
 the file with a cue at 0 that you never move.
 
@@ -908,7 +914,8 @@ The limits worth knowing before you design around Weft:
   spring's goals, and a bounce's walls are fixed when the program is built.
 - **No division, no comparison, no `if`, no `min`/`max`, no `abs`.** A `crossing` is the one way to
   make a gate; a `map` is the one way to rescale.
-- **No strings.** A value is one to four numbers.
+- **No strings in a signal.** A value is one to four numbers. Since step 27 a string literal,
+  `"text"`, exists for one use: a parameter of a client's noun (README, A Client's Nouns).
 - **A track holds a bounded number of writes** (`Limits.track_samples`, 1,024 by default).
 - **`crossing` events** can miss a there-and-back inside 1/480 s.
 - **Ranges are conservative.** A declared module range such as `in -1..1` can be refused because

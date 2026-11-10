@@ -7,19 +7,21 @@
 //! The editor asks for a line's tokens one at a time (`patchwork.editor.language`, section 2);
 //! this file asks Weft's tokenizer (`weft.lang.token.next`) and names each token's class, so the
 //! colours and the compiler can never disagree about where a token ends. No Weft token crosses a
-//! line, since a comment ends at its line's end and there are no strings, so the state is only
-//! `normal`.
+//! line, since a comment ends at its line's end and a string ends on the line it starts on, so
+//! the state is only `normal`.
 //!
 //! ## 2. Classes
 //! ```text
 //! keyword      seed, start, cue, track, module, use first on a line; in and every anywhere
 //! call         a name right before `(`, a primitive or a module
 //! name         any other name: a declaration, a cue, a parameter, a word
-//! number       a number, a time, or a frequency, with its unit
+//! number       a number, a time, or a frequency, with its unit; a string, which only a client's
+//!              nouns take, so Play's own files hold none and it has no colour of its own
 //! operator     = <- + - * ..
 //! punctuation  ( ) [ ] , : .
 //! comment      # to the end of the line
-//! invalid      a byte that starts no token, a whole UTF-8 sequence, or a number with a bad unit
+//! invalid      a byte that starts no token, a whole UTF-8 sequence, a number with a bad unit, or
+//!              a string with no closing quote
 //! ```
 //!
 //! ## 3. TigerStyle Invariants
@@ -91,11 +93,11 @@ fn class_of(line: []const u8, start: u32, end: u32, tag: token.Tag) Class {
             while (after < line.len and line[after] == ' ') after += 1;
             break :name if (after < line.len and line[after] == '(') .call else .name;
         },
-        .number, .time, .frequency => .number,
+        .number, .time, .frequency, .string => .number,
         .equal, .feed, .plus, .minus, .star, .dot_dot => .operator,
         .comma, .colon, .dot, .l_paren, .r_paren, .l_bracket, .r_bracket => .punctuation,
         .comment => .comment,
-        .bad_unit, .invalid => .invalid,
+        .bad_unit, .bad_string, .invalid => .invalid,
         .newline, .eof => unreachable,
     };
 }

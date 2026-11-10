@@ -30,7 +30,7 @@
 //! term    = unary { "*" unary }
 //! unary   = "-" unary | postfix
 //! postfix = primary { "." name | "[" number "]" }
-//! primary = literal | name | name "(" [ arg { "," arg } [","] ] ")" | "(" expr ")"
+//! primary = literal | string | name | name "(" [ arg { "," arg } [","] ] ")" | "(" expr ")"
 //!         | "[" [ item { "," item } [","] ] "]"
 //! arg     = [ name ":" ] value
 //! item    = value [ ":" expr ]
@@ -79,7 +79,7 @@ pub const Tag = enum(u8) {
     module,
     /// token: the library's name.
     use,
-    /// token: a number, time, or frequency; a: 1 when negated.
+    /// token: a number, time, frequency, or string; a: 1 when negated.
     literal,
     /// token: the name.
     name,
@@ -612,9 +612,14 @@ const Parser = struct {
         const first = parser.peek();
         const token = parser.tokens[first];
         switch (token.tag) {
-            .number, .time, .frequency => {
+            .number, .time, .frequency, .string => {
                 _ = parser.take();
                 return parser.push(.{ .tag = .literal, .token = first, .first = first, .last = first });
+            },
+            .bad_string => {
+                const diagnostic = parser.diagnostics.add(.unclosed_string, token.start, 1, "this string has no closing quote on its line", .{});
+                error_module.hint(diagnostic, "a string ends with `\"` on the line it starts on, and holds no `\"` itself", .{});
+                return error.Syntax;
             },
             .bad_unit => {
                 const digits = token_module.digits_of(token, parser.source);

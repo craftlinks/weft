@@ -37,6 +37,7 @@ pub const Code = enum(u8) {
     // Tokens and syntax.
     invalid_character,
     bad_unit,
+    unclosed_string,
     unexpected_token,
     expected_declaration,
     expected_value,

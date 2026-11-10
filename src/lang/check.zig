@@ -31,6 +31,14 @@
 //! are exact to 5 decimal places and milliseconds to 2, since 705,600,000 = 2^9 3^2 5^5 7^2.
 //! Anything finer is refused with the nearest whole flick, so a bounce's hits stay exact.
 //!
+//! ## 4a. A Cue After a Cue
+//! A cue's time is a time literal, or an earlier cue plus one: `cue hit = b2 + 500ms` (step 29).
+//! So a beat's parts are written against the beat, and an edit of the beat's one literal moves
+//! them all. The sum is worked out here, in whole flicks, and the cue table holds plain times as
+//! before: `Cues.move` on the first cue does not move the second, since the program keeps no
+//! link between them. Cues stay in time order however they are written, which is why there is
+//! no minus: a cue before the cue it names would be above it in the file.
+//!
 //! ## 5. Seeds
 //! An explicit `seed:` wins. Otherwise a call's seed is the FNV-1a hash of its declaration's name,
 //! and the second seeded call in one declaration hashes that with its ordinal, so adding a line
@@ -60,6 +68,14 @@
 //!   the caller has expanded in this declaration, so section 5 holds inside modules.
 //!
 //! A client's nouns (step 14) are entries looked up after the table of primitives (`lookup`).
+//!
+//! ## 6a. Nouns That Only Describe
+//! A call to an entry whose op is `noun` (step 27, `schema.zig` section 3a) is not an expression:
+//! it is checked only as the whole value of a declaration, which binds the name as a `noun` and
+//! adds a `noun` declaration. Anywhere a signal is wanted, the call or its name is `wrong_type`.
+//! Its arguments are checked like any call's, but nothing joins their lanes or shapes: each
+//! signal is the client's to read. A `noun` parameter takes the name of a noun bound above, so a
+//! plot can name its axes, and the order of the file is the order a client resolves them in.
 //!
 //! ## 8. Shapes
 //! Every expression has a shape (step 16): a number, a vec2, a vec3, or a colour, three
@@ -178,6 +194,10 @@ pub const Value = union(enum) {
     seed: u64,
     /// A vector or a colour of numbers, where a shaped parameter takes one (section 8).
     vector: Vector,
+    /// A string's text, a slice of the source it was written in (section 6a).
+    string: []const u8,
+    /// A noun's binding, an index into `Checked.bindings` (section 6a).
+    noun: u32,
 
     /// The shape of a value: a vector's own, else one value.
     pub fn shape(value: Value) Shape {
@@ -258,7 +278,8 @@ pub const Binding = struct {
     name: []const u8,
     item: u32,
     kind: Kind,
-    /// The cue, the series' first cue, the track, the expression, the path, or the regions.
+    /// The cue, the series' first cue, the track, the expression, the path, the regions, or a
+    /// noun's call.
     index: u32,
     /// A series' cue count.
     count: u32 = 0,
@@ -268,12 +289,14 @@ pub const Binding = struct {
     fed: bool = false,
 
     /// `failed` is a name whose declaration was refused: its uses report nothing more (section 2).
-    pub const Kind = enum { cue, series, track, signal, path, regions, failed };
+    pub const Kind = enum { cue, series, track, signal, path, regions, noun, failed };
 };
 
 pub const Declaration = union(enum) {
     signal: struct { binding: u32, expr: u32 },
     feed: struct { binding: u32, expr: u32, item: u32 },
+    /// A noun that only describes (section 6a): its binding and its call.
+    noun: struct { binding: u32, call: u32 },
 };
 
 pub const Memory = struct {
@@ -599,7 +622,7 @@ const Checker = struct {
                 checker.start_item = index;
             },
             .cue => {
-                const time = try checker.literal_time(it.a);
+                const time = try checker.cue_time(it.a);
                 const cue = try checker.add_cue(index, time);
                 _ = try checker.declare(index, .{ .name = name, .item = index, .kind = .cue, .index = cue });
             },
@@ -644,10 +667,39 @@ const Checker = struct {
         return cue;
     }
 
+    /// A cue's time (section 4a): a time literal, an earlier cue, or that cue plus a time
+    /// literal.
+    fn cue_time(checker: *Checker, index: u32) Fail!i64 {
+        const it = checker.item(index);
+        switch (it.tag) {
+            .name, .element => return checker.memory.cue_times[try checker.cue_of(index)],
+            .subtract => {
+                const diagnostic = checker.fail(index, .cue_out_of_order, "a cue comes at or after the cue it names, so there is no minus", .{});
+                error_module.hint(diagnostic, "declare this cue first, and write the other as this one plus a time", .{});
+                return error.Checked;
+            },
+            .add => {
+                const base_tag = checker.item(it.a).tag;
+                if (base_tag != .name and base_tag != .element) {
+                    const diagnostic = checker.fail(it.a, .wrong_type, "a cue's time is a time, or a cue and a time after it", .{});
+                    error_module.hint(diagnostic, "for example `cue hit = beat + 500ms`", .{});
+                    return error.Checked;
+                }
+                const base = checker.memory.cue_times[try checker.cue_of(it.a)];
+                const offset = try checker.literal_time(it.b);
+                return std.math.add(i64, base, offset) catch {
+                    _ = checker.fail(index, .out_of_range, "this cue's time is past what a time holds", .{});
+                    return error.Checked;
+                };
+            },
+            else => return checker.literal_time(index),
+        }
+    }
+
     fn cue_series(checker: *Checker, index: u32) Fail!void {
         const it = checker.item(index);
-        const from = try checker.literal_time(it.a);
-        const to = try checker.literal_time(checker.tree.extra[it.b]);
+        const from = try checker.cue_time(it.a);
+        const to = try checker.cue_time(checker.tree.extra[it.b]);
         const every = try checker.literal_time(checker.tree.extra[it.b + 1]);
         if (every <= 0 or to < from or @rem(to - from, every) != 0) {
             const diagnostic = checker.fail(index, .bad_series, "a series' step must be above 0s and divide its span exactly", .{});
@@ -689,6 +741,14 @@ const Checker = struct {
             _ = checker.fail(it.a, .wrong_type, "a name holds a signal, a path, or regions", .{});
             return error.Checked;
         }
+        if (value.tag == .call) if (checker.lookup(checker.text(it.a), .signal)) |entry| if (entry.op == .noun) {
+            const delays_before = checker.delay_calls;
+            const call = try checker.check_call(entry, it.a);
+            if (checker.delay_calls != delays_before) return checker.unreachable_delay(it.a);
+            const at = try checker.declare(index, .{ .name = name, .item = index, .kind = .noun, .index = call, .entry = entry });
+            try checker.push_declaration(index, .{ .noun = .{ .binding = at, .call = call } });
+            return;
+        };
         checker.declared_last = null;
         const delays_before = checker.delay_calls;
         const expr = try checker.signal(it.a);
@@ -824,6 +884,11 @@ const Checker = struct {
             .call => {
                 const name = checker.text(index);
                 if (checker.lookup(name, .signal)) |entry| {
+                    if (entry.op == .noun) {
+                        const diagnostic = checker.fail_token(index, .wrong_type, "`{s}` describes a thing, and is not a signal", .{name});
+                        error_module.hint(diagnostic, "give it a line of its own, such as `name = {s}(…)`", .{name});
+                        return error.Checked;
+                    }
                     // `lanes` opens its region when its count is checked, and closes it here.
                     const region = checker.region;
                     defer checker.region = region;
@@ -896,6 +961,10 @@ const Checker = struct {
                 if (bound_to.kind == .signal and checker.shape_of(bound_to.index).components > 1) {
                     return checker.component_of(index, try checker.signal_name(base_index, 0), output_name);
                 }
+                if (bound_to.kind == .noun) {
+                    _ = checker.fail_token(index, .unknown_output, "`{s}` is a noun, `{s}`, and a noun has no outputs", .{ base_name, bound_to.entry.?.name });
+                    return error.Checked;
+                }
                 if (checker.memory.bindings[found].entry) |entry| break :entry entry;
                 const diagnostic = checker.fail_token(index, .unknown_output, "`{s}` has no output `{s}`", .{ base_name, output_name });
                 error_module.hint(diagnostic, "only a call such as `bounce` has outputs", .{});
@@ -939,6 +1008,11 @@ const Checker = struct {
                 return checker.push_expr(.{ .tag = .binding, .a = found, .b = output_index, .item = index, .shape = shape, .lanes = lanes });
             },
             .track => return checker.push_expr(.{ .tag = .track, .a = binding.index, .item = index }),
+            .noun => {
+                const diagnostic = checker.fail(index, .wrong_type, "`{s}` is a noun, `{s}`, not a signal", .{ name, binding.entry.?.name });
+                error_module.hint(diagnostic, "a noun is named only where a parameter takes one", .{});
+                return error.Checked;
+            },
             else => {
                 _ = checker.fail(index, .wrong_type, "`{s}` is a {s}, not a signal", .{ name, kind_name(binding.kind) });
                 return error.Checked;
@@ -1109,6 +1183,7 @@ const Checker = struct {
             .unbounded => .{ .number_range = .{ -std.math.inf(f64), std.math.inf(f64) } },
             .seed => .{ .seed = checker.derived_seed() },
             .whole => .absent,
+            .text => |string| .{ .string = string },
         };
     }
 
@@ -1523,6 +1598,7 @@ const Checker = struct {
                 };
             },
             .inputs, .one => {},
+            .apart => return 1,
         }
         for (entry.params, values) |param, value| {
             if (value != .signal or param.live) continue;
@@ -1807,6 +1883,39 @@ const Checker = struct {
                 return error.Checked;
             },
             .mover => return .{ .mover = try checker.mover_of(index) },
+            .string => {
+                if (it.tag != .literal or checker.tree.tokens[it.token].tag != .string) {
+                    const diagnostic = checker.fail(index, .wrong_type, "`{s}` takes a string", .{param.name});
+                    error_module.hint(diagnostic, "write it in double quotes, such as `\"text\"`", .{});
+                    return error.Checked;
+                }
+                return .{ .string = token_module.string_of(checker.tree.tokens[it.token], checker.source()) };
+            },
+            .noun => {
+                if (it.tag != .name) {
+                    const diagnostic = checker.fail(index, .wrong_type, "`{s}` takes the name of a noun", .{param.name});
+                    error_module.hint(diagnostic, "declare it on a line above, then name it here", .{});
+                    return error.Checked;
+                }
+                const name = checker.text(index);
+                const found = try checker.resolve(index, name);
+                const binding = checker.memory.bindings[found];
+                if (binding.kind != .noun) {
+                    _ = checker.fail(index, .wrong_type, "`{s}` is a {s}, and `{s}` takes a noun", .{ name, kind_name(binding.kind), param.name });
+                    return error.Checked;
+                }
+                if (param.words.len == 0) return .{ .noun = found };
+                for (param.words) |word| {
+                    if (std.mem.eql(u8, word, binding.entry.?.name)) return .{ .noun = found };
+                }
+                const diagnostic = checker.fail(index, .wrong_type, "`{s}` is `{s}`, which `{s}` does not take", .{ name, binding.entry.?.name, param.name });
+                if (param.words.len == 1) {
+                    error_module.hint(diagnostic, "it takes `{s}`", .{param.words[0]});
+                } else {
+                    error_module.hint(diagnostic, "it takes `{s}`, `{s}`, …", .{ param.words[0], param.words[1] });
+                }
+                return error.Checked;
+            },
             .seed => {
                 const token = checker.tree.tokens[it.token];
                 if (it.tag != .literal or token.tag != .number or it.a == 1) {
@@ -2033,7 +2142,7 @@ const Checker = struct {
         }
         if (it.tag != .literal or token.tag != .number) {
             const diagnostic = checker.fail(index, .wrong_type, "expected {s}, found {s}", .{ what, if (it.tag == .literal) literal_kind(token.tag) else item_kind(it.tag) });
-            if (it.tag == .literal) error_module.hint(diagnostic, "drop the unit", .{});
+            if (it.tag == .literal and token.tag != .string) error_module.hint(diagnostic, "drop the unit", .{});
             return error.Checked;
         }
         const number = parse_float(checker.text(index)) orelse return checker.bad_number(index);
@@ -2144,6 +2253,7 @@ fn literal_kind(tag: token_module.Tag) []const u8 {
     return switch (tag) {
         .time => "time",
         .frequency => "frequency",
+        .string => "string",
         else => "number",
     };
 }
@@ -2181,6 +2291,7 @@ fn kind_name(kind: Binding.Kind) []const u8 {
         .signal => "signal",
         .path => "path",
         .regions => "list of regions",
+        .noun => "noun",
         .failed => unreachable,
     };
 }
@@ -2199,6 +2310,8 @@ fn example_of(param: *const schema.Param) []const u8 {
         .word, .ease => param.words[0],
         .mover => "spring(time: 0.5s)",
         .seed => "a whole number",
+        .string => "\"text\"",
+        .noun => "the name of a noun",
     };
 }
 

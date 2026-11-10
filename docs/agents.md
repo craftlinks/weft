@@ -54,6 +54,7 @@ One declaration a line, a name above its use. Times carry units (`2s`, `500ms`),
 seed 7                                   # the file's seed; every noise draws from it
 cue c0 = 0s                              # a named time
 cue bar = 0s..60s every 2s               # a series: bar[0] to bar[30]
+cue late = bar[30] + 500ms               # a cue after a cue, summed when the file compiles
 track speed = 0.5 in 0..2                # a value a client writes, from a time on
 
 wave = wave(sine, 0.5hz)                 # pure: a function of t
@@ -146,6 +147,24 @@ will lock. Each scenario's image is drawn on the regress clock, 1/60 s a frame. 
 hashes, so to see what changed in an old scenario, render it from the tree before your change with
 `./zig-out/bin/play --render NAME --out DIR` and compare the two images; `--regress --only NAME`
 runs one scenario.
+
+## 3a. A Client With Nouns of Its Own
+
+A client such as Tapestry registers nouns, calls that describe what it owns, and compiles a file
+with `compile_client`. In such a file you will meet two things plain Weft does not have:
+
+```txt
+ax = axes(x: -3..3, y: -1..9)            # a noun: a line of its own, bound to a name
+f = plot(ax, xs, y: a * xs * xs)         # a noun names a noun above it; its signals are Weft's
+n1 = say(b1, "Here is a parabola.")      # a string: double quotes, one line, no escapes
+```
+
+- The `weft` command does not know a client's nouns, so check such a file with the client's own
+  command. Its `describe` lists them under `nouns`.
+- A noun is not a signal: `ax + 1` and `lanes(3, axes(…))` are errors. Bind every signal a noun
+  reads on a line of its own first if you want to `sample` it.
+- To add nouns to a client, see the README's A Client's Nouns: an `Entry` with `op = .noun`, and
+  `compiled.nouns()` to read them.
 
 ## 4. Add a Primitive
 
