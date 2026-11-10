@@ -64,6 +64,12 @@ pub const State = struct {
     checkpoints_filled: u32,
     /// The step the slab's simulated state is at, or null if it holds none.
     step: ?u64,
+    /// The copy of the simulated nodes' regions at the step before the slab's own (`graph.zig`,
+    /// section 9), empty when the caller gave no room for it, and the step it holds, or null.
+    recent: []f64,
+    recent_step: ?u64,
+    /// The time of the last `eval`, which `events_since` reads on from.
+    last_read: ?Time,
     /// The cue generation the simulated state and the checkpoints were worked out under.
     generation: u64,
     /// The track generation they were worked out under (section 14).
@@ -82,9 +88,10 @@ pub const State = struct {
         recording: *Recording,
     };
 
-    /// `slab` needs at least `program.slab_count` values, and only those are used. A simulated
-    /// program has no checkpoints this way, so each read before the slab's own step runs every
-    /// step from the start.
+    /// `slab` needs at least `program.slab_count` values. With `program.reader_slab_count()`, the
+    /// reader also keeps the copy of `graph.zig` section 9, so a read of the step its slab has
+    /// just passed replays one step. A simulated program has no checkpoints this way, so each
+    /// read further back runs every step from the start.
     pub fn init(program: Program, slab: []f64) State {
         return init_with_checkpoints(program, slab, &.{});
     }
@@ -96,6 +103,10 @@ pub const State = struct {
         program.assert_valid();
         const slab_used = slab[0..program.slab_count];
         @memset(slab_used, 0);
+        const recent: []f64 = if (program.recent_count > 0 and slab.len >= program.reader_slab_count())
+            slab[program.slab_count..][0..program.recent_count]
+        else
+            &.{};
         for (program.nodes) |*node| switch (node.op) {
             .input => |op| @memset(slab_used[node.offset..][0..node.extent.count()], op.initial),
             else => {},
@@ -111,6 +122,9 @@ pub const State = struct {
             .checkpoints = checkpoints[0 .. room * program.slab_count],
             .checkpoints_filled = 0,
             .step = null,
+            .recent = recent,
+            .recent_step = null,
+            .last_read = null,
             .generation = program.cues.generation,
             .track_generation = program.tracks.generation,
             .steps_run = 0,
@@ -158,6 +172,26 @@ pub const State = struct {
         pass(&state.program, state.slab, time, .{ .between = weight });
         state.record_pass(time);
         state.evaluated = true;
+        state.last_read = time;
+    }
+
+    /// The events since the last `eval`, then an `eval` at `now`: the call a client makes each
+    /// frame. It reads `(last, now]`, which is `events(last + 1, now + 1)`, so it never replays a
+    /// step the evals would not. With no `eval` before, it reads the events at exactly `now`; at
+    /// or before the last one, a repeat or a seek back, it reads none. A jump forward reads every
+    /// event between, so a client that seeks without wanting them calls `eval` first.
+    pub fn events_since(state: *State, now: Time, out: []Event) Events {
+        assert(now.flicks < std.math.maxInt(i64));
+        var result: Events = .{ .count = 0, .dropped = 0 };
+        if (state.last_read) |last| {
+            if (now.flicks > last.flicks) {
+                result = state.events(.{ .flicks = last.flicks + 1 }, .{ .flicks = now.flicks + 1 }, out);
+            }
+        } else {
+            result = state.events(now, .{ .flicks = now.flicks + 1 }, out);
+        }
+        state.eval(now);
+        return result;
     }
 
     /// The value of a node of one value, from the last `eval`.
@@ -264,6 +298,8 @@ pub const State = struct {
             move_regions(state.program, into, from.program, out_of, twins);
         }
         state.step = step;
+        state.recent_step = null;
+        state.last_read = from.last_read;
         state.checkpoints_filled = filled;
         state.generation = state.program.cues.generation;
         state.track_generation = state.program.tracks.generation;
@@ -306,6 +342,7 @@ pub const State = struct {
             state.generation = cues.generation;
             state.checkpoints_filled = 0;
             state.step = null;
+            state.recent_step = null;
         }
         const start = cues.at(state.program.start);
         const tracks = state.program.tracks;
@@ -325,8 +362,12 @@ pub const State = struct {
         const at = floor orelse {
             state.checkpoints_filled = 0;
             state.step = null;
+            state.recent_step = null;
             return;
         };
+        if (state.recent_step) |kept| {
+            if (kept > 0 and step_time(start, kept - 1).flicks >= at.flicks) state.recent_step = null;
+        }
         while (state.checkpoints_filled > 0) {
             const last_pass = @as(u64, state.checkpoints_filled) * interval - 1;
             if (step_time(start, last_pass).flicks < at.flicks) break;
@@ -337,8 +378,8 @@ pub const State = struct {
         }
     }
 
-    /// Brings the simulated state to step `target`, from the nearest of the slab's own step and
-    /// the checkpoints before `target`.
+    /// Brings the simulated state to step `target`, from the nearest of the slab's own step, the
+    /// copy of the step before it, and the checkpoints before `target`.
     fn run_to(state: *State, target: u64, start: Time) void {
         const interval = simulation.checkpoint_interval;
         const nearest = @min(target / interval, state.checkpoints_filled);
@@ -346,7 +387,13 @@ pub const State = struct {
             live >= nearest * interval and live <= target
         else
             false;
-        if (!live_usable) state.restore(nearest);
+        if (!live_usable) {
+            const recent_usable = if (state.recent_step) |kept|
+                kept >= nearest * interval and kept <= target
+            else
+                false;
+            if (recent_usable) state.restore_recent() else state.restore(nearest);
+        }
         state.advance_to(target, start, null);
     }
 
@@ -357,6 +404,7 @@ pub const State = struct {
         var live = state.step.?;
         assert(live <= target);
         while (live < target) {
+            if (live + 1 == target) state.save_recent(live);
             step_once(&state.program, state.slab, start, live, report);
             state.record_pass(step_time(start, live));
             live += 1;
@@ -393,6 +441,37 @@ pub const State = struct {
         const first: usize = @intCast((index - 1) * size);
         @memcpy(state.checkpoints[first..][0..size], state.slab);
         state.checkpoints_filled += 1;
+    }
+
+    /// Copies each simulated node's region, at step `step`, into `recent`, packed in node order
+    /// (`graph.zig`, section 9). A reader with no room for it skips it.
+    fn save_recent(state: *State, step: u64) void {
+        const copy = state.recent;
+        if (copy.len == 0) return;
+        var at: usize = 0;
+        for (state.program.nodes) |*node| {
+            if (!node.op.simulated()) continue;
+            const size: usize = @intCast(region_of(node));
+            @memcpy(copy[at..][0..size], state.slab[node.offset..][0..size]);
+            at += size;
+        }
+        assert(at == copy.len);
+        state.recent_step = step;
+    }
+
+    /// Puts each simulated node's region back from the copy, at `recent_step`.
+    fn restore_recent(state: *State) void {
+        const copy = state.recent;
+        assert(copy.len > 0);
+        var at: usize = 0;
+        for (state.program.nodes) |*node| {
+            if (!node.op.simulated()) continue;
+            const size: usize = @intCast(region_of(node));
+            @memcpy(state.slab[node.offset..][0..size], copy[at..][0..size]);
+            at += size;
+        }
+        assert(at == copy.len);
+        state.step = state.recent_step.?;
     }
 
     /// Puts the slab at checkpoint `index`, where checkpoint 0 is the start, rebuilt. An input

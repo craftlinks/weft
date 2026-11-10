@@ -117,8 +117,9 @@ v0.1 means a client can depend on these, not that Weft is finished. Within 0.1, 
 them is a bug or a new minor version, named in this README:
 
 - **The library's exports**, `src/weft.zig`: `Builder` and its calls, `Program`, `State` and its
-  `eval`, `events`, `values`, `extent`, `finite`, `set_input`, `record`, and `adopt`, the op structs, `Cues`,
-  `Goals`, `Regions`, `Tracks`, `Time`, `Rate`, `Event`, and `weft.colour`.
+  `eval`, `events`, `events_since`, `values`, `extent`, `finite`, `set_input`, `record`, and
+  `adopt`, the op structs, `Cues`, `Goals`, `Regions`, `Tracks`, `Time`, `Rate`, `Event`, and
+  `weft.colour`.
 - **The language**: every call and parameter `weft describe` lists, the syntax, the canonical
   format, and the seeds a file's names derive, so a file samples the same values in every 0.1.
 - **The command line's JSON**: the fields of `describe`, `sample`, and `parse --json`. A new field
@@ -409,7 +410,10 @@ is a hash of a seed, as noise is. Their state sits in the slab after their outpu
 is a copy of the slab, and a reader keeps one a second, filled as it plays past them, in memory it
 gives `State.init_with_checkpoints`. A read restores the nearest checkpoint before it and steps
 forward, at most 479 steps once the checkpoints are filled; evaluating the latest time once, while
-loading, fills them all. The checkpoints only change what a read costs, never its value, and a cue
+loading, fills them all. A slab of `program.reader_slab_count()` values, rather than
+`program.slab_count`, also gives the reader a copy of its simulated nodes at the step before its
+own, so a read of the step it has just passed, which an `events` right after an `eval` or a track
+written at the time just read makes, replays one step instead of restoring a checkpoint. The checkpoints only change what a read costs, never its value, and a cue
 move drops them. `program.simulated` says whether a program has such nodes. `simulation.zig` and
 `graph.zig`, sections 9 and 10, explain the step, the draws, and why a cycle needs a delay.
 
@@ -462,11 +466,12 @@ run each step once, and an `eval(t1)` after them costs nothing more. `events` le
 outputs at no particular time, so `value` asserts until the next `eval`. `graph.zig`, section 11,
 and `event.zig` explain the rules.
 
-**Evals and events on one reader.** An `eval(s)` at a time exactly on a step leaves the slab one
-step past it, so an `events(s, ...)` right after it restores a checkpoint. A reader that
-interleaves the two, as a scope sampling a window does, can read its events as `(s, s']`, that is
-`events(s + 1, s' + 1)` in flicks: that range starts at the very step `eval(s)` left and ends at
-the one `eval(s')` needs, so it never restores and runs no step the evals would not. An events
+**Evals and events on one reader.** Each frame, `state.events_since(now, &out)` gives the events
+since the last `eval`, `(last, now]`, then evaluates at `now`: one call that never runs a step the
+evals would not. Its first call gives the events at exactly `now`, and a repeat or a seek back
+gives none. By hand, the same is `events(s + 1, s' + 1)` in flicks. `events(s, s')` after
+`eval(s)` starts one step behind the slab, which a reader with `reader_slab_count()` of slab
+replays in one step and a reader without restores from a checkpoint. An events
 query runs every simulated node's steps across its range, whatever sources the caller wants, so
 events of pure sources are cheapest in a pure program of their own (Play's bouncers are one).
 

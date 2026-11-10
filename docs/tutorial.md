@@ -604,20 +604,21 @@ for (found[0..result.count]) |event| {
 
 After `events`, the slab is at no particular time, so call `eval` before the next `value`.
 
-**Each frame, read events as `(last, now]`, not `[last, now)`.** That is one flick added to both
-ends:
+**Each frame, call `events_since`.** It reads the events since the last `eval`, `(last, now]`,
+then evaluates at `now`:
 
 ```zig
-const result = state.events(.{ .flicks = last.flicks + 1 }, .{ .flicks = now.flicks + 1 }, &found);
-state.eval(now);
-last = now;
+const result = state.events_since(now, &found);   // events in (last eval, now], then eval(now)
 ```
 
-On a program with no simulated node the two cost the same. On a simulated one the difference is
-large, because an `eval` at a time that falls exactly on a step, as every 60 Hz frame does, leaves
-the reader one step ahead of where `[last, now)` wants to begin, so it rewinds. Measured on a
-three-node file over 600 frames at 60 Hz: 4,801 steps with `(last, now]`, which is what the frames
-need; 147,001 with `[last, now)` and checkpoints; 1,443,001 without checkpoints.
+By hand it is `events(last + 1, now + 1)` then `eval(now)`: one flick added to both ends. On a
+program with no simulated node any order costs the same. On a simulated one, an `eval` at a time
+that falls exactly on a step, as every 60 Hz frame does, leaves the reader one step ahead of where
+`[last, now)` wants to begin. Since 0.1.1 a reader whose slab has `program.reader_slab_count()`
+values keeps a copy of that step and replays it; one with only `slab_count` restores a
+checkpoint. Measured on a four-node file over 600 frames at 60 Hz: 4,801 steps with
+`events_since`, which is what the frames need; 5,400 with `[last, now)` and the copy; 147,000
+without it.
 
 **A full buffer keeps the earliest events and counts the rest.** For "flash what just happened"
 that is the wrong end: with a window of the last 200 ms and a buffer too small, the hits you keep
@@ -886,7 +887,7 @@ The limits worth knowing before you design around Weft:
 - **One simulated node makes every `events` call step**, including for the pure nodes beside it.
   A six-second events window cost 2 µs on a pure program and 1.6 ms once a chase was added. Keep
   event timelines and simulated motion in separate programs, and on a simulated program read
-  events as `(last, now]` (section 12).
+  events with `events_since` (section 12).
 - **A feedback loop that grows is not caught.** `check` passes it, and its range is reported as
   unbounded (as every loop's is, stable or not). Since 0.1.1 its state saturates near 2^256 in
   every build mode, and `state.finite()` says when a value computed from it has overflowed.
@@ -940,7 +941,7 @@ target).
 | A freeze on pressing End | A cold seek on a simulated program | Give the reader checkpoints, and warm it |
 | Every lane's `crossing` fires at the first flick | The inputs start at or above the level | Move the level, or start below it |
 | A `seekable` program reads as `live` | It has an `input` | Use a `track`, or record and play back |
-| Frames get slower the longer a simulated program plays | `events(last, now)` each frame rewinds the reader | Read `(last, now]`: add one flick to both ends |
+| Frames get slower the longer a simulated program plays | `events(last, now)` each frame rewinds the reader | Call `events_since(now)`, and give the reader `reader_slab_count()` of slab |
 | A knob stops responding after a while | `error.TrackFull`: 1,024 writes | Write on change, thin a drag, raise `Limits.track_samples` |
 | A knob turned while scrubbed back erases later turns | A write removes every later write | Save the samples and `restore` them to undo |
 | A puppet on a live `input` jumps when a cue is dragged | The reader replays its steps with today's input | Give it checkpoints; do not move cues during a take |
