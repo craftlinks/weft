@@ -638,3 +638,170 @@ test "the builder keeps a moving constant within the bound" {
     try testing.expectError(error.NotFinite, regions.add(&.{.{ .low = 0, .high = past }}));
     _ = builder.finish();
 }
+
+/// A noise chased with its time from a track, a crossing of the chase, and an input, read by one
+/// reader at 60 Hz for ten seconds: 600 frames, which need 4,800 steps (step 20).
+const Paced = struct {
+    cue_times: [1]Time,
+    cues: Cues,
+    track_entries: [1]@import("../track.zig").Track,
+    track_samples: [600]@import("../recording.zig").Sample,
+    tracks: @import("../track.zig").Tracks,
+    time_track: @import("../track.zig").TrackId,
+    nodes: [6]Node,
+    program: Program,
+    chase: Id,
+    level: Id,
+    slab: [64]f64,
+    checkpoints: [10 * 64]f64,
+
+    const frame_flicks = @divExact(flicks_per_second, 60);
+    const frames = 600;
+
+    fn init(paced: *Paced) !void {
+        paced.cues = Cues.init(&paced.cue_times);
+        _ = try paced.cues.add(.{ .flicks = 0 });
+        paced.tracks = @import("../track.zig").Tracks.init(&paced.track_entries);
+        paced.time_track = try paced.tracks.add(&paced.track_samples, 0.125, 2, 0.5);
+        var builder = Builder.init(&paced.nodes, .{ .slab_count_max = 32, .cues = &paced.cues, .tracks = &paced.tracks, .seed = 5 });
+        const wander = try builder.noise(.{ .shape = .smooth, .hz = 1, .seed = 1 });
+        const time = try builder.track(paced.time_track);
+        paced.chase = try builder.chase(.{ .target = wander, .from = 0, .time = .{ .flicks = flicks_per_second }, .overshoot = 0, .time_from = time });
+        _ = try builder.crossing(.{ .input = paced.chase, .level = 0, .direction = .both });
+        paced.level = try builder.input(.{ .low = 0, .high = 1, .initial = 0.25 });
+        paced.program = builder.finish();
+        assert(paced.program.reader_slab_count() <= paced.slab.len);
+        assert(paced.program.slab_count * 10 <= paced.checkpoints.len);
+    }
+
+    /// A reader with room for the copy, and with ten checkpoints or none.
+    fn reader(paced: *Paced, checkpoints: bool) State {
+        const slab = paced.slab[0..@intCast(paced.program.reader_slab_count())];
+        const memory = paced.checkpoints[0 .. 10 * paced.program.slab_count];
+        return State.init_with_checkpoints(paced.program, slab, if (checkpoints) memory else &.{});
+    }
+
+    fn frame(index: u64) Time {
+        return .{ .flicks = @as(i64, @intCast(index)) * frame_flicks };
+    }
+
+    /// The chase's value at `time` from a fresh reader with no copy and no checkpoints.
+    fn fresh(paced: *const Paced, time: Time) f64 {
+        var slab: [64]f64 = undefined;
+        var state = State.init(paced.program, slab[0..paced.program.slab_count]);
+        state.eval(time);
+        return state.value(paced.chase);
+    }
+};
+
+// Locks step 20's first measure: `events(last, now)` then `eval(now)` each frame replays one step
+// a frame with the copy, with or without checkpoints, where v0.1.0 ran 147,001 and 1,443,001; and
+// a reader with no room for the copy still restores a checkpoint, as before.
+test "a reader with the copy replays one step when events come before the eval" {
+    var paced: Paced = undefined;
+    try paced.init();
+    var out: [64]graph_module.Event = undefined;
+    for ([_]bool{ true, false }) |checkpoints| {
+        var state = paced.reader(checkpoints);
+        for (1..Paced.frames + 1) |index| {
+            _ = state.events(Paced.frame(index - 1), Paced.frame(index), &out);
+            state.eval(Paced.frame(index));
+            if (index % 50 == 0) try testing.expectEqual(paced.fresh(Paced.frame(index)), state.value(paced.chase));
+        }
+        try testing.expect(state.steps_run <= 5_401);
+    }
+    var slab: [64]f64 = undefined;
+    var state = State.init_with_checkpoints(paced.program, slab[0..paced.program.slab_count], paced.checkpoints[0 .. 10 * paced.program.slab_count]);
+    for (1..Paced.frames + 1) |index| {
+        _ = state.events(Paced.frame(index - 1), Paced.frame(index), &out);
+        state.eval(Paced.frame(index));
+    }
+    try testing.expect(state.steps_run > 100_000);
+}
+
+// Locks `events_since`: one step a frame, the same events as the `(last, now]` form, the events at
+// exactly `now` on a first call, and none on a repeat or a seek back.
+test "events since the last read cost no step the evals would not" {
+    var paced: Paced = undefined;
+    try paced.init();
+    var state = paced.reader(true);
+    var other_slab: [64]f64 = undefined;
+    var other = State.init(paced.program, other_slab[0..@intCast(paced.program.reader_slab_count())]);
+    var out: [64]graph_module.Event = undefined;
+    var expected: [64]graph_module.Event = undefined;
+    var total: u32 = 0;
+    _ = state.events_since(Paced.frame(0), &out);
+    other.eval(Paced.frame(0));
+    for (1..Paced.frames + 1) |index| {
+        const found = state.events_since(Paced.frame(index), &out);
+        const wanted = other.events(.{ .flicks = Paced.frame(index - 1).flicks + 1 }, .{ .flicks = Paced.frame(index).flicks + 1 }, &expected);
+        other.eval(Paced.frame(index));
+        try testing.expectEqualDeep(wanted, found);
+        try testing.expectEqualSlices(graph_module.Event, expected[0..wanted.count], out[0..found.count]);
+        total += found.count;
+    }
+    try testing.expect(total > 0);
+    try testing.expect(state.steps_run <= 4_801);
+    try testing.expectEqual(@as(u32, 0), state.events_since(Paced.frame(Paced.frames), &out).count);
+    try testing.expectEqual(@as(u32, 0), state.events_since(Paced.frame(10), &out).count);
+
+    var times: [1]Time = undefined;
+    var cues = Cues.init(&times);
+    const at = try cues.add(.{ .flicks = flicks_per_second });
+    var nodes: [1]Node = undefined;
+    var builder = Builder.init(&nodes, .{ .slab_count_max = 4, .cues = &cues });
+    _ = try builder.cues(.{ .first = at, .count = 1 });
+    var slab: [4]f64 = undefined;
+    var first = State.init(builder.finish(), &slab);
+    try testing.expectEqual(@as(u32, 1), first.events_since(.{ .flicks = flicks_per_second }, &out).count);
+    try testing.expectEqual(@as(u32, 0), first.events_since(.{ .flicks = flicks_per_second }, &out).count);
+}
+
+// Locks step 20's third measure: a track write at the time just read, on alternate frames, drops
+// the slab's own step but not the copy, so the next read replays one step. A recording attached to
+// the input stays complete through it, and a seek back that reads a new value marks it incomplete.
+test "a track write at the time just read replays one step" {
+    var paced: Paced = undefined;
+    try paced.init();
+    var state = paced.reader(true);
+    var entries: [16]@import("../recording.zig").Sample = undefined;
+    var recording = @import("../recording.zig").Recording.init(&entries);
+    state.record(paced.level, &recording);
+    for (1..Paced.frames + 1) |index| {
+        state.eval(Paced.frame(index));
+        if (index % 2 == 0) {
+            const value: f64 = if (index % 4 == 0) 0.5 else 0.625;
+            try paced.tracks.write(paced.time_track, Paced.frame(index), value);
+        }
+        if (index % 50 == 1) try testing.expectEqual(paced.fresh(Paced.frame(index)), state.value(paced.chase));
+    }
+    try testing.expect(state.steps_run <= 5_100);
+    try testing.expect(recording.complete());
+    // A seek back that reads what the recording plays is still no loss; one that reads a new
+    // value at an old time is.
+    state.eval(.{ .flicks = 5 * flicks_per_second });
+    try testing.expect(recording.complete());
+    state.set_input(paced.level, 0.75);
+    state.eval(.{ .flicks = 4 * flicks_per_second });
+    try testing.expect(!recording.complete());
+}
+
+// Locks that a cue move drops the copy, and a carried state starts without one but keeps the
+// time of its last read.
+test "the copy is dropped by a cue move and not carried" {
+    var paced: Paced = undefined;
+    try paced.init();
+    var state = paced.reader(true);
+    state.eval(Paced.frame(60));
+    try testing.expect(state.recent_step != null);
+    try paced.cues.move(.{ .index = 0 }, .{ .flicks = flicks_per_second / 4 });
+    state.eval(Paced.frame(61));
+    try testing.expectEqual(paced.fresh(Paced.frame(61)), state.value(paced.chase));
+    var twins: [6]?u32 = undefined;
+    for (paced.program.nodes, 0..) |_, index| twins[index] = @intCast(index);
+    var slab: [64]f64 = undefined;
+    var carried = State.init(paced.program, slab[0..@intCast(paced.program.reader_slab_count())]);
+    try testing.expect(carried.adopt(&state, twins[0..paced.program.nodes.len]));
+    try testing.expectEqual(@as(?u64, null), carried.recent_step);
+    try testing.expectEqual(state.last_read, carried.last_read);
+}

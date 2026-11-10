@@ -15,6 +15,10 @@
 //! A recording is in time order. A pass at a time before the latest pass noted, which only a
 //! backward read makes, is not appended: it is counted in `dropped`, and the recording is
 //! incomplete from then on. A full recording counts too. Neither ever corrupts what was kept.
+//! One backward pass is no loss: one that reads the very value the recording already plays at
+//! its time, because the last sample kept is at or before it and holds the same bits. A reader
+//! that replays the step its slab has just passed, as a track write at the time just read makes
+//! it, reads that, so its recording stays complete while the input holds still.
 //!
 //! ## 3. Samples in a Program
 //! A program reads recordings from a `Samples` table, as it reads goals and regions, and a
@@ -111,6 +115,12 @@ pub const Recording = struct {
         assert(std.math.isFinite(value));
         if (recording.latest) |latest| {
             if (time.flicks < latest.flicks) {
+                // No loss when playback already gives this value at this time (section 2).
+                if (recording.count > 0) {
+                    const last = recording.entries[recording.count - 1];
+                    const same = @as(u64, @bitCast(last.value)) == @as(u64, @bitCast(value));
+                    if (last.time.flicks <= time.flicks and same) return;
+                }
                 recording.dropped += 1;
                 return;
             }
@@ -205,4 +215,24 @@ test "a recording keeps changes in order and plays them held forward" {
     try testing.expectEqual(@as(f64, 0.5), play(table, at(2)));
     try testing.expectEqual(@as(f64, 0.125), play(table, at(3)));
     try testing.expectEqual(@as(f64, 0.125), play(table, at(100)));
+}
+
+// Locks section 2's exception: a backward pass that reads what playback already gives at its time
+// is no loss, and any other backward pass is.
+test "a backward pass is no loss only when playback already gives its value" {
+    var entries: [4]Sample = undefined;
+    var recording = Recording.init(&entries);
+    const second = @import("time.zig").flicks_per_second;
+    recording.add(.{ .flicks = second }, 0.5);
+    recording.add(.{ .flicks = 2 * second }, 0.5);
+    recording.add(.{ .flicks = 3 * second / 2 }, 0.5);
+    try std.testing.expect(recording.complete());
+    try std.testing.expectEqual(@as(u32, 1), recording.count);
+    recording.add(.{ .flicks = 3 * second / 2 }, 0.75);
+    try std.testing.expect(!recording.complete());
+    var again = Recording.init(&entries);
+    again.add(.{ .flicks = second }, 0.5);
+    again.add(.{ .flicks = 2 * second }, 0.5);
+    again.add(.{ .flicks = second / 2 }, 0.5);
+    try std.testing.expect(!again.complete());
 }

@@ -123,7 +123,8 @@ costs what its steps cost, so plan for three things. Its reader needs checkpoint
 has not reached runs every step from the start: about 1.5 s at 600 s for 48 lanes of followers
 and chases, once, while the checkpoints fill. And a window of events behind the playhead, as the
 lanes page reads, restores a checkpoint and steps again every frame, so read a stepped page's
-values, or its events from the last frame's time to this one, not a window behind it.
+values, or its events since the last frame with `state.events_since(now, &out)`, not a window
+behind it, and give its reader `program.reader_slab_count()` of slab rather than `slab_count`.
 
 Then, in `play/`:
 

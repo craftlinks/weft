@@ -293,7 +293,7 @@ pub fn sample(
         try writer.writeAll("],\"values\":[");
         // Each signal reads the window from a fresh state, which a read cannot tell apart from one
         // that read the others too, so no lane array needs keeping.
-        var state = weft.State.init(program, slab[0..program.slab_count]);
+        var state = weft.State.init(program, slab[0..@min(slab.len, program.reader_slab_count())]);
         for (0..count) |index| {
             if (index > 0) try writer.writeAll(",");
             state.eval(.{ .flicks = window.from + @as(i64, @intCast(index)) * window.step });
@@ -308,7 +308,7 @@ pub fn sample(
         try writer.writeAll("]}");
     }
     try writer.writeAll("],\"events\":[");
-    var state = weft.State.init(program, slab[0..program.slab_count]);
+    var state = weft.State.init(program, slab[0..@min(slab.len, program.reader_slab_count())]);
     const found = state.events(.{ .flicks = window.from }, .{ .flicks = window.to }, &events);
     for (events[0..found.count], 0..) |event, at| {
         if (at > 0) try writer.writeAll(",");

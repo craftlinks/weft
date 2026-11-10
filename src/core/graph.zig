@@ -84,6 +84,14 @@
 //! step before and its index, so a value never depends on the memory a reader gave or the order
 //! of its reads. A cue move drops them all, since a step can read cue times.
 //!
+//! A reader given room for it (`Program.reader_slab_count`) also keeps one more copy, of its
+//! simulated nodes' regions only, after its slab: their state at the step before the slab's own,
+//! saved before the last step of every call that steps. A read of the step the slab has just passed, which
+//! `events(last, now)` after `eval(last)` makes, and so does a track written at the time just
+//! read, restores that copy instead of a checkpoint, so it replays one step, not up to a second
+//! of them. It is a cache in the same sense: pure nodes are refilled by the next pass, and a
+//! motion's cursor is a cache of its own.
+//!
 //! ## 10. Cycles Through a Delay
 //! Every op but a delay refers only to earlier nodes, so a pass has no cycle. A delay's input can
 //! be any node, set by `close` after it is built, and is read only by the update after a pass,
@@ -784,13 +792,26 @@ pub const Program = struct {
     start: Cue,
     /// Whether any node runs on the fixed step, so a read may cost steps.
     simulated: bool,
+    /// The f64 of every node's values and caches: the least slab a reader takes.
     slab_count: u32,
+    /// The f64 of a reader's copy of its simulated nodes' regions at the step before its own,
+    /// packed in node order (section 9), which it keeps after `slab_count` when its slab has room
+    /// for `reader_slab_count`. 0 for a program with no simulated node.
+    recent_count: u32 = 0,
     /// The family index of lane 0 of a node built in a lane region (section 16).
     lane_first: u32 = 0,
+
+    /// The slab a reader takes to keep the copy of section 9 as well: `slab_count` plus
+    /// `recent_count`. A reader given only `slab_count` keeps none, and then a read of the step its
+    /// slab has just passed restores a checkpoint instead.
+    pub fn reader_slab_count(program: Program) u64 {
+        return @as(u64, program.slab_count) + program.recent_count;
+    }
 
     pub fn assert_valid(program: Program) void {
         var offset: u64 = 0;
         var simulated_count: u32 = 0;
+        var simulated_regions: u64 = 0;
         for (program.nodes, 0..) |*node, index| {
             assert(node.offset == offset);
             assert(node.extent.lanes >= 1 and node.extent.lanes <= lanes_max);
@@ -802,8 +823,12 @@ pub const Program = struct {
                 const lanes = program.nodes[input.index].extent.lanes;
                 assert(lanes == 1 or lanes == node.extent.lanes);
             }
-            offset += node.extent.count() + node.op.cache_count(node.extent.count());
-            if (node.op.simulated()) simulated_count += 1;
+            const region = node.extent.count() + node.op.cache_count(node.extent.count());
+            offset += region;
+            if (node.op.simulated()) {
+                simulated_count += 1;
+                simulated_regions += region;
+            }
             switch (node.op) {
                 .constant, .wave, .noise, .shift => {},
                 .lane => assert(node.extent.laned),
@@ -877,6 +902,7 @@ pub const Program = struct {
             }
         }
         assert(offset == program.slab_count);
+        assert(program.recent_count == 0 or program.recent_count == simulated_regions);
         assert(program.simulated == (simulated_count > 0));
         if (program.simulated) assert(program.start.index < program.cues.count);
     }
@@ -1106,6 +1132,8 @@ pub const Builder = struct {
     nodes: []Node,
     node_count: u32,
     slab_count: u32,
+    /// The f64 of the simulated nodes' regions built so far (`Program.recent_count`).
+    recent_count: u32,
     slab_count_max: u32,
     /// The table of `Options.cues`. Not named `cues`, which is the op of section 11.
     cue_table: *const Cues,
@@ -1223,6 +1251,7 @@ pub const Builder = struct {
             .nodes = nodes,
             .node_count = 0,
             .slab_count = 0,
+            .recent_count = 0,
             .slab_count_max = options.slab_count_max,
             .cue_table = options.cues,
             .goals = options.goals,
@@ -1614,6 +1643,7 @@ pub const Builder = struct {
             .start = builder.start,
             .simulated = builder.simulated,
             .slab_count = builder.slab_count,
+            .recent_count = builder.recent_count,
             .lane_first = builder.lane_first,
         };
         program.assert_valid();
@@ -1702,6 +1732,8 @@ pub const Builder = struct {
         if (builder.slab_count + count > builder.slab_count_max) {
             return error.SlabCapacityExceeded;
         }
+        // A reader may keep a simulated node's region twice: in place, and in its copy.
+        const copy: u64 = if (op.simulated()) count else 0;
         const id: Id = .{ .index = builder.node_count };
         builder.nodes[id.index] = .{
             .op = op,
@@ -1710,6 +1742,7 @@ pub const Builder = struct {
         };
         builder.node_count += 1;
         builder.slab_count += @intCast(count);
+        builder.recent_count += @intCast(copy);
         if (op.simulated()) builder.simulated = true;
         return id;
     }
