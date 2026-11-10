@@ -29,6 +29,7 @@ const assert = std.debug.assert;
 
 pub const message_len_max = 120;
 pub const hint_len_max = 96;
+pub const note_len_max = 96;
 /// Longer names are never suggested, so the distance's row is fixed.
 pub const name_len_max = 48;
 
@@ -86,6 +87,9 @@ pub const Diagnostic = struct {
     message_len: u8,
     hint: [hint_len_max]u8,
     hint_len: u8,
+    /// Where the error is, when the message and the span cannot say: inside a library's module.
+    note: [note_len_max]u8,
+    note_len: u8,
 
     pub fn message_text(diagnostic: *const Diagnostic) []const u8 {
         return diagnostic.message[0..diagnostic.message_len];
@@ -93,6 +97,10 @@ pub const Diagnostic = struct {
 
     pub fn hint_text(diagnostic: *const Diagnostic) []const u8 {
         return diagnostic.hint[0..diagnostic.hint_len];
+    }
+
+    pub fn note_text(diagnostic: *const Diagnostic) []const u8 {
+        return diagnostic.note[0..diagnostic.note_len];
     }
 
     /// Prints the diagnostic as section 1 shows, for a file called `name`.
@@ -118,6 +126,7 @@ pub const Diagnostic = struct {
         for (0..carets) |_| try writer.writeByte('^');
         try writer.writeByte('\n');
         if (diagnostic.hint_len > 0) try writer.print("    hint: {s}\n", .{diagnostic.hint_text()});
+        if (diagnostic.note_len > 0) try writer.print("    note: {s}\n", .{diagnostic.note_text()});
     }
 };
 
@@ -190,6 +199,8 @@ pub const List = struct {
             .message_len = 0,
             .hint = undefined,
             .hint_len = 0,
+            .note = undefined,
+            .note_len = 0,
         };
         diagnostic.message_len = @intCast(print_cut(&diagnostic.message, format, args).len);
         return diagnostic;
@@ -200,6 +211,11 @@ pub const List = struct {
 pub fn hint(diagnostic: ?*Diagnostic, comptime format: []const u8, args: anytype) void {
     const target = diagnostic orelse return;
     target.hint_len = @intCast(print_cut(&target.hint, format, args).len);
+}
+
+pub fn note(diagnostic: ?*Diagnostic, comptime format: []const u8, args: anytype) void {
+    const target = diagnostic orelse return;
+    target.note_len = @intCast(print_cut(&target.note, format, args).len);
 }
 
 /// Prints into `buffer`, cut with `...` where it does not fit.
@@ -227,24 +243,33 @@ pub fn nearest(name: []const u8, candidates: []const []const u8) ?[]const u8 {
             best_distance = distance;
         }
     }
-    if (best_distance > 2 or best_distance >= name.len) return null;
+    // An edit for every three letters at most, and two at most: `tme` is `time`, but `min` is
+    // not `map`, nor `phase` `shape`.
+    if (best_distance > 2 or 3 * best_distance > name.len) return null;
     return best;
 }
 
-/// The Levenshtein distance between two names of at most `name_len_max` bytes.
+/// The edit distance between two names of at most `name_len_max` bytes, where a swap of two
+/// neighbouring letters is one edit (the optimal string alignment distance).
 pub fn edit_distance(a: []const u8, b: []const u8) u32 {
     assert(a.len <= name_len_max);
     assert(b.len <= name_len_max);
+    // Three rows: two letters swapped, the commonest slip, is one edit, as in `nosie`.
+    var before: [name_len_max + 1]u32 = undefined;
+    var previous: [name_len_max + 1]u32 = undefined;
     var row: [name_len_max + 1]u32 = undefined;
     for (0..b.len + 1) |j| row[j] = @intCast(j);
     for (a, 0..) |byte_a, i| {
-        var diagonal = row[0];
+        before = previous;
+        previous = row;
         row[0] = @intCast(i + 1);
         for (b, 0..) |byte_b, j| {
-            const above = row[j + 1];
             const cost: u32 = if (byte_a == byte_b) 0 else 1;
-            row[j + 1] = @min(@min(above + 1, row[j] + 1), diagonal + cost);
-            diagonal = above;
+            var best = @min(@min(previous[j + 1] + 1, row[j] + 1), previous[j] + cost);
+            if (i > 0 and j > 0 and byte_a == b[j - 1] and a[i - 1] == byte_b) {
+                best = @min(best, before[j - 1] + 1);
+            }
+            row[j + 1] = best;
         }
     }
     return row[b.len];

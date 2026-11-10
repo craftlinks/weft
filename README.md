@@ -130,6 +130,9 @@ them is a bug or a new minor version, named in this README:
 Not promised: anything a file of `src/core` or `src/lang` does not export, the layout of the slab
 and the node array, `Limits`' defaults, diagnostics' wording, Play, and the bench's numbers.
 
+A file that 0.1.0 accepted and should not have is a bug, so 0.1.1 refuses it: a tween from a
+colour to a number, a product of two colours, and a module with two parameters of one name.
+
 ## Requirements
 
 | | |
@@ -641,7 +644,10 @@ compiled.compile_with(&.{.{ .name = "std", .text = weft.lang.std_library }}, sou
 - **Seeds** inside an instance hash the instance's place, so two instances differ and a new line
   elsewhere never reshuffles one.
 - **A declared range**, `in lo..hi`, is checked after the build for an instance bound to a name.
-- **Errors** inside a library's module are reported on the file's call.
+  The range analysis widens each range by a rounding margin, so the declared range is allowed
+  that margin too: 2^-40 of its larger end.
+- **Errors** inside a library's module are reported on the file's call, with a note naming the
+  module and the library.
 
 ## Vectors and Colour
 

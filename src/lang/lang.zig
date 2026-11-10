@@ -398,7 +398,11 @@ pub fn Compiled(comptime limits: Limits) type {
             for (compiled.checked.instances) |instance| {
                 const id = compiled.ids[instance.binding].first;
                 const reached = compiled.ranges[id.index];
-                if (reached.low >= instance.low and reached.high <= instance.high) continue;
+                // The analysis widens each range by a rounding margin, so a body that stays inside
+                // its declared range is allowed that margin of the declared scale too.
+                const declared: range_module.Range = .{ .low = instance.low, .high = instance.high };
+                const allowed = declared.widen(declared.scale(), range_module.margin_motion);
+                if (reached.low >= allowed.low and reached.high <= allowed.high) continue;
                 ok = false;
                 const tree = &compiled.syntax.tree;
                 const at_token = tree.tokens[tree.item(instance.item).token];
@@ -688,7 +692,7 @@ test "random bytes never crash the front end" {
     var prng = std.Random.DefaultPrng.init(0x5eed_12);
     const random = prng.random();
     var buffer: [512]u8 = undefined;
-    const alphabet = "abcehimnorstvz019._ =<-,:()[]#+*\n\t\x00\xff";
+    const alphabet = "abcehimnorstvz019._ =<-,:()[]#+*/\n\t\x00\xff";
     for (0..fuzz_count) |_| {
         const len = random.uintAtMost(usize, 256);
         for (buffer[0..len]) |*byte| {

@@ -195,3 +195,152 @@ test "a parameter used twice is one signal" {
         "n = noise(smooth, 1hz, seed: 4)\nout = n + n\n",
     );
 }
+
+/// The diagnostics of a file that must not compile, all of them.
+fn all_errors(libraries: []const weft.lang.Source, source: []const u8) ![]const weft.lang.Diagnostic {
+    failing.compile_with(libraries, source) catch return failing.errors();
+    return error.TestUnexpectedResult;
+}
+
+const Expected = struct {
+    source: []const u8,
+    code: diagnostic.Code,
+    message: []const u8,
+    hint: []const u8 = "",
+    /// The text under the error's span.
+    span: []const u8,
+};
+
+fn expect_one(libraries: []const weft.lang.Source, case: Expected) !void {
+    errdefer std.debug.print("case: {s}\n", .{case.source});
+    const found = try all_errors(libraries, case.source);
+    try testing.expectEqual(@as(usize, 1), found.len);
+    try testing.expectEqual(case.code, found[0].code);
+    try testing.expectEqualStrings(case.message, found[0].message_text());
+    try testing.expectEqualStrings(case.hint, found[0].hint_text());
+    try testing.expectEqualStrings(case.span, case.source[found[0].start..][0..found[0].len]);
+}
+
+// Locks step 21: each hole in the checker found by the showcase, refused or reported once, at
+// the place to fix, with the fix as its hint.
+test "the checker's holes are closed, each with one error" {
+    const cases = [_]Expected{
+        .{
+            .source = "cue c = 0s\nx = tween(from: srgb(1, 0, 0), to: 0.5, at: c, over: 1s)\n",
+            .code = .wrong_shape,
+            .message = "`from` and `to` differ: a colour and a number",
+            .hint = "write the number as a colour, such as `oklab(0.5, 0, 0)`",
+            .span = "tween(from: srgb(1, 0, 0), to: 0.5, at: c, over: 1s)",
+        },
+        .{
+            .source = "y = oklab(0.5, 0, 0) * oklab(0.5, 0, 0)\n",
+            .code = .wrong_shape,
+            .message = "two colours do not multiply",
+            .hint = "scale a colour by a number, or multiply components, such as `a.l * b.l`",
+            .span = "oklab(0.5, 0, 0) * oklab(0.5, 0, 0)",
+        },
+        .{
+            .source = "module a(p, p) = p\nout = a(1, 2)\n",
+            .code = .duplicate_name,
+            .message = "`p` is a parameter of `a` twice",
+            .hint = "rename one of them",
+            .span = "p",
+        },
+        .{
+            .source = "cue a = 2s\ncue b = 1s\nx = tween(from: 0, to: 1, at: b, over: 1s)\nfb = delay(b)\nfb <- x\n",
+            .code = .cue_out_of_order,
+            .message = "cues are in time order, and this one is before the cue above it",
+            .hint = "move it above the cues it comes before",
+            .span = "cue b = 1s",
+        },
+        .{
+            .source = "x = wave(sine, 1hz) / 4\n",
+            .code = .unexpected_token,
+            .message = "there is no division",
+            .hint = "multiply by the reciprocal: `* 0.25`",
+            .span = "/",
+        },
+        .{
+            .source = "x = wave(sine, 1hz) / lane\n",
+            .code = .unexpected_token,
+            .message = "there is no division",
+            .hint = "multiply by the reciprocal, such as `* 0.5`",
+            .span = "/",
+        },
+        .{
+            .source = "x = min(1, 2)\n",
+            .code = .unknown_call,
+            .message = "there is no call `min`",
+            .span = "min",
+        },
+        .{
+            .source = "x = wave(sine, 1hz, phase: 0.25)\n",
+            .code = .unknown_parameter,
+            .message = "wave has no parameter `phase`",
+            .span = "phase",
+        },
+        .{
+            .source = "module arrive(x) = x\ny = arrives(1)\n",
+            .code = .unknown_call,
+            .message = "there is no call `arrives`",
+            .hint = "did you mean `arrive`?",
+            .span = "arrives",
+        },
+        .{
+            .source = "noise = noise(smooth, 1hz)\nc = chase(nosie, time: 1s)\n",
+            .code = .unknown_name,
+            .message = "`nosie` is not declared",
+            .hint = "did you mean `noise`?",
+            .span = "nosie",
+        },
+        .{
+            .source = "x = wave(sine, 1hz\n",
+            .code = .unexpected_token,
+            .message = "this `(` is never closed",
+            .hint = "close it with `)`",
+            .span = "(",
+        },
+        .{
+            .source = "cue c0 = 0s\ntrack k = 1 in 0..2\nf = follow([0..k], by: spring(time: 1s), seed: 1)\n",
+            .code = .not_live,
+            .message = "a range's end is fixed when it is built, so `k` cannot set it",
+            .hint = "write a number; to move it, map the output instead",
+            .span = "k",
+        },
+    };
+    for (cases) |case| try expect_one(&.{}, case);
+}
+
+// Locks the library note: an error inside a library's module is reported at the call, and names
+// the module and the library.
+test "an error inside a library module names the module and the library" {
+    const library: []const weft.lang.Source = &.{.{ .name = "lib", .text = "module bad(x) = x * oklab(0.5, 0, 0) * oklab(0.5, 0, 0)\n" }};
+    const found = try all_errors(library, "use lib\nout = bad(1)\n");
+    try testing.expectEqual(@as(usize, 1), found.len);
+    try testing.expectEqual(diagnostic.Code.wrong_shape, found[0].code);
+    try testing.expectEqualStrings("in `bad`, a module of the library `lib`", found[0].note_text());
+    // A module of a library the file does not use is unknown, not silently refused.
+    const unused = try all_errors(library, "out = bad(1)\n");
+    try testing.expectEqual(diagnostic.Code.unknown_call, unused[0].code);
+}
+
+// Locks the limit hints: each names a field of `Limits`.
+test "a limit's hint names a field of Limits" {
+    var text: [2048]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&text);
+    for (0..limits.names + 1) |index| writer.print("n{d} = {d}\n", .{ index, index }) catch unreachable;
+    const found = try first_error(&.{}, writer.buffered());
+    try testing.expectEqual(diagnostic.Code.limit, found.code);
+    try testing.expectEqualStrings("raise `Limits.names`", found.hint_text());
+}
+
+// Locks the README's module with a declared range: the range analysis's rounding margin fits
+// inside the declared range, and a body that really leaves it is still refused.
+test "a declared range allows the analysis's rounding margin" {
+    try expect_same(
+        "cue c0 = 0s\nmodule hop(s, at) in -1..1 = bounce(0..1, speed: s, at: at) * 2 - 1\nout = hop(0.7, c0)\n",
+        "cue c0 = 0s\nout = bounce(0..1, speed: 0.7, at: c0) * 2 - 1\n",
+    );
+    const found = try first_error(&.{}, "module twice(x) in 0..1 = x * 2\nout = twice(0.9)\n");
+    try testing.expectEqual(diagnostic.Code.out_of_range, found.code);
+}

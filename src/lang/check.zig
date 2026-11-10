@@ -18,7 +18,8 @@
 //! used only below its declaration, so the node order is the text order; a cycle goes through a
 //! delay, whose feed `fb <- x` comes after both. Calls live apart: a name before `(` is looked up
 //! in the table only, so `tween = tween(…)` is fine. `seed`, `start`, `cue`, and `track` are not
-//! names.
+//! names. A declaration that is refused still binds its name, as `failed`, so its uses below fail
+//! without a second message: one mistake reads as one error.
 //!
 //! ## 3. Arithmetic
 //! `a + b` and `a * b` are the builder's add and multiply. `a - b` is `a + b * -1`, `-a` is
@@ -64,7 +65,9 @@
 //! Every expression has a shape (step 16): a number, a vec2, a vec3, or a colour, three
 //! components in OKLab. `vec2`, `vec3`, and `oklab` pack scalar signals; `srgb` is a colour of
 //! numbers, converted at compile time. Arithmetic takes two equal shapes or one scalar, which it
-//! broadcasts; a colour and a vector never mix. A parameter takes one value unless the table marks
+//! broadcasts, except that two colours do not multiply; a colour and a vector never mix. Two ends
+//! that must agree, such as a tween's `from` and `to`, broadcast a number to a vector but never to
+//! a colour, whose components are not alike. A parameter takes one value unless the table marks
 //! it `shaped`: then `tween`'s ends, a path's goals and a motion's `from` may be a vector or a
 //! colour written in numbers (`Vector`), and `chase`'s target, `map`'s input, and a tween's
 //! `after` a shaped signal, and the call's shape is theirs. A vector path is one run a component.
@@ -96,6 +99,11 @@ const Tree = parse_module.Tree;
 const Item = parse_module.Item;
 const token_module = @import("token.zig");
 const schema = @import("schema.zig");
+/// The most modules a "did you mean" looks through.
+const modules_suggested_max = 256;
+
+/// The fields of `Limits`, so a hint can only name one that exists.
+const LimitField = std.meta.FieldEnum(@import("lang.zig").Limits);
 const Entry = schema.Entry;
 const error_module = @import("error.zig");
 const Diagnostics = error_module.List;
@@ -259,7 +267,8 @@ pub const Binding = struct {
     delay: bool = false,
     fed: bool = false,
 
-    pub const Kind = enum { cue, series, track, signal, path, regions };
+    /// `failed` is a name whose declaration was refused: its uses report nothing more (section 2).
+    pub const Kind = enum { cue, series, track, signal, path, regions, failed };
 };
 
 pub const Declaration = union(enum) {
@@ -459,7 +468,21 @@ const Checker = struct {
         args: anytype,
     ) ?*error_module.Diagnostic {
         const span = checker.span_of(index);
-        return checker.diagnostics.add(code, span[0], @max(span[1], 1), format, args);
+        const diagnostic = checker.diagnostics.add(code, span[0], @max(span[1], 1), format, args);
+        checker.note_library(diagnostic);
+        return diagnostic;
+    }
+
+    /// Notes which library module an error inside one is in, since it is reported at the call.
+    fn note_library(checker: *const Checker, diagnostic: ?*error_module.Diagnostic) void {
+        if (!checker.is_library(checker.frame)) return;
+        const frame = checker.memory.frames[checker.frame];
+        const module = checker.memory.modules[frame.module.?];
+        for (checker.memory.libraries) |library| {
+            if (library.tree != frame.tree) continue;
+            error_module.note(diagnostic, "in `{s}`, a module of the library `{s}`", .{ module.name, library.name });
+            return;
+        }
     }
 
     /// An error on an item's main token rather than all of it.
@@ -472,13 +495,23 @@ const Checker = struct {
     ) ?*error_module.Diagnostic {
         const at = checker.located(index);
         const token = at.tree.tokens[at.tree.item(at.index).token];
-        return checker.diagnostics.add(code, token.start, @max(token.len, 1), format, args);
+        const diagnostic = checker.diagnostics.add(code, token.start, @max(token.len, 1), format, args);
+        checker.note_library(diagnostic);
+        return diagnostic;
     }
 
-    fn limit(checker: *Checker, index: u32, name: []const u8, count: usize) Fail {
-        const diagnostic = checker.fail(index, .limit, "the file needs more than {d} {s}", .{ count, name });
-        error_module.hint(diagnostic, "raise `Limits.{s}`", .{name});
+    /// A table of `Limits.field` is full. The field is an enum, so a hint names one that exists.
+    fn limit(checker: *Checker, index: u32, noun: []const u8, comptime field: LimitField, count: usize) Fail {
+        const diagnostic = checker.fail(index, .limit, "the file needs more than {d} {s}", .{ count, noun });
+        error_module.hint(diagnostic, "raise `Limits.{s}`", .{@tagName(field)});
         checker.stopped = true;
+        return error.Checked;
+    }
+
+    /// A fixed bound that no `Limits` field raises was passed.
+    fn fixed_limit(checker: *Checker, index: u32, noun: []const u8, count: usize) Fail {
+        const diagnostic = checker.fail(index, .limit, "more than {d} {s}", .{ count, noun });
+        error_module.hint(diagnostic, "that is fixed, not a `Limits` field; split it", .{});
         return error.Checked;
     }
 
@@ -528,7 +561,7 @@ const Checker = struct {
             return error.Checked;
         }
         if (checker.binding_count == checker.memory.bindings.len) {
-            return checker.limit(index, "names", checker.memory.bindings.len);
+            return checker.limit(index, "names", .names, checker.memory.bindings.len);
         }
         const at = checker.binding_count;
         checker.memory.bindings[at] = binding;
@@ -578,7 +611,7 @@ const Checker = struct {
                     return error.Checked;
                 }
                 if (checker.track_count == checker.memory.tracks.len) {
-                    return checker.limit(index, "tracks", checker.memory.tracks.len);
+                    return checker.limit(index, "tracks", .tracks, checker.memory.tracks.len);
                 }
                 const track = checker.track_count;
                 checker.memory.tracks[track] = .{ .initial = initial, .low = bounds[0], .high = bounds[1], .item = index };
@@ -601,7 +634,7 @@ const Checker = struct {
             }
         }
         if (checker.cue_count == checker.memory.cue_times.len) {
-            return checker.limit(index, "cues", checker.memory.cue_times.len);
+            return checker.limit(index, "cues", .cues, checker.memory.cue_times.len);
         }
         const cue = checker.cue_count;
         checker.memory.cue_times[cue] = time;
@@ -621,7 +654,7 @@ const Checker = struct {
         }
         const count_wide = @divExact(to - from, every) + 1;
         if (count_wide > checker.memory.cue_times.len - checker.cue_count) {
-            return checker.limit(index, "cues", checker.memory.cue_times.len);
+            return checker.limit(index, "cues", .cues, checker.memory.cue_times.len);
         }
         const count: u32 = @intCast(count_wide);
         const first = try checker.add_cue(index, from);
@@ -675,7 +708,7 @@ const Checker = struct {
         const at = try checker.declare(index, binding);
         if (declared) |range| if (value.tag == .call and checker.find_module(checker.text(it.a)) != null) {
             if (checker.instance_count == checker.memory.instances.len) {
-                return checker.limit(index, "names", checker.memory.instances.len);
+                return checker.limit(index, "names", .names, checker.memory.instances.len);
             }
             checker.memory.instances[checker.instance_count] = .{ .binding = at, .low = range[0], .high = range[1], .item = it.a };
             checker.instance_count += 1;
@@ -692,6 +725,7 @@ const Checker = struct {
             return error.Checked;
         };
         const binding = &checker.memory.bindings[target];
+        if (binding.kind == .failed) return checker.reported();
         if (!binding.delay) {
             const diagnostic = checker.fail_token(index, .not_a_delay, "only a delay is fed with `<-`, and `{s}` is not one", .{name});
             error_module.hint(diagnostic, "declare it as `{s} = delay(0)`", .{name});
@@ -728,7 +762,7 @@ const Checker = struct {
 
     fn push_declaration(checker: *Checker, index: u32, declaration_value: Declaration) Fail!void {
         if (checker.declaration_count == checker.memory.declarations.len) {
-            return checker.limit(index, "declarations", checker.memory.declarations.len);
+            return checker.limit(index, "declarations", .names, checker.memory.declarations.len);
         }
         checker.memory.declarations[checker.declaration_count] = declaration_value;
         checker.declaration_count += 1;
@@ -736,7 +770,7 @@ const Checker = struct {
 
     fn push_expr(checker: *Checker, expr: Expr) Fail!u32 {
         if (checker.expr_count == checker.memory.exprs.len) {
-            return checker.limit(expr.item, "expressions", checker.memory.exprs.len);
+            return checker.limit(expr.item, "expressions", .tree, checker.memory.exprs.len);
         }
         const at = checker.expr_count;
         var placed = expr;
@@ -809,7 +843,7 @@ const Checker = struct {
                     return checker.constant(if (it.tag == .add) a + b else a * b, index);
                 };
                 const tag: Expr.Tag = if (it.tag == .add) .add else .multiply;
-                const shape = try checker.combine(index, left, right);
+                const shape = try checker.combine(index, left, right, tag == .multiply);
                 const lanes = try checker.join_lanes(index, left, right);
                 return checker.push_expr(.{ .tag = tag, .a = left, .b = right, .item = index, .shape = shape, .lanes = lanes });
             },
@@ -821,7 +855,7 @@ const Checker = struct {
                     const negative = try checker.constant(-b, it.b);
                     return checker.push_expr(.{ .tag = .add, .a = left, .b = negative, .item = index, .shape = checker.shape_of(left), .lanes = checker.lanes_of(left) });
                 }
-                const shape = try checker.combine(index, left, right);
+                const shape = try checker.combine(index, left, right, false);
                 const lanes = try checker.join_lanes(index, left, right);
                 const minus_one = try checker.constant(-1, index);
                 const negated = try checker.push_expr(.{ .tag = .multiply, .a = right, .b = minus_one, .item = it.b, .shape = checker.shape_of(right), .lanes = checker.lanes_of(right) });
@@ -855,7 +889,7 @@ const Checker = struct {
         const entry: *const Entry = switch (base.tag) {
             .name => entry: {
                 const base_name = checker.text(base_index);
-                const found = checker.find(base_name) orelse return checker.unknown_name(base_index, base_name);
+                const found = try checker.resolve(base_index, base_name);
                 const bound_to = checker.memory.bindings[found];
                 if (bound_to.kind == .signal and checker.shape_of(bound_to.index).components > 1) {
                     return checker.component_of(index, try checker.signal_name(base_index, 0), output_name);
@@ -894,7 +928,7 @@ const Checker = struct {
 
     fn signal_name(checker: *Checker, index: u32, output_index: u32) Fail!u32 {
         const name = checker.text(index);
-        const found = checker.find(name) orelse return checker.unknown_name(index, name);
+        const found = try checker.resolve(index, name);
         const binding = checker.memory.bindings[found];
         switch (binding.kind) {
             .signal => {
@@ -908,6 +942,53 @@ const Checker = struct {
                 return error.Checked;
             },
         }
+    }
+
+    /// The binding of `name`, or the error for a name not declared. A name whose declaration was
+    /// refused fails with nothing more to say (section 2).
+    fn resolve(checker: *Checker, index: u32, name: []const u8) Fail!u32 {
+        const found = checker.find(name) orelse return checker.unknown_name(index, name);
+        if (checker.memory.bindings[found].kind == .failed) return checker.reported();
+        return found;
+    }
+
+    /// Whether `name` is a module declared in the file or a library it uses that `register`
+    /// refused, so a call of it reports nothing more (section 2).
+    fn module_refused(checker: *const Checker, name: []const u8) bool {
+        if (checker.find_module(name) != null) return false;
+        if (declares_module(checker.root, name)) return true;
+        for (checker.root.declarations) |index| {
+            const it = checker.root.item(index);
+            if (it.tag != .use) continue;
+            const used = checker.root.token_text(it.token);
+            for (checker.memory.libraries) |library| {
+                if (!std.mem.eql(u8, library.name, used)) continue;
+                if (declares_module(library.tree, name)) return true;
+            }
+        }
+        return false;
+    }
+
+    /// The failure of a use whose cause was already reported.
+    fn reported(checker: *const Checker) Fail {
+        assert(checker.diagnostics.total() > 0);
+        return error.Checked;
+    }
+
+    /// After `declaration` refused the declaration `index`, binds its name as `failed`, when it
+    /// has one that is free, so its uses are not reported again (section 2).
+    fn bind_failed(checker: *Checker, index: u32) void {
+        const it = checker.item(index);
+        switch (it.tag) {
+            .cue, .cue_series, .track, .bind => {},
+            else => return,
+        }
+        const name = checker.tree.token_text(it.token);
+        for (reserved) |word| if (std.mem.eql(u8, word, name)) return;
+        if (checker.find(name) != null) return;
+        if (checker.binding_count == checker.memory.bindings.len) return;
+        checker.memory.bindings[checker.binding_count] = .{ .name = name, .item = index, .kind = .failed, .index = 0 };
+        checker.binding_count += 1;
     }
 
     fn unknown_name(checker: *Checker, index: u32, name: []const u8) Fail {
@@ -933,8 +1014,16 @@ const Checker = struct {
 
     fn unknown_call(checker: *Checker, index: u32) Fail {
         const name = checker.text(index);
+        if (checker.module_refused(name)) return checker.reported();
         const diagnostic = checker.fail_token(index, .unknown_call, "there is no call `{s}`", .{name});
-        if (error_module.nearest(name, &schema.call_names)) |near| {
+        // The primitives, then the modules in the table, the file's and its libraries'.
+        var buffer: [schema.call_names.len + modules_suggested_max][]const u8 = undefined;
+        @memcpy(buffer[0..schema.call_names.len], &schema.call_names);
+        const modules = @min(checker.module_count, modules_suggested_max);
+        for (buffer[schema.call_names.len..][0..modules], checker.memory.modules[0..modules]) |*slot, module| {
+            slot.* = module.name;
+        }
+        if (error_module.nearest(name, buffer[0 .. schema.call_names.len + modules])) |near| {
             error_module.hint(diagnostic, "did you mean `{s}`?", .{near});
         }
         return error.Checked;
@@ -982,10 +1071,10 @@ const Checker = struct {
             positional += 1;
         }
         if (checker.value_count + entry.params.len > checker.memory.values.len) {
-            return checker.limit(index, "values", checker.memory.values.len);
+            return checker.limit(index, "values", .tree, checker.memory.values.len);
         }
         if (checker.call_count == checker.memory.calls.len) {
-            return checker.limit(index, "calls", checker.memory.calls.len);
+            return checker.limit(index, "calls", .tree, checker.memory.calls.len);
         }
         const first = checker.value_count;
         checker.value_count += @intCast(entry.params.len);
@@ -1087,7 +1176,19 @@ const Checker = struct {
             error_module.hint(diagnostic, "rename one of them, or remove the `use` that brings it in", .{});
             return error.Checked;
         }
-        for (tree.children(tree.item(index).a)) |param| {
+        const params = tree.children(tree.item(index).a);
+        for (params, 0..) |param, at| {
+            const param_name = tree.token_text(tree.item(param).token);
+            for (params[0..at]) |earlier| {
+                if (!std.mem.eql(u8, tree.token_text(tree.item(earlier).token), param_name)) continue;
+                // At the second one in the file; at the `use` for a library's module.
+                const at_item = if (tree == checker.root) param else report;
+                const diagnostic = checker.fail_token(at_item, .duplicate_name, "`{s}` is a parameter of `{s}` twice", .{ param_name, name });
+                error_module.hint(diagnostic, "rename one of them", .{});
+                return error.Checked;
+            }
+        }
+        for (params) |param| {
             const default = tree.item(param).a;
             if (default == 0 or tree.item(default - 1).tag == .literal) continue;
             const diagnostic = checker.fail(report, .wrong_type, "the default of `{s}` in {s} is not a literal", .{ tree.text(param), name });
@@ -1100,7 +1201,7 @@ const Checker = struct {
             return error.Checked;
         }
         if (checker.module_count == checker.memory.modules.len) {
-            return checker.limit(report, "modules", checker.memory.modules.len);
+            return checker.limit(report, "modules", .modules, checker.memory.modules.len);
         }
         checker.memory.modules[checker.module_count] = .{ .name = name, .tree = tree, .item = index };
         checker.module_count += 1;
@@ -1429,9 +1530,16 @@ const Checker = struct {
 
     /// The shape of `left` and `right` together (section 8): theirs when equal, the other's when
     /// one is a number; a colour and a vector, or two vectors of different sizes, are refused.
-    fn combine(checker: *Checker, index: u32, left: u32, right: u32) Fail!Shape {
+    /// The shape of a sum or a product: equal shapes, or a number with anything. Two colours do
+    /// not multiply (section 8).
+    fn combine(checker: *Checker, index: u32, left: u32, right: u32, product: bool) Fail!Shape {
         const a = checker.shape_of(left);
         const b = checker.shape_of(right);
+        if (product and a.colour and b.colour) {
+            const diagnostic = checker.fail(index, .wrong_shape, "two colours do not multiply", .{});
+            error_module.hint(diagnostic, "scale a colour by a number, or multiply components, such as `a.l * b.l`", .{});
+            return error.Checked;
+        }
         if (a.eql(b) or b.eql(Shape.scalar)) return a;
         if (a.eql(Shape.scalar)) return b;
         const diagnostic = checker.fail(index, .wrong_shape, "{s} and {s} do not go together", .{ a.noun(), b.noun() });
@@ -1491,11 +1599,18 @@ const Checker = struct {
         }
     }
 
-    /// Two shapes that must agree, a number broadcast to the other.
+    /// Two shapes that must agree, a number broadcast to a vector. A number is never broadcast to
+    /// a colour, whose three components are not alike (section 8).
     fn agree(checker: *Checker, index: u32, a: Shape, b: Shape, what: []const u8) Fail!Shape {
-        if (a.eql(b) or b.eql(Shape.scalar)) return a;
-        if (a.eql(Shape.scalar)) return b;
-        _ = checker.fail(index, .wrong_shape, "{s} differ: {s} and {s}", .{ what, a.noun(), b.noun() });
+        if (a.eql(b)) return a;
+        if (!a.colour and !b.colour) {
+            if (b.eql(Shape.scalar)) return a;
+            if (a.eql(Shape.scalar)) return b;
+        }
+        const diagnostic = checker.fail(index, .wrong_shape, "{s} differ: {s} and {s}", .{ what, a.noun(), b.noun() });
+        if ((a.colour and b.eql(Shape.scalar)) or (b.colour and a.eql(Shape.scalar))) {
+            error_module.hint(diagnostic, "write the number as a colour, such as `oklab(0.5, 0, 0)`", .{});
+        }
         return error.Checked;
     }
 
@@ -1536,9 +1651,9 @@ const Checker = struct {
     fn vector_path(checker: *Checker, index: u32, goals: []const Goal, values: []const [4]f64, shape: Shape, declared: bool) Fail!u32 {
         const count = shape.components;
         if (goals.len * count > checker.memory.goals.len - checker.goal_count) {
-            return checker.limit(index, "goals", checker.memory.goals.len);
+            return checker.limit(index, "goals", .goals, checker.memory.goals.len);
         }
-        if (checker.path_count + count > checker.memory.paths.len) return checker.limit(index, "paths", checker.memory.paths.len);
+        if (checker.path_count + count > checker.memory.paths.len) return checker.limit(index, "paths", .goals, checker.memory.paths.len);
         const first_path = checker.path_count;
         for (0..count) |k| {
             const first = checker.goal_count;
@@ -1707,6 +1822,11 @@ const Checker = struct {
     }
 
     fn not_live(checker: *Checker, entry: *const Entry, param: *const schema.Param, index: u32) Fail {
+        if (checker.item(index).tag == .name) {
+            if (checker.find(checker.text(index))) |found| {
+                if (checker.memory.bindings[found].kind == .failed) return checker.reported();
+            }
+        }
         const diagnostic = checker.fail(index, .not_live, "{s}'s `{s}` is fixed when it is built, so a signal cannot set it", .{ entry.name, param.name });
         switch (entry.op) {
             .spring, .newtonian => error_module.hint(diagnostic, "chase follows a moving value, and a follower's mover reads signals", .{}),
@@ -1722,7 +1842,7 @@ const Checker = struct {
             return error.Checked;
         }
         const name = checker.text(index);
-        const found = checker.find(name) orelse return checker.unknown_name(index, name);
+        const found = try checker.resolve(index, name);
         const binding = checker.memory.bindings[found];
         if (binding.kind != kind) {
             _ = checker.fail(index, .wrong_type, "`{s}` is a {s}, not {s}", .{ name, kind_name(binding.kind), kind_name(kind) });
@@ -1749,6 +1869,7 @@ const Checker = struct {
                 _ = checker.fail(index, .wrong_type, "only a series has elements", .{});
                 return error.Checked;
             };
+            if (binding.kind == .failed) return checker.reported();
             if (binding.kind != .series) {
                 _ = checker.fail(index, .wrong_type, "`{s}` is a {s}, not a series", .{ name, kind_name(binding.kind) });
                 return error.Checked;
@@ -1766,7 +1887,7 @@ const Checker = struct {
             return error.Checked;
         }
         const name = checker.text(index);
-        const found = checker.find(name) orelse return checker.unknown_name(index, name);
+        const found = try checker.resolve(index, name);
         const binding = checker.memory.bindings[found];
         if (binding.kind != .cue) {
             const diagnostic = checker.fail(index, .wrong_type, "`{s}` is a {s}, not a cue", .{ name, kind_name(binding.kind) });
@@ -1782,7 +1903,7 @@ const Checker = struct {
             _ = checker.fail(index, .wrong_type, "a path has at least one goal", .{});
             return error.Checked;
         }
-        if (children.len > run_max) return checker.limit(index, "goals in one path", run_max);
+        if (children.len > run_max) return checker.fixed_limit(index, "goals in one path", run_max);
         var buffer: [run_max]Goal = undefined;
         var values: [run_max][4]f64 = undefined;
         const fresh = buffer[0..children.len];
@@ -1824,9 +1945,9 @@ const Checker = struct {
             }
         }
         if (fresh.len > checker.memory.goals.len - checker.goal_count) {
-            return checker.limit(index, "goals", checker.memory.goals.len);
+            return checker.limit(index, "goals", .goals, checker.memory.goals.len);
         }
-        if (checker.path_count == checker.memory.paths.len) return checker.limit(index, "paths", checker.memory.paths.len);
+        if (checker.path_count == checker.memory.paths.len) return checker.limit(index, "paths", .goals, checker.memory.paths.len);
         const first = checker.goal_count;
         @memcpy(checker.memory.goals[first..][0..fresh.len], fresh);
         checker.goal_count += @intCast(fresh.len);
@@ -1842,7 +1963,7 @@ const Checker = struct {
             _ = checker.fail(index, .wrong_type, "regions are at least one range", .{});
             return error.Checked;
         }
-        if (children.len > run_max) return checker.limit(index, "regions in one list", run_max);
+        if (children.len > run_max) return checker.fixed_limit(index, "regions in one list", run_max);
         var buffer: [run_max]Region = undefined;
         const fresh = buffer[0..children.len];
         for (children, fresh) |child, *region| {
@@ -1855,10 +1976,10 @@ const Checker = struct {
             }
         }
         if (fresh.len > checker.memory.regions.len - checker.region_count) {
-            return checker.limit(index, "regions", checker.memory.regions.len);
+            return checker.limit(index, "regions", .regions, checker.memory.regions.len);
         }
         if (checker.run_count == checker.memory.region_runs.len) {
-            return checker.limit(index, "region runs", checker.memory.region_runs.len);
+            return checker.limit(index, "region runs", .regions, checker.memory.region_runs.len);
         }
         const first = checker.region_count;
         @memcpy(checker.memory.regions[first..][0..fresh.len], fresh);
@@ -1896,6 +2017,18 @@ const Checker = struct {
         }
         const it = checker.item(index);
         const token = checker.tree.tokens[it.token];
+        if (it.tag == .name) {
+            // A track or a signal changes after the build, and this number cannot, as `not_live` says.
+            if (checker.find(checker.text(index))) |found| switch (checker.memory.bindings[found].kind) {
+                .track, .signal => {
+                    const diagnostic = checker.fail(index, .not_live, "{s} is fixed when it is built, so `{s}` cannot set it", .{ what, checker.text(index) });
+                    error_module.hint(diagnostic, "write a number; to move it, map the output instead", .{});
+                    return error.Checked;
+                },
+                .failed => return checker.reported(),
+                else => {},
+            };
+        }
         if (it.tag != .literal or token.tag != .number) {
             const diagnostic = checker.fail(index, .wrong_type, "expected {s}, found {s}", .{ what, if (it.tag == .literal) literal_kind(token.tag) else item_kind(it.tag) });
             if (it.tag == .literal) error_module.hint(diagnostic, "drop the unit", .{});
@@ -2029,6 +2162,15 @@ fn item_kind(tag: parse_module.Tag) []const u8 {
     };
 }
 
+/// Whether `tree` declares a module called `name`.
+fn declares_module(tree: *const Tree, name: []const u8) bool {
+    for (tree.declarations) |index| {
+        const it = tree.item(index);
+        if (it.tag == .module and std.mem.eql(u8, tree.token_text(it.token), name)) return true;
+    }
+    return false;
+}
+
 fn kind_name(kind: Binding.Kind) []const u8 {
     return switch (kind) {
         .cue => "cue",
@@ -2037,6 +2179,7 @@ fn kind_name(kind: Binding.Kind) []const u8 {
         .signal => "signal",
         .path => "path",
         .regions => "list of regions",
+        .failed => unreachable,
     };
 }
 
@@ -2067,7 +2210,7 @@ pub fn check(tree: *const Tree, memory: Memory, diagnostics: *Diagnostics) Check
     checker.register(tree);
     for (tree.declarations) |index| {
         if (checker.stopped) break;
-        checker.declaration(index) catch {};
+        checker.declaration(index) catch checker.bind_failed(index);
     }
     var start: u32 = 0;
     if (!checker.stopped) {
@@ -2076,6 +2219,8 @@ pub fn check(tree: *const Tree, memory: Memory, diagnostics: *Diagnostics) Check
             const found = checker.find(name);
             if (found != null and memory.bindings[found.?].kind == .cue) {
                 start = memory.bindings[found.?].index;
+            } else if (found != null and memory.bindings[found.?].kind == .failed) {
+                assert(diagnostics.total() > before);
             } else {
                 const diagnostic = checker.fail_token(index, .unknown_name, "`{s}` is not a cue", .{name});
                 error_module.hint(diagnostic, "the start is a cue declared with `cue`", .{});

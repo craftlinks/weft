@@ -53,6 +53,8 @@ const token_module = @import("token.zig");
 const Token = token_module.Token;
 pub const TokenTag = token_module.Tag;
 const error_module = @import("error.zig");
+/// The fields of `Limits`, so a hint can only name one that exists.
+const LimitField = std.meta.FieldEnum(@import("lang.zig").Limits);
 const Diagnostics = error_module.List;
 
 pub const depth_max = 32;
@@ -203,6 +205,10 @@ const Parser = struct {
     position: u32 = 0,
     /// Parentheses and brackets open, inside which a newline is space.
     nest: u32 = 0,
+    /// The `(` of each call and group open, innermost last, so an error at the end of the file
+    /// can say which one is never closed.
+    open: [depth_max]u32 = undefined,
+    open_count: u32 = 0,
     depth: u32 = 0,
     /// The last token consumed.
     last: u32 = 0,
@@ -288,6 +294,13 @@ const Parser = struct {
         comptime format: []const u8,
         args: anytype,
     ) Fail {
+        if (parser.open_count > 0 and parser.tokens[index].tag == .eof) {
+            // The file ended inside a call or a group: the `(` is the mistake, not the end.
+            const open = parser.tokens[parser.open[parser.open_count - 1]];
+            const unclosed = parser.diagnostics.add(code, open.start, 1, "this `(` is never closed", .{});
+            error_module.hint(unclosed, "close it with `)`", .{});
+            return error.Syntax;
+        }
         const token = parser.tokens[index];
         const diagnostic = parser.diagnostics.add(code, token.start, @max(token.len, 1), format, args);
         if (code == .bad_unit) {
@@ -308,6 +321,7 @@ const Parser = struct {
     fn recover(parser: *Parser) void {
         parser.nest = 0;
         parser.depth = 0;
+        parser.open_count = 0;
         parser.stack_count = 0;
         // An error found at a token that starts a later line, such as an unclosed call running into
         // the next declaration, resumes at that token, so the next line is not lost.
@@ -325,17 +339,18 @@ const Parser = struct {
     }
 
     fn push(parser: *Parser, item: Item) Fail!u32 {
-        if (parser.item_count == parser.memory.items.len) return parser.limit("tree", parser.memory.items.len);
+        if (parser.item_count == parser.memory.items.len) return parser.limit("tree", .tree, parser.memory.items.len);
         const index = parser.item_count;
         parser.memory.items[index] = item;
         parser.item_count += 1;
         return index;
     }
 
-    fn limit(parser: *Parser, name: []const u8, count: usize) Fail {
+    /// A table of `Limits.field` is full. The field is an enum, so a hint names one that exists.
+    fn limit(parser: *Parser, noun: []const u8, comptime field: LimitField, count: usize) Fail {
         const token = parser.tokens[parser.position];
-        const diagnostic = parser.diagnostics.add(.limit, token.start, @max(token.len, 1), "the file needs more than {d} {s} entries", .{ count, name });
-        error_module.hint(diagnostic, "raise `Limits.{s}`", .{name});
+        const diagnostic = parser.diagnostics.add(.limit, token.start, @max(token.len, 1), "the file needs more than {d} {s} entries", .{ count, noun });
+        error_module.hint(diagnostic, "raise `Limits.{s}`", .{@tagName(field)});
         parser.stopped = true;
         return error.Syntax;
     }
@@ -358,7 +373,7 @@ const Parser = struct {
             });
         }
         if (parser.declaration_count == parser.memory.declarations.len) {
-            return parser.limit("declarations", parser.memory.declarations.len);
+            return parser.limit("declarations", .names, parser.memory.declarations.len);
         }
         parser.memory.declarations[parser.declaration_count] = index;
         parser.declaration_count += 1;
@@ -475,7 +490,7 @@ const Parser = struct {
     }
 
     fn extra_pair(parser: *Parser, a: u32, b: u32) Fail!u32 {
-        if (parser.memory.extra.len - parser.extra_count < 2) return parser.limit("extra", parser.memory.extra.len);
+        if (parser.memory.extra.len - parser.extra_count < 2) return parser.limit("extra", .tree, parser.memory.extra.len);
         const index = parser.extra_count;
         parser.memory.extra[index] = a;
         parser.memory.extra[index + 1] = b;
@@ -485,7 +500,10 @@ const Parser = struct {
 
     fn enter(parser: *Parser) Fail!void {
         if (parser.depth == depth_max) {
-            return parser.fail_at(parser.peek(), .too_deep, "expressions nest more than {d} deep here", .{depth_max});
+            const token = parser.tokens[parser.peek()];
+            const diagnostic = parser.diagnostics.add(.too_deep, token.start, @max(token.len, 1), "expressions nest more than {d} deep here", .{depth_max});
+            error_module.hint(diagnostic, "the depth is fixed, not a `Limits` field; name a part of it", .{});
+            return error.Syntax;
         }
         parser.depth += 1;
     }
@@ -524,7 +542,27 @@ const Parser = struct {
             const right = try parser.unary();
             left = try parser.push(.{ .tag = .multiply, .token = operator, .a = left, .b = right, .first = first, .last = parser.last });
         }
+        const next = parser.peek();
+        if (parser.tokens[next].tag == .invalid and std.mem.eql(u8, parser.tokens[next].text(parser.source), "/")) {
+            return parser.no_division(next);
+        }
         return left;
+    }
+
+    /// `/` where an operator could go: the language has no division.
+    fn no_division(parser: *Parser, slash: u32) Fail {
+        const token = parser.tokens[slash];
+        const diagnostic = parser.diagnostics.add(.unexpected_token, token.start, 1, "there is no division", .{});
+        const after = parser.tokens[slash + 1];
+        if (after.tag == .number) {
+            const number = std.fmt.parseFloat(f64, after.text(parser.source)) catch 0;
+            if (number != 0 and std.math.isFinite(number) and std.math.isFinite(1 / number)) {
+                error_module.hint(diagnostic, "multiply by the reciprocal: `* {d}`", .{1 / number});
+                return error.Syntax;
+            }
+        }
+        error_module.hint(diagnostic, "multiply by the reciprocal, such as `* 0.5`", .{});
+        return error.Syntax;
     }
 
     fn unary(parser: *Parser) Fail!u32 {
@@ -590,11 +628,12 @@ const Parser = struct {
             .l_paren => {
                 try parser.enter();
                 defer parser.depth -= 1;
-                _ = parser.take();
+                parser.open_paren(parser.take());
                 parser.nest += 1;
                 const inner = try parser.value();
                 parser.nest -= 1;
                 _ = try parser.expect(.r_paren, "`)`");
+                parser.open_count -= 1;
                 return parser.push(.{ .tag = .paren, .token = first, .a = inner, .first = first, .last = parser.last });
             },
             .l_bracket => return parser.list(first),
@@ -603,10 +642,17 @@ const Parser = struct {
         }
     }
 
+    /// Notes the `(` at `token` as open, which `enter` bounded by `depth_max`.
+    fn open_paren(parser: *Parser, token: u32) void {
+        assert(parser.open_count < depth_max);
+        parser.open[parser.open_count] = token;
+        parser.open_count += 1;
+    }
+
     fn call(parser: *Parser, name: u32) Fail!u32 {
         try parser.enter();
         defer parser.depth -= 1;
-        _ = parser.take();
+        parser.open_paren(parser.take());
         parser.nest += 1;
         const base = parser.stack_count;
         while (parser.peek_tag() != .r_paren) {
@@ -630,6 +676,7 @@ const Parser = struct {
         }
         parser.nest -= 1;
         _ = parser.take();
+        parser.open_count -= 1;
         const run = try parser.stack_pop(base);
         return parser.push(.{ .tag = .call, .token = name, .a = run.first, .b = run.count, .first = name, .last = parser.last });
     }
@@ -666,7 +713,7 @@ const Parser = struct {
     }
 
     fn stack_push(parser: *Parser, child: u32) Fail!void {
-        if (parser.stack_count == parser.memory.stack.len) return parser.limit("stack", parser.memory.stack.len);
+        if (parser.stack_count == parser.memory.stack.len) return parser.limit("stack", .tree, parser.memory.stack.len);
         parser.memory.stack[parser.stack_count] = child;
         parser.stack_count += 1;
     }
@@ -677,7 +724,7 @@ const Parser = struct {
     fn stack_pop(parser: *Parser, base: u32) Fail!Run {
         assert(base <= parser.stack_count);
         const count = parser.stack_count - base;
-        if (parser.memory.extra.len - parser.extra_count < count) return parser.limit("extra", parser.memory.extra.len);
+        if (parser.memory.extra.len - parser.extra_count < count) return parser.limit("extra", .tree, parser.memory.extra.len);
         const first = parser.extra_count;
         @memcpy(parser.memory.extra[first..][0..count], parser.memory.stack[base..][0..count]);
         parser.extra_count += count;

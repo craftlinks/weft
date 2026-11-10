@@ -68,6 +68,13 @@ test "check reports each error with its line and hint" {
         \\module a(x) = b(x)
         \\module b(x) = a(x)
         \\e = a(1)
+        \\f = oklab(0.5, 0, 0) * oklab(0.5, 0, 0)
+        \\module p(q, q) = q
+        \\g = p(1, 2)
+        \\cue late = 2s
+        \\cue early = 1s
+        \\h = tween(from: 0, to: 1, at: early, over: 1s)
+        \\i = min(1, 2)
         \\
     ;
     try testing.expect(!try commands.check(&compiled, &writer, .{ .name = "bad.weft", .text = bad }, &.{}));
