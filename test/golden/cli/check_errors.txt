@@ -1,3 +1,7 @@
+bad.weft:8:13: error: `q` is a parameter of `p` twice
+    module p(q, q) = q
+                ^
+    hint: rename one of them
 bad.weft:2:14: error: chase has no parameter `tme`
     c = chase(n, tme: 1s)
                  ^^^
@@ -10,3 +14,14 @@ bad.weft:5:15: error: the module `a` uses itself
     module b(x) = a(x)
                   ^^^^
     hint: the cycle is a -> b -> a; break it with a parameter or a primitive
+bad.weft:7:5: error: two colours do not multiply
+    f = oklab(0.5, 0, 0) * oklab(0.5, 0, 0)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    hint: scale a colour by a number, or multiply components, such as `a.l * b.l`
+bad.weft:11:1: error: cues are in time order, and this one is before the cue above it
+    cue early = 1s
+    ^^^^^^^^^^^^^^
+    hint: move it above the cues it comes before
+bad.weft:13:5: error: there is no call `min`
+    i = min(1, 2)
+        ^^^
