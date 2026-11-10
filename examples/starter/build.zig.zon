@@ -1,0 +1,16 @@
+.{
+    .name = .starter,
+    .version = "0.0.0",
+    .fingerprint = 0x4042238b94894a89,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        .weft = .{ .path = "../.." },
+        .patchwork = .{ .path = "../../../patchwork" },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "app.zig",
+        "motion.weft",
+    },
+}
