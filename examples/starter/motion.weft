@@ -1,0 +1,14 @@
+# The starter's motion: a row of 24 dots that rise one after another, each to a height of its
+# own, in a colour of its own, and a marker that springs between four places and bounces.
+seed 3
+cue c0 = 0s
+cue c1 = 1s
+cue c2 = 2s
+cue c3 = 3s
+
+rise = lanes(24, tween(from: 0, to: 1, at: c0, over: 0.6s, ease: out, stagger: 40ms))
+own = lanes(24, map(noise(smooth, 0.4hz), -1..1, to: 0.25..1))
+height = rise * own
+tint = lanes(24, oklab(0.75, noise(smooth, 0.2hz) * 0.14, noise(smooth, 0.2hz) * 0.14))
+marker = spring([c0: 0.1, c1: 0.9, c2: 0.35, c3: 0.65], from: 0.5, time: 0.5s, overshoot: 0.3)
+hop = bounce(0..1, speed: 1.5, at: c0)

@@ -9,7 +9,9 @@
 //! 1); a pass evaluates every node at one time (section 9); a step runs the simulated nodes on the
 //! fixed step, with checkpoints (section 9); and an events query finds what happened in a range
 //! (section 11). The program side, the ops, and the builder stay in `graph.zig`, so this file reads
-//! the op structs and never builds them.
+//! the op structs and never builds them. Every value a simulated node reads or stores passes
+//! through `simulation.bounded`, so a loop that runs away saturates instead of overflowing
+//! (`simulation.zig`, section 7), and `finite` tells a client when a pure node downstream did.
 //!
 //! ## 2. TigerStyle Invariants
 //! - `eval` and `events` allocate nothing, take no lock, and are bounded, as `graph.zig`
@@ -171,6 +173,21 @@ pub const State = struct {
         assert(state.evaluated);
         assert(id.index < state.program.nodes.len);
         return node_values(state.program.nodes, state.slab, id);
+    }
+
+    /// Whether every value of the last `eval` is finite. A loop that runs away saturates at
+    /// `simulation.state_bound` (`simulation.zig`, section 7), but pure nodes downstream of it can
+    /// still overflow, so a client checks this after an `eval` of a program with a loop, and
+    /// shows a false rather than drawing it. It scans every node's values, so `eval` pays nothing.
+    pub fn finite(state: *const State) bool {
+        assert(state.evaluated);
+        for (state.program.nodes, 0..) |_, index| {
+            const id: Id = .{ .index = @intCast(index) };
+            for (node_values(state.program.nodes, state.slab, id)) |read| {
+                if (!std.math.isFinite(read)) return false;
+            }
+        }
+        return true;
     }
 
     /// The lanes and components of a node's values (`graph.zig`, sections 15 and 16).
@@ -585,7 +602,9 @@ fn report_crossing(
     // Nothing to compare at step 0, before the first update has kept an input.
     if (cache[inputs.len] == 0) return;
     const step_before: Time = .{ .flicks = time.flicks -% simulation.step.flicks };
-    for (cache[0..inputs.len], inputs, 0..) |a, b, lane| {
+    for (cache[0..inputs.len], inputs, 0..) |a, b_read, lane| {
+        // Read through the bound as the update reads it (`simulation.zig`, section 7).
+        const b = simulation.bounded(b_read);
         if (!op.crosses(a, b)) continue;
         // In [0, 1], since a subtraction rounds monotonically: 0 only falling from on the level.
         const weight = (op.level - a) / (b - a);
@@ -860,8 +879,7 @@ fn update_node(program: *const Program, slab: []f64, node: *const Node, index: u
         // It keeps no values to interpolate, only its input at this pass, for the next compare.
         const inputs = node_values(program.nodes, slab, node.op.crossing.input);
         assert(inputs.len == output_count);
-        for (inputs) |input| assert(std.math.isFinite(input));
-        @memcpy(cache[0..output_count], inputs);
+        for (cache[0..output_count], inputs) |*kept, input| kept.* = simulation.bounded(input);
         cache[output_count] = 1;
         return;
     }
@@ -880,7 +898,9 @@ fn update_node(program: *const Program, slab: []f64, node: *const Node, index: u
                 op.law };
             for (after, velocities, target) |*position, *velocity, goal| {
                 const now: motion.Kinematics = .{ .position = position.*, .velocity = velocity.* };
-                const next = motion.advance(law, now, goal, simulation.step_seconds);
+                const next = simulation.bounded_kinematics(
+                    motion.advance(law, now, simulation.bounded(goal), simulation.step_seconds),
+                );
                 position.* = next.position;
                 velocity.* = next.velocity;
             }
@@ -888,7 +908,11 @@ fn update_node(program: *const Program, slab: []f64, node: *const Node, index: u
         .delay => |op| if (op.input) |input| {
             const values = node_values(program.nodes, slab, input);
             // A one-lane feed is broadcast (`graph.zig`, section 16).
-            if (values.len == 1) @memset(after, values[0]) else @memcpy(after, values);
+            if (values.len == 1) {
+                @memset(after, simulation.bounded(values[0]));
+            } else {
+                for (after, values) |*kept, value| kept.* = simulation.bounded(value);
+            }
         },
         .follow => |*op| {
             const law: motion.Law = switch (op.law) {
@@ -921,8 +945,8 @@ fn update_node(program: *const Program, slab: []f64, node: *const Node, index: u
         .oscillator => |*op| {
             const rates = node_values(program.nodes, slab, op.rate);
             assert(rates.len == output_count);
-            for (after, own[0..output_count], rates) |*value, *phase, rate| {
-                assert(std.math.isFinite(rate));
+            for (after, own[0..output_count], rates) |*value, *phase, rate_read| {
+                const rate = simulation.bounded(rate_read);
                 const turned = phase.* + rate * simulation.step_seconds;
                 phase.* = turned - @floor(turned);
                 // A sum one ulp below a whole turn can round up to 1 after the floor.
@@ -933,7 +957,7 @@ fn update_node(program: *const Program, slab: []f64, node: *const Node, index: u
         .constant, .add, .multiply, .map_range, .wave, .tween, .noise, .motion => unreachable,
         .bounce, .cues, .crossing, .input, .recorded, .track, .pack, .pick, .lane, .spread => unreachable,
     }
-    for (after) |value| assert(std.math.isFinite(value));
+    for (after) |value| assert(@abs(value) <= simulation.state_bound);
 }
 
 /// Puts a node's simulated state at the start, step 0, as section 9 explains. Other nodes keep

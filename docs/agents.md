@@ -80,6 +80,8 @@ Rules that trip agents most often:
   the tween: `tween(from: 0, to: 1, …) * height`.
 - **There is no division.** Multiply by the reciprocal: `lane * 0.001`.
 - **A delay is a declaration of its own**, `fb = delay(0)`, fed once below with `fb <- …`.
+- **A loop with gain above 1 saturates** near 2^256 rather than crashing; values computed from it
+  can still overflow, so a client calls `state.finite()` after `eval` on a program with a loop.
 - **Lanes meet where their counts are equal or one side has one lane.** A name bound outside a
   region is shared by every lane. `lane` and `stagger:` belong inside `lanes(n, …)`.
 - **Spring and Newtonian goals are at cues**, not times: declare the cues first.

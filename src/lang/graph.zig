@@ -617,7 +617,7 @@ const Back = struct {
                 .{ .param = "count", .message = "the cues run past the last cue" }
             else
                 .{ .param = "", .message = "this runs on the fixed step from a start cue, and the file has no cue", .hint = "declare one, such as `cue c0 = 0s`" },
-            error.NotFinite => .{ .param = "", .message = "a value is infinite or not a number" },
+            error.NotFinite => .{ .param = "", .message = "a value is infinite, not a number, or past 2^256 either way where it moves" },
             error.InvalidEase => .{ .param = "ease", .message = "a cubic ease's x1 and x2 must be in [0, 1]" },
             error.ShapeMismatch => .{ .param = "", .message = "the shapes of its values do not fit together" },
             error.LaneMismatch => .{ .param = "", .message = "the lanes of its values do not fit together" },

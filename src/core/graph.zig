@@ -696,11 +696,10 @@ fn law_cache_count(params: [3]u32, spring: bool) u64 {
     return if (spring and any_param(params)) spring_cache_count else 0;
 }
 
-/// The value of parameter node `id` at this pass: its first lane.
+/// The value of parameter node `id` at this pass: its first lane, bounded as a simulated node
+/// reads every value (`simulation.zig`, section 7).
 pub fn param_value(program: *const Program, slab: []const f64, id: Id) f64 {
-    const value = node_values(program.nodes, slab, id)[0];
-    assert(std.math.isFinite(value));
-    return value;
+    return simulation.bounded(node_values(program.nodes, slab, id)[0]);
 }
 
 /// The law of a spring at this step: `fixed`, with its omega from a time node and its damping from
@@ -1134,7 +1133,9 @@ pub const Builder = struct {
         SlabCapacityExceeded,
         /// An id that no node built so far has, which also refuses a forward reference.
         UnknownNode,
-        /// A constant or a parameter that is infinite or NaN, or an input end that is NaN.
+        /// A constant or a parameter that is infinite or NaN, or an input end that is NaN. A
+        /// constant that becomes a moving value or a goal must also be within
+        /// `simulation.state_bound`, 2^256 (`simulation.zig`, section 7).
         NotFinite,
         /// Two vectors of different sizes in one op, a vector where an op reads one value, a pack
         /// of fewer than 2 or more than `components_max` inputs, or a component past the end
@@ -1377,7 +1378,7 @@ pub const Builder = struct {
     pub fn chase(builder: *Builder, source: Chase) Error!Id {
         try builder.check_scalar(source.target);
         try builder.check_start();
-        if (!std.math.isFinite(source.from)) return error.NotFinite;
+        if (!simulation.within_bound(source.from)) return error.NotFinite;
         const law = try spring_law(source.time, source.overshoot);
         const params = try builder.params_of(.{ source.time_from, source.overshoot_from, null });
         return builder.push_shaped(.{ .chase = .{
@@ -1407,7 +1408,7 @@ pub const Builder = struct {
     /// graph's seed.
     pub fn follow(builder: *Builder, source: Follow) Error!Id {
         try builder.check_start();
-        if (!std.math.isFinite(source.from)) return error.NotFinite;
+        if (!simulation.within_bound(source.from)) return error.NotFinite;
         const span = source.regions;
         if (span.count == 0) return error.UnknownRegions;
         if (span.first > builder.regions.len) return error.UnknownRegions;
@@ -1478,7 +1479,7 @@ pub const Builder = struct {
     /// A delay, open until `close` gives it its input, as section 10 explains.
     pub fn delay(builder: *Builder, initial: f64) Error!Id {
         try builder.check_start();
-        if (!std.math.isFinite(initial)) return error.NotFinite;
+        if (!simulation.within_bound(initial)) return error.NotFinite;
         const op: Op = .{ .delay = .{ .input = null, .initial = initial } };
         const id = try builder.push_shaped(op, builder.source_extent());
         builder.delays_open += 1;
@@ -1582,12 +1583,13 @@ pub const Builder = struct {
     }
 
     fn check_goals(builder: *const Builder, path: motion.Path, from: f64) Error!void {
-        if (!std.math.isFinite(from)) return error.NotFinite;
+        if (!simulation.within_bound(from)) return error.NotFinite;
         if (path.count == 0) return error.UnknownGoals;
         if (path.first > builder.goals.len) return error.UnknownGoals;
         if (path.count > builder.goals.len - path.first) return error.UnknownGoals;
         for (builder.goals[path.first..][0..path.count]) |goal| {
             if (goal.cue.index >= builder.cue_table.count) return error.UnknownCue;
+            if (!simulation.within_bound(goal.value)) return error.NotFinite;
         }
     }
 
@@ -1726,7 +1728,7 @@ fn spring_law(time: Time, overshoot: f64) Builder.Error!motion.SpringLaw {
 /// The limits of a Newtonian move, or the refusal of one of them.
 fn newtonian_limits(speed: f64, accel: f64, decel: f64) Builder.Error!motion.Limits {
     for ([_]f64{ speed, accel, decel }) |limit| {
-        if (!std.math.isFinite(limit)) return error.NotFinite;
+        if (!simulation.within_bound(limit)) return error.NotFinite;
         if (limit <= 0) return error.InvalidLimit;
     }
     return .{ .speed = speed, .accel = accel, .decel = decel };
