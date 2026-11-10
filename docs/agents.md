@@ -26,18 +26,24 @@ zig-out/bin/weft sample FILE --signal NAME               # one signal
   one's kind (`number`, `time`, `frequency`, `signal`, `cue`, `path`, …), its default, whether a
   signal may set it (`live`), and whether it takes a vector or a colour (`shaped`). Then every
   module of the standard library, with its body. Read it before writing a call.
-- **`check`** prints `ok:` with every count a `Limits` must hold (nodes, the slab, cues, goals,
-  regions, tracks) and whether the program is seekable and stepped, or each error with a line, a
+- **`check`** prints `ok:` with the program's counts and whether it is seekable and stepped,
+  then `limits: .{ … }`, the least `Limits` the file compiles with, ready to paste, and for a
+  file with a region what a lane costs of the slab. Or it prints each error with a line, a
   column, and a hint. The hint is usually the fix.
 - **`sample`** is how you see motion you cannot watch: each signal's range, its value at each time,
   and the events in the window. A signal of many lanes prints `"lanes"` and each value as an
   array of lanes; a vector prints `"components"`. Sample a short window first: `--to 2 --step 0.1`.
   The output's times are flicks (705,600,000 a second), and each event has its source node, its
-  `instance` (the lane), the `name` bound to its source, and its `value`.
-- **Which calls take lanes**: in `lanes(n, …)`, `noise`, `follow`, `shift`, and `delay` have the
-  region's lanes, and so do `wave`, `tween`, `spring`, `newtonian`, and `bounce` given a
-  `stagger:`. Every other call, `chase`, `crossing`, `map`, `oscillator` and the arithmetic
-  among them, has the most lanes of the signals it reads.
+  `instance` (the lane), the `name` bound to its source, and its `value`. With 700 events or
+  20,000 lanes, add `--events NAME` and `--lanes 0..4` to read a few.
+- **A chain or a trail** is chases of chases: `a = chase(lead, time: 0.2s)`, `b = chase(a, …)`,
+  each link a line. A `chase` takes a vector target (`describe` marks it `shaped`), so
+  `chase(vec2(x, y), time: 0.2s)` follows a point.
+- **Which calls take lanes**: `describe` gives each call's `"lanes"`. In `lanes(n, …)`, `noise`,
+  `follow`, `shift`, and `delay` have the region's lanes (`region`), and so do `wave`, `tween`,
+  `spring`, `newtonian`, and `bounce` given a `stagger:` (`stagger`). Every other call, `chase`,
+  `crossing`, `map`, `oscillator` and the arithmetic among them, has the most lanes of the
+  signals it reads (`inputs`).
 
 ## 2. Write a File
 

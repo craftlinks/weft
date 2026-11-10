@@ -27,6 +27,7 @@ const parse_golden = @embedFile("golden/cli/parse.json");
 const check_golden = @embedFile("golden/cli/check_errors.txt");
 const check_ok_golden = @embedFile("golden/cli/check_ok.txt");
 const sample_golden = @embedFile("golden/cli/sample.json");
+const sample_filtered_golden = @embedFile("golden/cli/sample_filtered.json");
 
 const sequence =
     \\seed 7
@@ -94,22 +95,22 @@ test "check summarises a file that compiles" {
 // Locks the sample output: a spring's range and its value every 0.5 s over 2 s.
 test "sample writes each signal over the window, and its events" {
     var writer: std.Io.Writer = .fixed(&output);
-    try testing.expect(try commands.sample(&compiled, &writer, .{ .name = "sequence.weft", .text = sequence }, &.{}, &.{"out"}, .{
+    try testing.expect(try commands.sample(testing.allocator, &compiled, &writer, .{ .name = "sequence.weft", .text = sequence }, &.{}, &.{"out"}, .{
         .from = 0,
         .to = 1_411_200_000,
         .step = 352_800_000,
-    }));
+    }, .{}));
     try testing.expectEqualStrings(sample_golden, writer.buffered());
 }
 
 // Locks the refusals: a name that is not a signal, and the windows the sampler cannot run.
 test "sample refuses a name that is not a signal, and a window it cannot run" {
     var writer: std.Io.Writer = .fixed(&output);
-    try testing.expect(!try commands.sample(&compiled, &writer, .{ .name = "sequence.weft", .text = sequence }, &.{}, &.{"moves"}, .{
+    try testing.expect(!try commands.sample(testing.allocator, &compiled, &writer, .{ .name = "sequence.weft", .text = sequence }, &.{}, &.{"moves"}, .{
         .from = 0,
         .to = 705_600_000,
         .step = 70_560_000,
-    }));
+    }, .{}));
     try testing.expectEqualStrings("error: \"moves\" is not a signal of the file\n", writer.buffered());
     const second = 705_600_000;
     try testing.expect(!(commands.Window{ .from = 0, .to = second, .step = 0 }).valid());
@@ -148,4 +149,89 @@ test "a client's noun is checked beside the primitives and refused by the back e
     try commands.describe(&writer, &.{}, &clients);
     const nouns = std.mem.indexOf(u8, writer.buffered(), "\"nouns\":[{\"name\":\"dot\",\"role\":\"signal\",\"op\":\"client\"").?;
     try testing.expect(nouns > 0);
+}
+
+/// A file with a library, a module, cues, goals, a region, a track, and lanes, for the least
+/// `Limits` that `check` prints (step 22).
+const least_source =
+    \\use std
+    \\cue c0 = 0s
+    \\cue c1 = 1s
+    \\track k = 0.5 in 0..1
+    \\moves = [c1: 1]
+    \\s = snappy(moves)
+    \\f = follow([0..1], by: spring(time: 0.5s), seed: 2)
+    \\b = lanes(4, noise(smooth, 1hz) * k)
+    \\module twice(x) = x * 2
+    \\t = twice(s)
+    \\
+;
+
+const least_libraries: []const weft.lang.Source = &.{.{ .name = "std", .text = weft.lang.std_library }};
+
+/// What `check` prints for `least_source`, as a `Limits`.
+const least: weft.lang.Limits = .{ .tokens = 97, .tree = 47, .names = 10, .nodes = 7, .slab = 25, .cues = 2, .goals = 1, .regions = 1, .tracks = 1, .modules = 5, .libraries = 1 };
+
+/// Whether `least_source` compiles under `limits`, each in a `Compiled` of its own.
+fn compiles_with(comptime limits: weft.lang.Limits) bool {
+    const Holder = struct {
+        var compiled: weft.lang.Compiled(limits) = undefined;
+    };
+    // A caller passes at most `limits.libraries`: fewer than the file uses fails to find one.
+    Holder.compiled.compile_with(least_libraries[0..limits.libraries], least_source) catch return false;
+    return true;
+}
+
+// Locks step 22: the limits `check` prints are the least the file compiles with. It compiles at
+// exactly them, and fails with any one of them one less.
+test "check prints the least limits a file compiles with" {
+    var buffer: [1024]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    try testing.expect(try commands.check(&compiled, &writer, .{ .name = "least.weft", .text = least_source }, least_libraries));
+    const needs = compiled.needs();
+    inline for (@typeInfo(weft.lang.Limits).@"struct".field_names) |name| {
+        if (comptime std.mem.eql(u8, name, "track_samples") or std.mem.eql(u8, name, "errors")) continue;
+        try testing.expectEqual(@field(least, name), @field(needs, name));
+    }
+    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "limits: .{ .tokens = 97, .tree = 47,") != null);
+    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "a lane costs 2 of the slab\n") != null);
+    try testing.expect(compiles_with(least));
+    inline for (@typeInfo(weft.lang.Limits).@"struct".field_names) |name| {
+        if (comptime std.mem.eql(u8, name, "track_samples") or std.mem.eql(u8, name, "errors")) continue;
+        comptime var less = least;
+        @field(less, name) -= 1;
+        errdefer std.debug.print("compiles with one less {s}\n", .{name});
+        try testing.expect(!compiles_with(less));
+    }
+}
+
+// Locks `--events` and `--lanes` (step 22): lanes 1 and 2 of a region, a signal of one lane
+// whole, and only the events of `h`, of those lanes.
+test "sample keeps the events and lanes asked for" {
+    const text =
+        \\cue c0 = 0s
+        \\h = lanes(4, bounce(0..1, speed: 2, at: c0, stagger: 100ms))
+        \\w = wave(sine, 1hz)
+        \\x = crossing(w, level: 0)
+        \\n = lanes(4, noise(smooth, 1hz))
+        \\
+    ;
+    var writer: std.Io.Writer = .fixed(&output);
+    const window: commands.Window = .{ .from = 0, .to = 705_600_000, .step = 352_800_000 };
+    try testing.expect(try commands.sample(testing.allocator, &compiled, &writer, .{ .name = "filtered.weft", .text = text }, &.{}, &.{ "h", "w" }, window, .{
+        .events = &.{"h"},
+        .lanes = .{ 1, 2 },
+    }));
+    try testing.expectEqualStrings(sample_filtered_golden, writer.buffered());
+}
+
+// Locks that the command samples a file of any slab: 40,000 lanes of followers need more than
+// the 262,144 values v0.1.0's command held.
+test "sample runs a region larger than a fixed slab" {
+    const text = "cue c0 = 0s\nf = lanes(40000, follow([0..1], by: spring(time: 0.5s), seed: 2))\n";
+    var writer: std.Io.Writer = .fixed(&output);
+    const window: commands.Window = .{ .from = 0, .to = 70_560_000, .step = 70_560_000 };
+    try testing.expect(try commands.sample(testing.allocator, &compiled, &writer, .{ .name = "big.weft", .text = text }, &.{}, &.{"f"}, window, .{ .lanes = .{ 0, 1 } }));
+    try testing.expect(compiled.program.slab_count > 1 << 18);
+    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "\"lanes\":40000,\"lane_first\":0") != null);
 }

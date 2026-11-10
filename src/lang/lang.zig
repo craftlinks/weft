@@ -297,6 +297,42 @@ pub fn Compiled(comptime limits: Limits) type {
             compiled.ok = true;
         }
 
+        /// The least `Limits` this file compiles with, as it compiled just now: every field but
+        /// `track_samples` and `errors`, which the client chooses, and which keep this `limits`'
+        /// values. `weft check` prints it, so a client can size a `Compiled` to a file (step 22).
+        pub fn needs(compiled: *const Self) Limits {
+            assert(compiled.ok);
+            const checked = &compiled.checked;
+            var result: Limits = .{
+                .track_samples = limits.track_samples,
+                .errors = limits.errors,
+                .tokens = 0,
+                .tree = 0,
+                .names = 0,
+                .nodes = @intCast(compiled.program.nodes.len),
+                .slab = compiled.program.slab_count,
+                .cues = @intCast(@max(checked.cue_times.len, compiled.tables.cues.count)),
+                .goals = @intCast(@max(@max(checked.goals.len, checked.paths.len), compiled.tables.goals.count)),
+                .regions = @intCast(@max(@max(checked.regions.len, checked.region_runs.len), compiled.tables.regions.count)),
+                .tracks = @intCast(checked.tracks.len),
+                .modules = checked.module_count,
+                .libraries = compiled.library_count,
+            };
+            // The checker's calls and expressions share `tree`, and its values take two a node.
+            result.tree = @intCast(@max(@max(checked.calls.len, checked.exprs.len), (checked.values.len + 1) / 2));
+            result.names = @intCast(@max(@max(checked.bindings.len, checked.declarations.len), checked.instances.len));
+            // A library parses under the same limits as the file.
+            var trees: [limits.libraries + 1]*const parse.Tree = undefined;
+            trees[0] = &compiled.syntax.tree;
+            for (compiled.library_syntax[0..compiled.library_count], 1..) |*syntax, at| trees[at] = &syntax.tree;
+            for (trees[0 .. compiled.library_count + 1]) |tree| {
+                result.tokens = @max(result.tokens, @as(u32, @intCast(tree.tokens.len)));
+                result.tree = @max(result.tree, @as(u32, @intCast(@max(tree.items.len, tree.extra.len))));
+                result.names = @max(result.names, @as(u32, @intCast(tree.declarations.len)));
+            }
+            return result;
+        }
+
         /// Each binding's fingerprint (section 5): its declaration's tokens, the fingerprint of
         /// every earlier binding it names, and what every declaration depends on: the seed, the
         /// start, the modules, and the libraries.

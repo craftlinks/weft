@@ -314,6 +314,8 @@ pub const Checked = struct {
     region_runs: []const Run,
     tracks: []const Track,
     instances: []const Instance,
+    /// The modules of the file and the libraries it uses.
+    module_count: u32 = 0,
     /// True when no error was found, so a back end may build.
     ok: bool,
 
@@ -1508,10 +1510,11 @@ const Checker = struct {
             }
         }
         var lanes: u32 = 1;
-        switch (entry.op) {
-            .lanes => return @intCast(values[0].integer),
-            .noise, .follow, .shift, .delay => return checker.region orelse 1,
-            .wave, .tween, .spring, .newtonian, .bounce => {
+        // The rule `describe` prints for the call, so the two cannot differ.
+        switch (entry.lane_rule()) {
+            .makes => return @intCast(values[0].integer),
+            .region => return checker.region orelse 1,
+            .stagger => {
                 const at = entry.param("stagger").?;
                 if (values[at].time != 0) lanes = checker.region orelse {
                     const diagnostic = checker.fail(items[at], .wrong_lanes, "`stagger:` spreads lanes in time, so it is used inside `lanes(n, …)`", .{});
@@ -1519,7 +1522,7 @@ const Checker = struct {
                     return error.Checked;
                 };
             },
-            else => {},
+            .inputs, .one => {},
         }
         for (entry.params, values) |param, value| {
             if (value != .signal or param.live) continue;
@@ -1529,9 +1532,8 @@ const Checker = struct {
     }
 
     /// The shape of `left` and `right` together (section 8): theirs when equal, the other's when
-    /// one is a number; a colour and a vector, or two vectors of different sizes, are refused.
-    /// The shape of a sum or a product: equal shapes, or a number with anything. Two colours do
-    /// not multiply (section 8).
+    /// one is a number; a colour and a vector, two vectors of different sizes, and a product of
+    /// two colours are refused.
     fn combine(checker: *Checker, index: u32, left: u32, right: u32, product: bool) Fail!Shape {
         const a = checker.shape_of(left);
         const b = checker.shape_of(right);
@@ -2248,6 +2250,7 @@ pub fn check(tree: *const Tree, memory: Memory, diagnostics: *Diagnostics) Check
         .region_runs = memory.region_runs[0..checker.run_count],
         .tracks = memory.tracks[0..checker.track_count],
         .instances = memory.instances[0..checker.instance_count],
+        .module_count = checker.module_count,
         .ok = diagnostics.total() == before,
     };
 }
