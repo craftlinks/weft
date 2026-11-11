@@ -254,18 +254,11 @@ test "the checker's holes are closed, each with one error" {
             .span = "cue b = 1s",
         },
         .{
-            .source = "x = wave(sine, 1hz) / 4\n",
-            .code = .unexpected_token,
-            .message = "there is no division",
-            .hint = "multiply by the reciprocal: `* 0.25`",
-            .span = "/",
-        },
-        .{
-            .source = "x = wave(sine, 1hz) / lane\n",
-            .code = .unexpected_token,
-            .message = "there is no division",
-            .hint = "multiply by the reciprocal, such as `* 0.5`",
-            .span = "/",
+            .source = "x = wave(sine, 1hz) / wave(sine, 2hz)\n",
+            .code = .not_live,
+            .message = "a divisor is a number, fixed when the program is built",
+            .hint = "to scale by a signal, multiply by one",
+            .span = "wave(sine, 2hz)",
         },
         .{
             .source = "x = min(1, 2)\n",

@@ -94,7 +94,7 @@ fn class_of(line: []const u8, start: u32, end: u32, tag: token.Tag) Class {
             break :name if (after < line.len and line[after] == '(') .call else .name;
         },
         .number, .time, .frequency, .string => .number,
-        .equal, .feed, .plus, .minus, .star, .dot_dot => .operator,
+        .equal, .feed, .plus, .minus, .star, .slash, .dot_dot => .operator,
         .comma, .colon, .dot, .l_paren, .r_paren, .l_bracket, .r_bracket => .punctuation,
         .comment => .comment,
         .bad_unit, .bad_string, .invalid => .invalid,

@@ -27,7 +27,7 @@
 //! param   = name [ ":" value ]
 //! value   = expr [ ".." expr ]
 //! expr    = term { ("+" | "-") term }
-//! term    = unary { "*" unary }
+//! term    = unary { ("*" | "/") unary }
 //! unary   = "-" unary | postfix
 //! postfix = primary { "." name | "[" number "]" }
 //! primary = literal | string | name | name "(" [ arg { "," arg } [","] ] ")" | "(" expr ")"
@@ -36,7 +36,9 @@
 //! item    = value [ ":" expr ]
 //! ```
 //! A `-` right before a literal makes a negative literal, not a negation, so `-0.8` is one
-//! constant, as the builder's `constant(-0.8)` is.
+//! constant, as the builder's `constant(-0.8)` is. `/` binds as `*` does, left to right, so
+//! `x / 3 / 2` is `(x / 3) / 2`; that a divisor is a number is the checker's rule, not the
+//! grammar's.
 //!
 //! ## 4. Recovery
 //! A syntax error adds a diagnostic and skips to the next line that starts at column 1, so one
@@ -96,6 +98,8 @@ pub const Tag = enum(u8) {
     add,
     subtract,
     multiply,
+    /// a: the dividend; b: the divisor, a number the checker knows (`check.zig`, section 3).
+    divide,
     /// a: the operand.
     negate,
     /// token: the output's name; a: the base.
@@ -537,32 +541,16 @@ const Parser = struct {
     fn term(parser: *Parser) Fail!u32 {
         const first = parser.peek();
         var left = try parser.unary();
-        while (parser.peek_tag() == .star) {
+        while (true) {
+            const tag: Tag = switch (parser.peek_tag()) {
+                .star => .multiply,
+                .slash => .divide,
+                else => return left,
+            };
             const operator = parser.take();
             const right = try parser.unary();
-            left = try parser.push(.{ .tag = .multiply, .token = operator, .a = left, .b = right, .first = first, .last = parser.last });
+            left = try parser.push(.{ .tag = tag, .token = operator, .a = left, .b = right, .first = first, .last = parser.last });
         }
-        const next = parser.peek();
-        if (parser.tokens[next].tag == .invalid and std.mem.eql(u8, parser.tokens[next].text(parser.source), "/")) {
-            return parser.no_division(next);
-        }
-        return left;
-    }
-
-    /// `/` where an operator could go: the language has no division.
-    fn no_division(parser: *Parser, slash: u32) Fail {
-        const token = parser.tokens[slash];
-        const diagnostic = parser.diagnostics.add(.unexpected_token, token.start, 1, "there is no division", .{});
-        const after = parser.tokens[slash + 1];
-        if (after.tag == .number) {
-            const number = std.fmt.parseFloat(f64, after.text(parser.source)) catch 0;
-            if (number != 0 and std.math.isFinite(number) and std.math.isFinite(1 / number)) {
-                error_module.hint(diagnostic, "multiply by the reciprocal: `* {d}`", .{1 / number});
-                return error.Syntax;
-            }
-        }
-        error_module.hint(diagnostic, "multiply by the reciprocal, such as `* 0.5`", .{});
-        return error.Syntax;
     }
 
     fn unary(parser: *Parser) Fail!u32 {
@@ -812,6 +800,26 @@ test "lists, goals, outputs, and elements" {
     const regions = tree.item(tree.children(follow)[0]);
     try testing.expectEqual(Tag.list, regions.tag);
     try testing.expectEqual(Tag.output, tree.item(tree.item(tree.declarations[2]).a).tag);
+}
+
+// Locks `/` in section 3 (step 30): it binds as `*`, left to right, and below `+`.
+test "a quotient is a term, left to right" {
+    var fixture: Fixture = undefined;
+    const tree = fixture.run("x = a / 3 / 2 * b + c / -4\n");
+    try testing.expectEqual(@as(u32, 0), fixture.diagnostics.total());
+    // x = (((a / 3) / 2) * b) + (c / -4)
+    const sum = tree.item(tree.item(tree.declarations[0]).a);
+    try testing.expectEqual(Tag.add, sum.tag);
+    const product = tree.item(sum.a);
+    try testing.expectEqual(Tag.multiply, product.tag);
+    const outer = tree.item(product.a);
+    try testing.expectEqual(Tag.divide, outer.tag);
+    try testing.expectEqualStrings("2", tree.text(outer.b));
+    try testing.expectEqual(Tag.divide, tree.item(outer.a).tag);
+    try testing.expectEqualStrings("3", tree.text(tree.item(outer.a).b));
+    const right = tree.item(sum.b);
+    try testing.expectEqual(Tag.divide, right.tag);
+    try testing.expectEqual(@as(u32, 1), tree.item(right.b).a);
 }
 
 // Locks recovery (section 4): each bad line gives one error, and the good lines still parse.

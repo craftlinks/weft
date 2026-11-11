@@ -26,6 +26,14 @@
 //! `a * -1`, and `a - 2` is `a + -2`: negation is exact, so each gives the bits of a subtraction.
 //! Two constants fold here, in f64, which is the arithmetic their nodes would do.
 //!
+//! `a / c` is `a * (1 / c)` (step 30): a product with a constant, so there is no divide op, the
+//! range rule is the product's, and it divides per component and per lane as a product does. The
+//! divisor is a number known when the program is built: anything that folds to a constant here,
+//! such as `4`, `-4`, or a module's parameter bound to one. A signal is refused, since its range
+//! may hold 0, and so is a time; 0, or a number whose reciprocal is not finite, is out of range.
+//! The product is the quotient exactly when `c` is a power of two, and otherwise within an ulp of
+//! it, the same bits on every target. Two numbers fold to their quotient itself.
+//!
 //! ## 4. Times
 //! A time literal is a whole number of flicks, worked out in integers from its digits: seconds
 //! are exact to 5 decimal places and milliseconds to 2, since 705,600,000 = 2^9 3^2 5^5 7^2.
@@ -928,6 +936,13 @@ const Checker = struct {
                 const negated = try checker.push_expr(.{ .tag = .multiply, .a = right, .b = minus_one, .item = it.b, .shape = checker.shape_of(right), .lanes = checker.lanes_of(right) });
                 return checker.push_expr(.{ .tag = .add, .a = left, .b = negated, .item = index, .shape = shape, .lanes = lanes });
             },
+            .divide => {
+                const left = try checker.signal(it.a);
+                const by = try checker.divisor(it.b);
+                if (checker.is_constant(left)) |a| return checker.constant(a / by, index);
+                const reciprocal = try checker.constant(1 / by, it.b);
+                return checker.push_expr(.{ .tag = .multiply, .a = left, .b = reciprocal, .item = index, .shape = checker.shape_of(left), .lanes = checker.lanes_of(left) });
+            },
             .negate => {
                 const operand = try checker.signal(it.a);
                 if (checker.is_constant(operand)) |a| return checker.constant(-a, index);
@@ -941,6 +956,60 @@ const Checker = struct {
             },
             else => unreachable,
         }
+    }
+
+    /// The number `index` divides by (section 3): a constant with a finite reciprocal.
+    fn divisor(checker: *Checker, index: u32) Fail!f64 {
+        assert(index < checker.tree.items.len);
+        assert(checker.frame < checker.frame_count);
+        if (checker.unit_literal(index)) |kind| {
+            const diagnostic = checker.fail(index, .wrong_type, "a divisor is a number, and this is a {s}", .{kind});
+            if (!std.mem.eql(u8, kind, "string")) error_module.hint(diagnostic, "drop the unit", .{});
+            return error.Checked;
+        }
+        const expr = try checker.signal(index);
+        const shape = checker.shape_of(expr);
+        if (!shape.eql(Shape.scalar)) {
+            const diagnostic = checker.fail(index, .wrong_shape, "a divisor is a number, and this is {s}", .{shape.noun()});
+            error_module.hint(diagnostic, "divide by a number, or take a component, such as `.{s}`", .{shape.component_names()[0]});
+            return error.Checked;
+        }
+        const number = checker.is_constant(expr) orelse {
+            const diagnostic = checker.fail(index, .not_live, "a divisor is a number, fixed when the program is built", .{});
+            error_module.hint(diagnostic, "to scale by a signal, multiply by one", .{});
+            return error.Checked;
+        };
+        if (number == 0) {
+            const diagnostic = checker.fail(index, .out_of_range, "there is no division by 0", .{});
+            error_module.hint(diagnostic, "a divisor is a number other than 0", .{});
+            return error.Checked;
+        }
+        if (!std.math.isFinite(1 / number)) {
+            const diagnostic = checker.fail(index, .out_of_range, "1 / {e} is past what a number holds", .{number});
+            error_module.hint(diagnostic, "divide by a number further from 0", .{});
+            return error.Checked;
+        }
+        assert(std.math.isFinite(number));
+        return number;
+    }
+
+    /// The kind of literal with a unit, or string, that `index` is, in parentheses or through a
+    /// parameter bound to one, so a divisor's error names it rather than calling it a signal.
+    fn unit_literal(checker: *Checker, index: u32) ?[]const u8 {
+        assert(index < checker.tree.items.len);
+        assert(checker.frame < checker.frame_count);
+        if (checker.bound(index)) |arg| {
+            const saved = checker.frame;
+            checker.focus(arg.frame);
+            defer checker.focus(saved);
+            return checker.unit_literal(arg.item);
+        }
+        const it = checker.item(index);
+        if (it.tag == .paren) return checker.unit_literal(it.a);
+        if (it.tag != .literal) return null;
+        const tag = checker.tree.tokens[it.token].tag;
+        if (tag == .number) return null;
+        return literal_kind(tag);
     }
 
     /// `base.name`: an output of a call, or of a name bound to one (section 3). `index` is the
@@ -2267,7 +2336,7 @@ fn item_kind(tag: parse_module.Tag) []const u8 {
         .list => "a list",
         .goal => "a goal",
         .range => "a range",
-        .add, .subtract, .multiply, .negate, .paren => "arithmetic",
+        .add, .subtract, .multiply, .divide, .negate, .paren => "arithmetic",
         .output => "an output",
         .element => "a cue of a series",
         else => "a declaration",

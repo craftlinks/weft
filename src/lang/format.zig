@@ -4,7 +4,7 @@
 //!
 //! ## 1. The Format
 //! - One declaration a line, and at most one blank line between two; none at the start or end.
-//! - `name = value`, `a + b`, `-x`, `name: value`, `[a, b]`, `a..b`, `f(a, b)`.
+//! - `name = value`, `a + b`, `a / b`, `-x`, `name: value`, `[a, b]`, `a..b`, `f(a, b)`.
 //! - Nothing is lined up, so renaming one line never moves another.
 //! - A call or a list whose last item has a trailing comma, or with a comment among its items, is
 //!   written one item a line, four spaces in, each with its comma. Any other stays on one line.
@@ -171,12 +171,13 @@ const Formatter = struct {
                 try formatter.write("..");
                 try formatter.value(item.b, indent, .signal);
             },
-            .add, .subtract, .multiply => {
+            .add, .subtract, .multiply, .divide => {
                 try formatter.value(item.a, indent, .signal);
                 try formatter.write(switch (item.tag) {
                     .add => " + ",
                     .subtract => " - ",
-                    else => " * ",
+                    .multiply => " * ",
+                    else => " / ",
                 });
                 try formatter.value(item.b, indent, .signal);
             },
@@ -454,6 +455,16 @@ test "a messy file formats to the canonical one" {
         \\
     , formatted);
     var again: [1024]u8 = undefined;
+    try testing.expectEqualStrings(formatted, try format_text(formatted, &again));
+}
+
+// Locks `/` in section 1 (step 30): `a/b` formats to `a / b`, a negative divisor keeps its sign
+// on the literal, and the result formats to itself.
+test "a quotient formats with a space on each side" {
+    var out: [256]u8 = undefined;
+    const formatted = try format_text("x = a/b\ny = (a+1)/-4/2*c\n", &out);
+    try testing.expectEqualStrings("x = a / b\ny = (a + 1) / -4 / 2 * c\n", formatted);
+    var again: [256]u8 = undefined;
     try testing.expectEqualStrings(formatted, try format_text(formatted, &again));
 }
 

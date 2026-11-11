@@ -54,6 +54,7 @@ pub const Tag = enum(u8) {
     plus,
     minus,
     star,
+    slash,
     l_paren,
     r_paren,
     l_bracket,
@@ -157,6 +158,7 @@ pub fn next(source: []const u8, start: u32) Token {
         ':' => .colon,
         '+' => .plus,
         '*' => .star,
+        '/' => .slash,
         '(' => .l_paren,
         ')' => .r_paren,
         '[' => .l_bracket,
@@ -258,12 +260,17 @@ test "a literal's unit decides its tag" {
     ));
 }
 
-// Locks the punctuation, a comment that stops at the newline, and an invalid byte.
+// Locks the punctuation, `/` included (step 30), a comment that stops at the newline, and an
+// invalid byte.
 test "punctuation, comments, and invalid bytes" {
     var tags: [64]Tag = undefined;
     try testing.expectEqualSlices(Tag, &.{
         .name, .feed, .name, .l_paren, .r_paren, .comment, .newline, .invalid, .name, .eof,
     }, tags_of("fb <- f() # note\n$x", &tags));
+    try testing.expectEqualSlices(Tag, &.{ .name, .slash, .number, .star, .minus, .number, .eof }, tags_of(
+        "x/4*-2",
+        &tags,
+    ));
     var tokens: [8]Token = undefined;
     const result = tokenize("a # é", &tokens);
     try testing.expectEqualStrings("# é", tokens[1].text("a # é"));
