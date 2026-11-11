@@ -358,7 +358,8 @@ const Back = struct {
                         const source: graph.Tween = .{
                             .from = v[0].component(k),
                             .to = v[1].component(k),
-                            .start = .{ .index = v[2].cue },
+                            .start = cue_start(v[2]),
+                            .cue_by_lane = v[2] == .cue_by_lane,
                             .duration = .{ .flicks = v[3].time },
                             .ease = switch (v[4]) {
                                 .cubic => |points| .{ .x1 = points[0], .y1 = points[1], .x2 = points[2], .y2 = points[3] },
@@ -375,7 +376,8 @@ const Back = struct {
                 const source: graph.Tween = .{
                     .from = v[0].number,
                     .to = v[1].number,
-                    .start = .{ .index = v[2].cue },
+                    .start = cue_start(v[2]),
+                    .cue_by_lane = v[2] == .cue_by_lane,
                     .duration = .{ .flicks = v[3].time },
                     .ease = switch (v[4]) {
                         .cubic => |points| .{ .x1 = points[0], .y1 = points[1], .x2 = points[2], .y2 = points[3] },
@@ -536,8 +538,9 @@ const Back = struct {
                     .low = v[0].number_range[0],
                     .high = v[0].number_range[1],
                     .speed = v[1].number,
-                    .start = .{ .index = v[2].cue },
+                    .start = cue_start(v[2]),
                     .stagger = .{ .flicks = v[3].time },
+                    .cue_by_lane = v[2] == .cue_by_lane,
                 };
                 const ids = builder.bounce(source) catch |err| return back.refuse(err, item, call);
                 return .{ .first = ids.position, .second = ids.velocity };
@@ -680,6 +683,16 @@ fn valid_overshoot(value: f64) bool {
 
 fn valid_limit(value: f64) bool {
     return value > 0 and std.math.isFinite(value);
+}
+
+/// The cue a `tween`'s or a `bounce`'s `at` names: a cue, or the first of a series chosen by lane,
+/// which the op's `cue_by_lane` then reads one cue a lane after (step 28).
+fn cue_start(value: check_module.Value) Cue {
+    return switch (value) {
+        .cue => |index| .{ .index = index },
+        .cue_by_lane => |index| .{ .index = index },
+        else => unreachable,
+    };
 }
 
 fn ease_of(word: u8) Ease {

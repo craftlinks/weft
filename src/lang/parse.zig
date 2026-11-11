@@ -29,14 +29,16 @@
 //! expr    = term { ("+" | "-") term }
 //! term    = unary { ("*" | "/") unary }
 //! unary   = "-" unary | postfix
-//! postfix = primary { "." name | "[" number "]" }
+//! postfix = primary { "." name | "[" ( number | name ) "]" }
 //! primary = literal | string | name | name "(" [ arg { "," arg } [","] ] ")" | "(" expr ")"
 //!         | "[" [ item { "," item } [","] ] "]"
 //! arg     = [ name ":" ] value
 //! item    = value [ ":" expr ]
 //! ```
 //! A `-` right before a literal makes a negative literal, not a negation, so `-0.8` is one
-//! constant, as the builder's `constant(-0.8)` is. `/` binds as `*` does, left to right, so
+//! constant, as the builder's `constant(-0.8)` is. An index is a number, or a name, which the
+//! checker allows only as `lane` (step 28); an expression in brackets is refused here, with a hint.
+//! A series written as a list, `cue title = [1s, 1080ms]`, is a `cue` whose time is a `list`. `/` binds as `*` does, left to right, so
 //! `x / 3 / 2` is `(x / 3) / 2`; that a divisor is a number is the checker's rule, not the
 //! grammar's.
 //!
@@ -104,7 +106,7 @@ pub const Tag = enum(u8) {
     negate,
     /// token: the output's name; a: the base.
     output,
-    /// token: the index; a: the base.
+    /// token: the index, a number or a name; a: the base.
     element,
     /// a: the inner expression.
     paren,
@@ -310,6 +312,16 @@ const Parser = struct {
         if (code == .bad_unit) {
             error_module.hint(diagnostic, "a unit is s, ms, or hz, right after the number", .{});
         }
+        return error.Syntax;
+    }
+
+    /// An expression in brackets, such as `beat[lane + 1]`: an index is one number or `lane`.
+    fn fail_index(parser: *Parser, index: u32) Fail {
+        const token = parser.tokens[index];
+        const diagnostic = parser.diagnostics.add(.unexpected_token, token.start, @max(token.len, 1), "an index is a whole number, or `lane` inside a region, found {s}", .{
+            describe(token, parser.source),
+        });
+        error_module.hint(diagnostic, "declare the cues the lanes want, `cue NAME = [1s, 1200ms]`, then write `NAME[lane]`", .{});
         return error.Syntax;
     }
 
@@ -586,9 +598,10 @@ const Parser = struct {
                     if (before == 0 or parser.source[before - 1] == ' ') return base;
                     _ = parser.take();
                     parser.nest += 1;
-                    const index = try parser.expect(.number, "an index");
+                    const index = if (parser.peek_tag() == .name) parser.take() else try parser.expect(.number, "an index");
                     parser.nest -= 1;
-                    _ = try parser.expect(.r_bracket, "`]`");
+                    if (parser.peek_tag() != .r_bracket) return parser.fail_index(parser.peek());
+                    _ = parser.take();
                     base = try parser.push(.{ .tag = .element, .token = index, .a = base, .first = first, .last = parser.last });
                 },
                 else => return base,

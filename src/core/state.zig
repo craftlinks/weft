@@ -38,6 +38,7 @@ const graph = @import("graph.zig");
 const elementary = @import("elementary.zig");
 const BounceNode = graph.BounceNode;
 const Crossing = graph.Crossing;
+const Cue = @import("cue.zig").Cue;
 const CueSpan = graph.CueSpan;
 const Id = graph.Id;
 const MapRange = graph.MapRange;
@@ -49,6 +50,7 @@ const follower_slot_arrived_goal = graph.follower_slot_arrived_goal;
 const follower_slots = graph.follower_slots;
 const law_cache_reset = graph.law_cache_reset;
 const lane_seed = graph.lane_seed;
+const lane_cue = graph.lane_cue;
 const lane_time = graph.lane_time;
 const Extent = graph.Extent;
 const newtonian_limits_at = graph.newtonian_limits_at;
@@ -632,10 +634,11 @@ fn contains(sources: []const Id, id: Id) bool {
 
 /// The hits of one lane of a bounce's position in the range: at each wall, the velocity just
 /// before it, `+speed` at `high` and `-speed` at `low`. Once the buffer is full, it counts the
-/// rest. Lane g's start is `g * stagger` after the cue (`graph.zig`, section 16).
+/// rest. Lane g's start is `g * stagger` after its cue (`graph.zig`, section 16), which is cue
+/// `start + g` when it is chosen by lane.
 fn events_bounce(program: *const Program, op: *const BounceNode, id: Id, lane: u32, report: *Found) void {
     assert(op.output == .position);
-    const start_time = lane_time(program.cues.at(op.start), negated(op.stagger), lane);
+    const start_time = lane_start(program, op.start, op.cue_by_lane, op.stagger, lane);
     const first = op.hits_before(report.t0, start_time) + 1;
     const last = op.hits_before(report.t1, start_time);
     var k = first;
@@ -832,6 +835,13 @@ fn family_lane(program: *const Program, node: *const Node, lane: usize) u32 {
     return program.lane_first + @as(u32, @intCast(lane));
 }
 
+/// When lane `lane` of a family of a cued op starts: its cue, `start` or `lane_cue(start, lane)`
+/// when chosen by lane, moved `lane * stagger` later.
+fn lane_start(program: *const Program, start: Cue, cue_by_lane: bool, stagger: Time, lane: u32) Time {
+    const cue = if (cue_by_lane) lane_cue(start, lane) else start;
+    return lane_time(program.cues.at(cue), negated(stagger), lane);
+}
+
 /// `time` negated, so `lane_time` moves later instead of earlier.
 fn negated(time: Time) Time {
     return .{ .flicks = 0 -% time.flicks };
@@ -931,10 +941,10 @@ fn eval_node(
             const previous: ?[]const f64 = if (tween.previous) |id| node_values(nodes, slab, id) else null;
             const cue_time = program.cues.at(tween.start);
             for (out, 0..) |*value, lane| {
-                const start_time = if (tween.stagger.flicks == 0)
+                const start_time = if (tween.stagger.flicks == 0 and !tween.cue_by_lane)
                     cue_time
                 else
-                    lane_time(cue_time, negated(tween.stagger), first + lane);
+                    lane_start(program, tween.start, tween.cue_by_lane, tween.stagger, @intCast(first + lane));
                 if (time.flicks >= start_time.flicks) {
                     value.* = tween.value_after(time, start_time);
                 } else if (previous) |values| {
@@ -956,7 +966,7 @@ fn eval_node(
                 return;
             }
             for (out, first..) |*value, lane| {
-                value.* = op.sample(time, lane_time(cue_time, negated(op.stagger), lane));
+                value.* = op.sample(time, lane_start(program, op.start, op.cue_by_lane, op.stagger, @intCast(lane)));
             }
         },
         .crossing => |*op| {

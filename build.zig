@@ -83,6 +83,12 @@ pub fn build(b: *std.Build) void {
             },
         }),
         b.createModule(.{
+            .root_source_file = b.path("test/by_lane.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "weft", .module = weft }},
+        }),
+        b.createModule(.{
             .root_source_file = b.path("test/sources.zig"),
             .target = target,
             .optimize = optimize,

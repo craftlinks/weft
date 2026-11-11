@@ -130,6 +130,18 @@
 //! one, and regions do not nest; each is `wrong_lanes`, as are `lane` and `stagger:` outside a
 //! region. A module called in a region expands in it, and a region of delays is fed as one delay.
 //!
+//! ## 9a. A Cue for Each Lane
+//! `series[lane]` (step 28) is a cue for each lane: lane g of the region reads the series' cue g.
+//! `cue_ref` allows it only where the parameter's `by_lane` says, the `at` of the table's `tween`
+//! and `bounce`, and only inside a region whose lane count the series covers; the value is then
+//! `cue_by_lane`, the series' first cue, and the call takes the region's lanes, as a stagger
+//! gives. Everywhere else, a path's goals, `cues(…)`, a cue's declaration, and a client's noun,
+//! it is refused with a hint that names where it belongs, as are a name other than `lane` in
+//! brackets and `stagger:` beside it; an expression in brackets is the parser's refusal. Through a
+//! module's parameter it is checked where it is used, in the caller's frame, so a module of a
+//! tween works by lane unchanged. A series written as a list, `cue title = [1s, 1080ms]`, adds
+//! each item as a cue in time order, so a series need not be evenly spaced.
+//!
 //! ## 7. TigerStyle Invariants
 //! - Every array is the caller's; a full one is an error naming its limit, and checking stops.
 //! - Names are found by a linear search over at most `Limits.names`, at compile time only.
@@ -208,6 +220,9 @@ pub const Value = union(enum) {
     /// A cubic Bezier's control points.
     cubic: [4]f64,
     cue: u32,
+    /// The first cue of a series whose cue g starts lane g of the region, `series[lane]` in the
+    /// `at` of a `tween` or a `bounce` (section 9a).
+    cue_by_lane: u32,
     /// The cues of a `cues` call's first argument.
     span: Span,
     number_range: [2]f64,
@@ -284,6 +299,9 @@ pub const Expr = struct {
 };
 
 pub const Goal = struct { cue: u32, value: f64 };
+
+/// A cue found by `cue_ref`: its index, or a series' first cue chosen by lane (section 9a).
+const CueRef = struct { index: u32, by_lane: bool = false };
 pub const Region = struct { low: f64, high: f64 };
 
 /// A path's goals or a list of regions. A declared one is a run of its own, even when an equal
@@ -654,6 +672,7 @@ const Checker = struct {
                 checker.start_item = index;
             },
             .cue => {
+                if (checker.item(it.a).tag == .list) return checker.cue_list(index);
                 const time = try checker.cue_time(it.a);
                 const cue = try checker.add_cue(index, time);
                 _ = try checker.declare(index, .{ .name = name, .item = index, .kind = .cue, .index = cue });
@@ -726,6 +745,39 @@ const Checker = struct {
             },
             else => return checker.literal_time(index),
         }
+    }
+
+    /// A series written as a list (step 28): each item a cue's time as `cue_time` reads it, in
+    /// time order, bound as a series of as many cues.
+    fn cue_list(checker: *Checker, index: u32) Fail!void {
+        const it = checker.item(index);
+        const children = checker.tree.children(it.a);
+        if (children.len == 0) {
+            const diagnostic = checker.fail(it.a, .bad_series, "a series written as a list has at least one cue", .{});
+            error_module.hint(diagnostic, "for example `cue title = [1s, 1080ms, 1560ms]`", .{});
+            return error.Checked;
+        }
+        if (children.len > checker.memory.cue_times.len - checker.cue_count) {
+            return checker.limit(index, "cues", .cues, checker.memory.cue_times.len);
+        }
+        const first = checker.cue_count;
+        for (children, 0..) |child, at| {
+            const time = try checker.cue_time(child);
+            if (at > 0 and time < checker.memory.cue_times[checker.cue_count - 1]) {
+                const diagnostic = checker.fail(child, .cue_out_of_order, "a series' cues are in time order, and this one is before the one before it", .{});
+                error_module.hint(diagnostic, "write the list in time order", .{});
+                return error.Checked;
+            }
+            _ = try checker.add_cue(child, time);
+        }
+        assert(checker.cue_count - first == children.len);
+        _ = try checker.declare(index, .{
+            .name = checker.tree.token_text(it.token),
+            .item = index,
+            .kind = .series,
+            .index = first,
+            .count = @intCast(children.len),
+        });
     }
 
     fn cue_series(checker: *Checker, index: u32) Fail!void {
@@ -1776,7 +1828,16 @@ const Checker = struct {
             .region => return checker.region orelse 1,
             .stagger => {
                 const at = entry.param("stagger").?;
-                if (values[at].time != 0) lanes = checker.region orelse {
+                const cue_at = entry.param("at");
+                if (cue_at != null and values[cue_at.?] == .cue_by_lane) {
+                    if (values[at].time != 0) {
+                        const diagnostic = checker.fail(items[at], .wrong_lanes, "`stagger:` and a cue chosen by lane both set when each lane starts", .{});
+                        error_module.hint(diagnostic, "each lane already starts at its own cue; drop `stagger:`", .{});
+                        return error.Checked;
+                    }
+                    // `cue_ref` found the region.
+                    lanes = checker.region.?;
+                } else if (values[at].time != 0) lanes = checker.region orelse {
                     const diagnostic = checker.fail(items[at], .wrong_lanes, "`stagger:` spreads lanes in time, so it is used inside `lanes(n, …)`", .{});
                     error_module.hint(diagnostic, "wrap the call in a region, or drop `stagger:`", .{});
                     return error.Checked;
@@ -2014,7 +2075,14 @@ const Checker = struct {
                 if (!param.shaped) try checker.expect_scalar(index, expr, param.name);
                 return .{ .signal = expr };
             },
-            .cue => return .{ .cue = try checker.cue_of(index) },
+            .cue => {
+                // Only the table's own `tween` and `bounce`: a client's entry never gets a cue by
+                // lane, whatever its parameter says, so it never reads `.cue_by_lane`.
+                const by_lane = param.by_lane and (entry.op == .tween or entry.op == .bounce);
+                const found = try checker.cue_ref(index, by_lane);
+                if (found.by_lane) return .{ .cue_by_lane = found.index };
+                return .{ .cue = found.index };
+            },
             .cues => {
                 if (it.tag == .name) {
                     if (checker.find(checker.text(index))) |found| {
@@ -2154,11 +2222,19 @@ const Checker = struct {
 
     /// A cue: a cue's name, or an element of a series.
     fn cue_of(checker: *Checker, index: u32) Fail!u32 {
+        const found = try checker.cue_ref(index, false);
+        assert(!found.by_lane);
+        return found.index;
+    }
+
+    /// A cue as `cue_of` reads it, or, where `by_lane` allows it, `series[lane]` inside a region:
+    /// the series' first cue, which lane g of the region reads g cues after (section 9a).
+    fn cue_ref(checker: *Checker, index: u32, by_lane: bool) Fail!CueRef {
         if (checker.bound(index)) |arg| {
             const saved = checker.frame;
             checker.focus(arg.frame);
             defer checker.focus(saved);
-            return checker.cue_of(arg.item);
+            return checker.cue_ref(arg.item, by_lane);
         }
         const it = checker.item(index);
         if (it.tag == .element) {
@@ -2175,12 +2251,13 @@ const Checker = struct {
                 _ = checker.fail(index, .wrong_type, "`{s}` is a {s}, not a series", .{ name, kind_name(binding.kind) });
                 return error.Checked;
             }
+            if (checker.tree.tokens[it.token].tag == .name) return checker.lane_element(index, name, binding, by_lane);
             const element = std.fmt.parseInt(u32, checker.text(index), 10) catch binding.count;
             if (element >= binding.count) {
                 _ = checker.fail(index, .out_of_range, "`{s}` has {d} cues, from [0] to [{d}]", .{ name, binding.count, binding.count - 1 });
                 return error.Checked;
             }
-            return binding.index + element;
+            return .{ .index = binding.index + element };
         }
         if (it.tag != .name) {
             const diagnostic = checker.fail(index, .wrong_type, "expected a cue, found {s}", .{item_kind(it.tag)});
@@ -2195,7 +2272,35 @@ const Checker = struct {
             if (binding.kind == .series) error_module.hint(diagnostic, "name one of its cues, such as `{s}[0]`", .{name});
             return error.Checked;
         }
-        return binding.index;
+        return .{ .index = binding.index };
+    }
+
+    /// `series[NAME]` (step 28): only `lane`, only where the parameter takes a cue by lane, only
+    /// inside a region, and only of a series with a cue for every lane.
+    fn lane_element(checker: *Checker, index: u32, name: []const u8, binding: Binding, by_lane: bool) Fail!CueRef {
+        const it = checker.item(index);
+        const lane_name = checker.tree.token_text(it.token);
+        if (!std.mem.eql(u8, lane_name, "lane")) {
+            const diagnostic = checker.fail(index, .wrong_type, "`{s}` is not an index", .{lane_name});
+            error_module.hint(diagnostic, "an index is a whole number, or `lane` inside a region", .{});
+            return error.Checked;
+        }
+        if (!by_lane) {
+            const diagnostic = checker.fail(index, .wrong_lanes, "`{s}[lane]` is a cue for each lane, which this place does not take", .{name});
+            error_module.hint(diagnostic, "a cue chosen by lane starts a `tween` or a `bounce`, as its `at:`", .{});
+            return error.Checked;
+        }
+        const count = checker.region orelse {
+            const diagnostic = checker.fail(index, .wrong_lanes, "`{s}[lane]` is a cue for each lane, so it is used inside `lanes(n, …)`", .{name});
+            error_module.hint(diagnostic, "wrap the call in a region, such as `lanes({d}, …)`", .{binding.count});
+            return error.Checked;
+        };
+        if (binding.count < count) {
+            const diagnostic = checker.fail(index, .wrong_lanes, "`{s}` has {d} cues and the region {d} lanes", .{ name, binding.count, count });
+            error_module.hint(diagnostic, "give the series a cue for every lane, or the region fewer lanes", .{});
+            return error.Checked;
+        }
+        return .{ .index = binding.index, .by_lane = true };
     }
 
     fn path_of(checker: *Checker, index: u32, declared: bool) Fail!u32 {

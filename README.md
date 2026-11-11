@@ -140,7 +140,7 @@ checker's holes above, and hints that name real `Limits` fields; `check` prints 
 `Limits` a file needs, `sample` takes `--events` and `--lanes` and any slab size, and `describe`
 says how each call takes lanes and what its events carry.
 
-**0.2.0** (steps 23, 26, 27, 29 to 33) adds language surface, so it is a minor version: a string
+**0.2.0** (steps 23, 26 to 33) adds language surface, so it is a minor version: a string
 literal, and a client's nouns that only describe (step 27, see A Client's Nouns); a cue written
 after another cue, `cue hit = c1 + 500ms` (step 29); division by a number (step 30); a tween
 `after` a tween that leaves out `from` (step 31); `abs`, `min`, and `max`, with `clamp` in `std`
@@ -154,7 +154,11 @@ changes its values, but one that declares a module named after any of these call
 file that uses `std` grows with `std`'s text. `State.events_of` reads the events of chosen sources,
 stepping nothing when they are all solved, `Compiled.event_sources` gives a binding's, and `weft
 sample --events` reads through them, so it keeps a region's bounce with no stagger and a vector's
-spring, which it kept nothing of before (step 23).
+spring, which it kept nothing of before (step 23). A cue chosen by lane, `at: beat[lane]` in a
+`tween` or a `bounce`, and a series written as a list, `cue title = [1s, 1080ms]` (step 28): the
+core gains `cue_by_lane` on `Tween`, `Bounce`, and `BounceNode`, false by default, and
+`graph.lane_cue`; `check.Value` gains `cue_by_lane`; `schema.Param` gains `by_lane`; and
+`describe` prints `"by_lane":true` on the two parameters that take one.
 
 ## Requirements
 
@@ -644,6 +648,9 @@ const goal = compiled.goal("spring");        // a path and its from, a chase's t
   naming the nearest flick.
 - **A cue is a time, or an earlier cue plus one**: `cue hit = c1 + 500ms`. The sum is worked out
   at compile, so the table holds plain times and `Cues.move` moves one cue.
+- **A series** is evenly spaced, `cue bar = 10s..600s every 2s`, or a list of cues in time order,
+  `cue title = [1s, 1080ms, c1 + 160ms]`, each item what a cue's time takes (step 28). Either way
+  `title[2]` is one of its cues, `cues(title)` counts them, and `Compiled.cue_name` names each.
 - **A name is declared above its use**, so the node order is the text order. Calls and names never
   clash, so `tween = tween(...)` is fine. A cycle goes through a delay, fed below by `<-`.
 - **Arithmetic** is `+`, `-`, `*`, `/`, and parentheses. `a - b` is `a + b * -1`, exact, so no
@@ -780,6 +787,20 @@ hits = lanes(1000, bounce(0..1, speed: 0.5, at: c0, stagger: 3ms))   # events ca
   after lane, ready to copy into an instance buffer, and `State.extent(id)` gives the counts.
 - **A lane count is fixed** when the program is built. A client whose data changes size
   recompiles, and the carry keeps every simulated node whose size did not change.
+- **A cue for each lane** (step 28): `at: beat[lane]` in a `tween` or a `bounce` starts lane i at
+  the series' cue i, so lanes can differ by more than a fixed gap. A title whose letters pause
+  after a space is a list series and one line:
+
+  ```txt
+  cue letters = [1s, 1080ms, 1160ms, 1240ms, 1320ms, 1400ms, 1720ms, 1800ms]
+  rise = lanes(8, tween(from: 0, to: 1, at: letters[lane], over: 300ms, ease: out))
+  ```
+
+  A cue moved with `Cues.move` moves its lane only. The series needs a cue for every lane, the
+  index is `lane` itself (no arithmetic on it), it takes no `stagger:`, and it is the `at` of a
+  `tween` or a `bounce` only; each of these is refused with a hint. In the core it is one field,
+  `cue_by_lane`, on `Tween`, `Bounce`, and `BounceNode`: lane g reads cue `start + g`
+  (`graph.lane_cue`), one load and one add a lane, in `eval` and in `events`.
 - **Lanes are checked** where they are written: two counts above 1 meet only when equal, a
   parameter a signal sets takes one value for every lane, regions do not nest, and `lane` and
   `stagger:` belong inside a region, each with an error that says so (`wrong_lanes`). `sample`

@@ -874,6 +874,11 @@ const fuzz_seeds = [_][]const u8{
     "cue c0 = 0s\nw = wave(sine, 1hz) * 4\ns = sin(w) + cos(vec2(w, 1)).y\ne = exp(w * 200) + ln(w)\n" ++
         "q = sqrt(w - 1) + floor(w) + round(-0.5)\np = pow(w, 3) + pow(1e200, 2)\n" ++
         "module snap(v, step) = round(v / step) * step\nk = lanes(4, snap(chase(w, time: 0.25s), 0.5) + lane)\n",
+    // A cue chosen by lane and a series written as a list (step 28), through a module too.
+    "cue c0 = 0s\ncue beat = [1s, c0 + 1080ms, 1160ms, 1560ms]\n" ++
+        "t = lanes(4, tween(from: 0, to: 1, at: beat[lane], over: 300ms, ease: out))\n" ++
+        "b = lanes(4, bounce(0..1, speed: 4, at: beat[lane]))\nmodule letter(at) = tween(to: 2, at: at, over: 1s, after: t)\n" ++
+        "u = lanes(4, letter(beat[lane]))\nn = cues(beat)\n",
     // A loop that runs away within half a second, so the reader meets the bound (step 19).
     "cue c0 = 0s\nfb = delay(0)\nloop = chase(1 + fb * 1e100, time: 0.01s)\nfb <- loop\nx = loop * loop * loop\n",
 };
