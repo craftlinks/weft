@@ -29,6 +29,12 @@
 //! of a noun declared above, of one of the entries the parameter's `words` lists, or of any when
 //! `words` is empty. A noun's signals each keep their own lanes and shape.
 //!
+//! ## 3b. A Default From the Tween Before
+//! A tween's `from` defaults to `after` (step 31): when `after` names a tween, `from` is that
+//! tween's `to`, so a chain of tweens says each value once. The checker fills it in, so the call
+//! a back end reads is the one the longer text gives, and with no tween to read it from, `from`
+//! is required as before. `describe` prints the default as `"after"`.
+//!
 //! ## 4. TigerStyle Invariants
 //! - The table is comptime and checked: positional parameters come first, names are unique in an
 //!   entry, a default suits its kind, and an entry has at most `params_max` parameters.
@@ -94,6 +100,9 @@ pub const Default = union(enum) {
     whole,
     /// A string's text.
     text: []const u8,
+    /// The `to` of the tween the call's `after` names (section 3b): a tween's `from`, which may be
+    /// left out only then.
+    after,
 };
 
 pub const Param = struct {
@@ -248,7 +257,7 @@ pub const entries = [_]Entry{
         .{ .name = "seed", .kind = .seed, .default = .seed },
     } },
     .{ .name = "tween", .op = .tween, .role = .signal, .summary = "a move from one value to another, from a cue", .params = &.{
-        .{ .name = "from", .kind = .number, .shaped = true },
+        .{ .name = "from", .kind = .number, .shaped = true, .default = .after },
         .{ .name = "to", .kind = .number, .shaped = true },
         .{ .name = "at", .kind = .cue },
         .{ .name = "over", .kind = .time },
@@ -378,6 +387,7 @@ comptime {
                 .whole => assert(param_a.kind == .integer),
                 .absent => assert(param_a.kind == .signal),
                 .text => assert(param_a.kind == .string),
+                .after => assert(param_a.kind == .number and param_a.shaped and entry.op == .tween),
                 .required => {},
             }
             for (entry.params[index_a + 1 ..]) |param_b| assert(!std.mem.eql(u8, param_a.name, param_b.name));
