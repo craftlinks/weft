@@ -455,7 +455,9 @@ forward, at most 479 steps once the checkpoints are filled; evaluating the lates
 loading, fills them all. A slab of `program.reader_slab_count()` values, rather than
 `program.slab_count`, also gives the reader a copy of its simulated nodes at the step before its
 own, so a read of the step it has just passed, which an `events` right after an `eval` or a track
-written at the time just read makes, replays one step instead of restoring a checkpoint. The checkpoints only change what a read costs, never its value, and a cue
+written at the time just read makes, replays one step instead of restoring a checkpoint. A step
+evaluates only the simulated nodes and the nodes they read, directly or through others (step 34),
+so pure nodes beside them cost nothing a step. The checkpoints only change what a read costs, never its value, and a cue
 move drops them. `program.simulated` says whether a program has such nodes. `simulation.zig` and
 `graph.zig`, sections 9 and 10, explain the step, the draws, and why a cycle needs a delay.
 
@@ -963,6 +965,12 @@ bound adds about 5% to a stepped node's step. The numbers are ReleaseFast: Debug
 times slower. Play's simulated file is `signals.weft`, 21 nodes: four chases, a follower, a
 shift register, an oscillator, tracks, cues, and pure nodes around them. A frame at 60 Hz has
 16.7 ms; an audio block of 128 frames at 48 kHz has 2.667 ms.
+
+Since step 34 (2026-11-11) a step skips the nodes no simulated node reads: three chases beside 32
+waves and 1,000 lanes they do not read went from 974 ms to 6 ms for a first eval at 90 s, and
+Tapestry's steps film from 1.44 s to 0.02 s for a read at 90 s. An eval of every node costs about
+0.1 to 0.2 ns more a node on the smallest pure ops, and the seek back and the pure edit of Play's
+file below got about a sixth faster; the other figures did not move.
 
 | What | Cost |
 | --- | --- |

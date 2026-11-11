@@ -7,9 +7,10 @@
 //! `graph.zig` holds the guide for the whole graph, and this file is its reading half: a section
 //! cited here is a section of `graph.zig`. A `State` is one reader's slab over a `Program` (section
 //! 1); a pass evaluates every node at one time (section 9); a step runs the simulated nodes on the
-//! fixed step, with checkpoints (section 9); and an events query finds what happened in a range
-//! (section 11), of every source or of the ones a caller lists, which step only when one of them
-//! needs the step. The program side, the ops, and the builder stay in `graph.zig`, so this file
+//! fixed step, with checkpoints, its pass covering only the nodes `Builder.finish` marked as read
+//! by a step (section 9, step 34); and an events query finds what happened in a range (section
+//! 11), of every source or of the ones a caller lists, which step only when one of them needs the
+//! step. The program side, the ops, and the builder stay in `graph.zig`, so this file
 //! reads the op structs and never builds them. Every value a simulated node reads or stores
 //! passes through `simulation.bounded`, so a loop that runs away saturates instead of
 //! overflowing (`simulation.zig`, section 7), and `finite` tells a client when a pure node
@@ -20,6 +21,12 @@
 //!   `graph.zig` section 13 states.
 //! - `events_of` over solved sources writes nothing in the state: `events_from` takes the step,
 //!   and clears `evaluated`, only when a listed source needs the step.
+//! - A step leaves the outputs it skips as an earlier pass left them, in the slab and so in a
+//!   checkpoint. Nothing reads one before the pass at the time read rewrites it: `eval` runs that
+//!   pass before it returns; `events` and a stepping `events_of` clear `evaluated`, so `value`
+//!   asserts until the next `eval`; `adopt` and the copy of the step before move only simulated
+//!   and input regions, and a checkpoint brings back skipped outputs no fresher than the slab's;
+//!   and a step's update and events read only what it passes (step 34).
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -476,7 +483,7 @@ pub const State = struct {
         assert(first <= last);
         state.run_to(first, start);
         state.advance_to(last, start, report);
-        pass(&state.program, state.slab, step_time(start, last), .at_step);
+        pass_stepped(&state.program, state.slab, step_time(start, last));
         report_step(&state.program, state.slab, start, last, report);
         assert(state.step.? == last);
     }
@@ -877,8 +884,38 @@ const Sampling = union(enum) {
 
 /// Evaluates every node at `time`, in order.
 pub fn pass(program: *const Program, slab: []f64, time: Time, sampling: Sampling) void {
+    pass_nodes(program, slab, time, sampling, .every);
+}
+
+/// Evaluates at step time `time`, in order, the nodes a step reads (`graph.zig`, section 9),
+/// skipping each run of the others at once. The rest of the slab keeps what it held.
+fn pass_stepped(program: *const Program, slab: []f64, time: Time) void {
+    pass_nodes(program, slab, time, .at_step, .read_at_step);
+}
+
+/// The one loop of `pass` and `pass_stepped`, so `eval_node` has one call site, which the
+/// compiler inlines as it did before step 34; a second one measured slower on the smallest ops.
+fn pass_nodes(
+    program: *const Program,
+    slab: []f64,
+    time: Time,
+    sampling: Sampling,
+    nodes_passed: enum { every, read_at_step },
+) void {
     assert(slab.len == program.slab_count);
-    for (program.nodes) |*node| eval_node(program, slab, node, time, sampling);
+    const nodes = program.nodes;
+    var index: usize = 0;
+    // Each round moves on by at least one node, so at most `nodes.len` rounds.
+    while (index < nodes.len) {
+        const skip = if (nodes_passed == .every) 0 else nodes[index].step_skip;
+        if (skip == 0) {
+            eval_node(program, slab, &nodes[index], time, sampling);
+            index += 1;
+        } else {
+            index += skip;
+        }
+    }
+    assert(index == nodes.len);
 }
 
 fn eval_node(
@@ -1057,11 +1094,11 @@ pub fn step_ceiling(start: Time, time: Time) u64 {
     return result;
 }
 
-/// Runs the step from step `index` to the next: a pass at its time, then an update of every
-/// simulated node from that pass, as section 9 explains. Between the two, the events found at
-/// step `index` go to `report`, as section 11 explains.
+/// Runs the step from step `index` to the next: a pass at its time over the nodes a step reads,
+/// then an update of every simulated node from that pass, as section 9 explains. Between the
+/// two, the events found at step `index` go to `report`, as section 11 explains.
 fn step_once(program: *const Program, slab: []f64, start: Time, index: u64, report: ?*Found) void {
-    pass(program, slab, step_time(start, index), .at_step);
+    pass_stepped(program, slab, step_time(start, index));
     if (report) |into| report_step(program, slab, start, index, into);
     for (program.nodes) |*node| {
         if (node.op.simulated()) update_node(program, slab, node, index + 1);
