@@ -88,6 +88,9 @@ Rules that trip agents most often:
 - **A divisor is a number**, fixed when the program is built: `lane / 1000`, `x / -4`, or a
   module's parameter bound to one. `x / 4` is `x * 0.25`, the same nodes. Dividing by a signal,
   a track, `lane`, a time, or 0 is an error: to scale by a signal, multiply by it.
+- **A tween `after` a tween may leave out `from`**, and starts from that tween's `to`:
+  `tween(to: 0, at: c1, over: 1s, after: rise)`. `after` must be a name bound to a tween;
+  anything else needs `from`.
 - **A delay is a declaration of its own**, `fb = delay(0)`, fed once below with `fb <- …`.
 - **A loop with gain above 1 saturates** near 2^256 rather than crashing; values computed from it
   can still overflow, so a client calls `state.finite()` after `eval` on a program with a loop.

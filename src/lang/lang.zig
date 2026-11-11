@@ -776,6 +776,7 @@ const fuzz_seeds = [_][]const u8{
         "f = follow([0..1], by: w(), seed: 3)\nuse std\n",
     "cue c0 = 0s\ncue c1 = 1s\np = spring([c0: vec2(0, 1), c1: vec2(1, 0)], from: 0.5, time: 0.5s)\n" ++
         "c = tween(from: srgb(1, 0.5, 0), to: oklab(0.6, -0.1, 0.1), at: c0, over: 2s)\n" ++
+        "d = tween(to: srgb(0, 0, 1), at: c1, over: 1s, after: c)\n" ++
         "v = chase(vec3(wave(sine, 1hz), 0, p.y), time: 0.25s) * 2 - p.x\nl = c.l + map(p, from: 0..1, to: 2..3).y\n" ++
         "module m(a) = a.x * vec2(1, 2)\nq = m(p)\nr = spring([c0: 1], from: 0, time: 1s)\n",
     "cue c0 = 0s\nb = lanes(8, tween(from: 0, to: lane * 0.1, at: c0, over: 1s, stagger: 5ms))\n" ++

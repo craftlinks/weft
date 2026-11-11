@@ -228,7 +228,7 @@ fn json_entry(writer: *std.Io.Writer, entry: *const schema.Entry) !void {
                 try json_number(writer, @as(f64, @floatFromInt(range[1])) / flicks_per_second);
                 try writer.writeAll("]");
             },
-            .absent, .unbounded, .seed, .whole => try json_string(writer, @tagName(param.default)),
+            .absent, .unbounded, .seed, .whole, .after => try json_string(writer, @tagName(param.default)),
             .text => |text| try json_string(writer, text),
         }
         try writer.writeAll(",\"words\":[");

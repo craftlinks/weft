@@ -85,6 +85,18 @@
 //! signal is the client's to read. A `noun` parameter takes the name of a noun bound above, so a
 //! plot can name its axes, and the order of the file is the order a client resolves them in.
 //!
+//! ## 6b. A Tween After a Tween
+//! A tween's `from` may be left out when its `after` names a tween (step 31): it is then that
+//! tween's `to`, a number or a vector or colour whole, copied into the call's values. So the call
+//! a back end reads is the call the longer text gives, and the program is the same. `after` must
+//! be a name bound to a tween call, or to `lanes(n, tween(…))`, reached directly, through
+//! parentheses, or through a module's parameter, since each of those is checked to the name's
+//! binding expression; an expression, a call, or a name bound to anything else leaves `from`
+//! required, `missing_argument`. The tween named was checked above with its `to` filled, so the
+//! default reads one value, with no chain to follow. Its shape is the earlier tween's, and the
+//! call's own `to` must agree with it as `from` and `to` always must. Both may still be written,
+//! equal or not: a jump at a cue is the file's choice.
+//!
 //! ## 8. Shapes
 //! Every expression has a shape (step 16): a number, a vec2, a vec3, or a colour, three
 //! components in OKLab. `vec2`, `vec3`, and `oklab` pack scalar signals; `srgb` is a colour of
@@ -1223,13 +1235,23 @@ const Checker = struct {
         }
         const first = checker.value_count;
         checker.value_count += @intCast(entry.params.len);
+        // A `from` left out is the `to` of the tween `after` names, read once `after` is checked.
+        var from_after: ?u32 = null;
         for (entry.params, 0..) |*param, at| {
             const slot = first + at;
             checker.memory.value_items[slot] = checker.site_of(given[at] orelse index);
+            if (given[at] == null and param.default == .after) {
+                checker.memory.values[slot] = .absent;
+                from_after = @intCast(at);
+                continue;
+            }
             checker.memory.values[slot] = if (given[at]) |child|
                 try checker.argument(entry, param, child)
             else
                 try checker.default_of(entry, param, index);
+        }
+        if (from_after) |at| {
+            checker.memory.values[first + at] = try checker.after_to(entry, index, &given, first);
         }
         const at = checker.call_count;
         checker.memory.calls[at] = .{ .entry = entry, .values = first, .item = checker.site_of(index) };
@@ -1253,7 +1275,55 @@ const Checker = struct {
             .seed => .{ .seed = checker.derived_seed() },
             .whole => .absent,
             .text => |string| .{ .string = string },
+            // `check_call` fills it in from `after`, once `after` is checked (section 6b).
+            .after => unreachable,
         };
+    }
+
+    /// The `to` of the tween a call's `after` names, for the `from` it leaves out (section 6b).
+    fn after_to(checker: *Checker, entry: *const Entry, index: u32, given: *const [schema.params_max]?u32, first: u32) Fail!Value {
+        assert(checker.value_count >= first + entry.params.len);
+        const hint = "`from` may be left out only when `after` names a tween";
+        const after_at = entry.param("after") orelse {
+            const diagnostic = checker.fail_token(index, .missing_argument, "{s} needs `from`", .{entry.name});
+            error_module.hint(diagnostic, hint, .{});
+            return error.Checked;
+        };
+        const after_item = given[after_at] orelse {
+            const diagnostic = checker.fail_token(index, .missing_argument, "{s} needs `from`", .{entry.name});
+            error_module.hint(diagnostic, hint, .{});
+            return error.Checked;
+        };
+        // A client's entry may give `.after` to a parameter whose `after` is not a signal.
+        const after = checker.memory.values[first + after_at];
+        const named = if (after == .signal) checker.tween_named(after.signal) else null;
+        const call = named orelse {
+            const diagnostic = checker.fail(after_item, .missing_argument, "{s} needs `from`, since `after` is not a name bound to a tween", .{entry.name});
+            error_module.hint(diagnostic, hint, .{});
+            return error.Checked;
+        };
+        const before = checker.memory.calls[call];
+        const to = checker.memory.values[before.values + before.entry.param("to").?];
+        assert(to == .number or to == .vector);
+        return to;
+    }
+
+    /// The tween call that `expr` names (section 6b): a name bound to a tween, or to a region of
+    /// one tween, or null. It reads two expressions and no more, so a chain costs nothing per link.
+    fn tween_named(checker: *const Checker, expr: u32) ?u32 {
+        const name = checker.memory.exprs[expr];
+        if (name.tag != .binding or name.b != 0) return null;
+        const binding = checker.memory.bindings[name.a];
+        if (binding.kind != .signal) return null;
+        const node = checker.memory.exprs[binding.index];
+        if (node.tag != .call or node.b != 0) return null;
+        const call = checker.memory.calls[node.a];
+        if (call.entry.op == .tween) return node.a;
+        if (call.entry.op != .lanes) return null;
+        const body = checker.memory.exprs[checker.memory.values[call.values + 1].signal];
+        if (body.tag != .call or body.b != 0) return null;
+        if (checker.memory.calls[body.a].entry.op != .tween) return null;
+        return body.a;
     }
 
     /// The parameter `index` names in the current frame, bound to its argument (section 6).

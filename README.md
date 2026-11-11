@@ -214,6 +214,7 @@ test/
   cli.zig             the weft command's output against its goldens, and a client's nouns
   nouns.zig           a score: nouns that only describe beside a program, strings, and their errors
   division.zig        a quotient by a number against the product with its reciprocal, and refusals
+  chains.zig          a tween chain with `from` left out against the chain written out
   golden/signals.txt  the committed samples
   golden/cli/         the weft command's committed output
 tools/
@@ -329,6 +330,11 @@ reader on another thread takes its own copy of the table.
 
 A chain through `previous` is a sequence. A gap holds the earlier value, and in an overlap the later
 tween wins from its start. `cue.zig` and `graph.zig`, section 6, explain why.
+
+In the language, `previous` is `after:`, and a tween after a tween may leave out `from`, which is
+then the earlier tween's `to`: `fall = tween(to: 0.25, at: drop, over: 500ms, after: rise)`. So a
+chain says each value once, and the checker builds the call the longer text gives. `after` must be
+a name bound to a tween, or to a region of one; otherwise `from` is required.
 
 ## Springs and Newtonian Moves
 

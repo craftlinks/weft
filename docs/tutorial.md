@@ -212,13 +212,17 @@ cue drop = 2s
 cue beat = 4s..12s every 500ms              # a series: beat[0], beat[1], ... beat[16]
 
 rise = tween(from: 0, to: 1, at: intro, over: 1s, ease: in_out)
-fall = tween(from: 1, to: 0.25, at: drop, over: 500ms, ease: out, after: rise)
+fall = tween(to: 0.25, at: drop, over: 500ms, ease: out, after: rise)
 ```
 
 - Before its cue, a tween holds `from`. After its end it returns `to` exactly, bit for bit.
 - `ease` is `linear` (the default), `in`, `out`, or `in_out`.
 - **`after:` chains tweens into a sequence.** `fall` follows `rise` until `drop`, then takes over.
   Sampled at 0, 1, 2, and 3 s, `fall` reads `0, 1, 1, 0.25`.
+- **A tween after a tween may leave out `from`**: it starts from the `to` of the tween `after`
+  names, so a chain says each value once. `after` must then be a name bound to a tween (directly,
+  in `lanes(n, …)`, or passed through a module); otherwise `from` is required. Writing `from`
+  anyway is allowed, and a different value is a jump at the cue.
 - **`from` and `to` are numbers, not signals.** To scale a tween by a signal, multiply:
   `tween(from: 0, to: 1, …) * height`.
 
