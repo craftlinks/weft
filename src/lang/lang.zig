@@ -24,7 +24,8 @@
 //! ## 3. Names for a Client
 //! The program stores no names (`graph.zig`, section 5). A client asks the `Compiled` for a
 //! signal's node, a track, a cue, or where a signal's goal comes from, by the name the text gave
-//! it, once at init.
+//! it, once at init. The other way, `cue_name` gives a cue's name from its index in the table, a
+//! value a noun or an event carries, so a client can print it (step 32).
 //!
 //! ## 4. Modules and Libraries
 //! A module (step 13) is checked where it is used: the checker expands it into the arrays a
@@ -118,6 +119,14 @@ pub const Limits = struct {
 
 /// A library's name and its text, for `compile_with`.
 pub const Source = struct { name: []const u8, text: []const u8 };
+
+/// What `Compiled.cue_name` gives for a cue (section 3): the name it was declared with, or for a
+/// cue of a series the series' name and the cue's place in it, `bar[2]`.
+pub const CueName = struct {
+    name: []const u8,
+    /// The cue's index in its series, or null for a cue declared alone.
+    element: ?u32 = null,
+};
 
 /// Hashes the tags and texts of an item's tokens, comments and newlines left out, so spacing and
 /// comments never change a fingerprint.
@@ -548,6 +557,27 @@ pub fn Compiled(comptime limits: Limits) type {
         pub fn cue(compiled: *const Self, name: []const u8) ?cue_module.Cue {
             const index = compiled.binding(name, .cue) orelse return null;
             return .{ .index = compiled.checked.bindings[index].index };
+        }
+
+        /// The name of the cue at `cue_index` in the cue table (step 32): a noun's `cue` value,
+        /// or an event's from `cues(…)`. A cue of a series gives the series and its place in it.
+        /// Null for an index past the table.
+        pub fn cue_name(compiled: *const Self, cue_index: u32) ?CueName {
+            assert(compiled.ok);
+            const checked = &compiled.checked;
+            if (cue_index >= checked.cue_times.len) return null;
+            for (checked.bindings) |each| {
+                switch (each.kind) {
+                    .cue => if (each.index == cue_index) return .{ .name = each.name },
+                    .series => if (cue_index >= each.index and cue_index - each.index < each.count) {
+                        return .{ .name = each.name, .element = cue_index - each.index };
+                    },
+                    else => {},
+                }
+            }
+            // Every cue in the table was added by a `cue` declaration that bound its name, and a
+            // file that compiled refused none.
+            unreachable;
         }
 
         /// Where the goal of the signal `name` comes from: a spring's or a Newtonian move's

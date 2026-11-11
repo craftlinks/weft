@@ -213,6 +213,7 @@ test/
   rules.zig           every file's guide, and no allocator, thread, lock, or I/O in the library
   cli.zig             the weft command's output against its goldens, and a client's nouns
   nouns.zig           a score: nouns that only describe beside a program, strings, and their errors
+  score.zig           that score and its nouns, shared with cli.zig's client command
   division.zig        a quotient by a number against the product with its reciprocal, and refusals
   chains.zig          a tween chain with `from` left out against the chain written out
   golden/signals.txt  the committed samples
@@ -798,6 +799,16 @@ while (each.next()) |noun| {
 - **A recompile carries a noun's simulated signals** like any binding's. A noun's fingerprint
   takes in the nouns it names, so editing an axis starts its plots' simulated signals fresh.
 - **An entry has at most 16 parameters** (`schema.params_max`).
+- **A cue's name from its index**: a noun's `cue` value is an index into the cue table, and
+  `compiled.cue_name(index)` gives back `.{ .name = "hit" }`, or for a cue of a series its name
+  and place, `.{ .name = "bar", .element = 2 }`; null for an index past the table.
+- **A client's own command** is a few lines on the module `commands` (`cli/commands.zig`):
+  `describe`, `check`, and `sample` take the client's entries, and the `weft` command passes
+  none. `check` counts the nouns on its `ok:` line; `sample` lists signals only, so a signal a
+  noun reads inline is sampled by binding it on a line of its own. A client's own checks of its
+  nouns (a shape, a position) run after `check` returns: they add to
+  `compiled.syntax.diagnostics` and the client renders them. `commands.limits` holds two
+  libraries, `std` and one of the client's.
 
 ## The weft Command
 
@@ -832,7 +843,8 @@ $ weft sample play/signals.weft --to 1 --step 0.5 --signal wave
   an infinite end, which prints as `null`.
 - **`describe`** gives each primitive's `"lanes"`, how it takes them (`region`, `stagger`,
   `inputs`, `one`, or `makes`), and its `"events"`, what an event's `value` carries, or `null`.
-- **At most two `--use`**; a third is an error that says so.
+- **At most two `--use`**; a third is an error that says so, as it is from `commands.check` and
+  `commands.sample`, which a client's command calls with its own entries (A Client's Nouns).
 - **JSON** has its keys in a fixed order and no whitespace, and a value that is not finite, such
   as an unbounded range, is `null`. The output of every command is locked by a golden in
   `test/golden/cli`, so a change to it is a reviewed change.

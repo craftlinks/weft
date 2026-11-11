@@ -102,7 +102,7 @@ pub fn main(init: std.process.Init) !u8 {
         const text = read(io, path, &file_buffers[0]) orelse return 2;
         const source: commands.Source = .{ .name = path, .text = text };
         if (std.mem.eql(u8, command, "check")) {
-            const ok = try commands.check(&compiled, &writer, source, libraries[0..library_count]);
+            const ok = try commands.check(&compiled, &writer, source, libraries[0..library_count], &.{});
             if (!ok) status = 1;
         } else if (std.mem.eql(u8, command, "sample")) {
             if (!window.valid()) {
@@ -110,7 +110,7 @@ pub fn main(init: std.process.Init) !u8 {
                 return 2;
             }
             const filter: commands.Filter = .{ .events = event_names[0..event_count], .lanes = lanes };
-            const ok = try commands.sample(init.gpa, &compiled, &writer, source, libraries[0..library_count], names[0..name_count], window, filter);
+            const ok = try commands.sample(init.gpa, &compiled, &writer, source, libraries[0..library_count], &.{}, names[0..name_count], window, filter);
             if (!ok) status = 1;
         } else if (std.mem.eql(u8, command, "parse")) {
             const ok = try commands.parse(&writer, source);
