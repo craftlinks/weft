@@ -364,7 +364,8 @@ pub const Memory = struct {
     frames: []Frame,
     libraries: []const Library = &.{},
     instances: []Instance = &.{},
-    /// A client's nouns, checked after the table of primitives (step 14).
+    /// A client's nouns, checked after the table of primitives (step 14), each with at most
+    /// `schema.params_max` parameters, as the table's are.
     clients: []const schema.Entry = &.{},
 };
 
@@ -2616,6 +2617,7 @@ pub fn check(tree: *const Tree, memory: Memory, diagnostics: *Diagnostics) Check
     var checker: Checker = .{ .tree = tree, .root = tree, .memory = memory, .diagnostics = diagnostics };
     const before = diagnostics.total();
     assert(memory.frames.len >= frames_max);
+    for (memory.clients) |entry| assert(entry.params.len <= schema.params_max);
     memory.frames[0] = .{ .tree = tree };
     checker.register(tree);
     for (tree.declarations) |index| {

@@ -867,7 +867,8 @@ while (each.next()) |noun| {
   resolves them in `nouns()`' order never meets one it has not seen.
 - **A recompile carries a noun's simulated signals** like any binding's. A noun's fingerprint
   takes in the nouns it names, so editing an axis starts its plots' simulated signals fresh.
-- **An entry has at most 16 parameters** (`schema.params_max`).
+- **An entry has at most 24 parameters** (`schema.params_max`; 16 before step 36), and so has a
+  module.
 - **A cue's name from its index**: a noun's `cue` value is an index into the cue table, and
   `compiled.cue_name(index)` gives back `.{ .name = "hit" }`, or for a cue of a series its name
   and place, `.{ .name = "bar", .element = 2 }`; null for an index past the table.

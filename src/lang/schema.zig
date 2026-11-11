@@ -59,7 +59,7 @@ const noise = @import("../core/noise.zig");
 const simulation = @import("../core/simulation.zig");
 const graph = @import("../core/graph.zig");
 
-pub const params_max = 16;
+pub const params_max = 24;
 
 pub const Kind = enum {
     /// A number literal.
