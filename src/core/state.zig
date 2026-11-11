@@ -8,14 +8,18 @@
 //! cited here is a section of `graph.zig`. A `State` is one reader's slab over a `Program` (section
 //! 1); a pass evaluates every node at one time (section 9); a step runs the simulated nodes on the
 //! fixed step, with checkpoints (section 9); and an events query finds what happened in a range
-//! (section 11). The program side, the ops, and the builder stay in `graph.zig`, so this file reads
-//! the op structs and never builds them. Every value a simulated node reads or stores passes
-//! through `simulation.bounded`, so a loop that runs away saturates instead of overflowing
-//! (`simulation.zig`, section 7), and `finite` tells a client when a pure node downstream did.
+//! (section 11), of every source or of the ones a caller lists, which step only when one of them
+//! needs the step. The program side, the ops, and the builder stay in `graph.zig`, so this file
+//! reads the op structs and never builds them. Every value a simulated node reads or stores
+//! passes through `simulation.bounded`, so a loop that runs away saturates instead of
+//! overflowing (`simulation.zig`, section 7), and `finite` tells a client when a pure node
+//! downstream did.
 //!
 //! ## 2. TigerStyle Invariants
-//! - `eval` and `events` allocate nothing, take no lock, and are bounded, as `graph.zig`
-//!   section 13 states.
+//! - `eval`, `events`, and `events_of` allocate nothing, take no lock, and are bounded, as
+//!   `graph.zig` section 13 states.
+//! - `events_of` over solved sources writes nothing in the state: `events_from` takes the step,
+//!   and clears `evaluated`, only when a listed source needs the step.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -237,29 +241,73 @@ pub const State = struct {
     /// explains, and leaves the outputs of the slab at no particular time, so `value` asserts
     /// until the next `eval`.
     pub fn events(state: *State, t0: Time, t1: Time, out: []Event) Events {
+        return state.events_from(null, t0, t1, out);
+    }
+
+    /// The events of `sources` only, node ids as `Event.source` gives them, strictly ascending:
+    /// what `events` gives, with every other source's events left out, in the same order and with
+    /// the same overflow rule (step 23). A call steps only when a source is a crossing, a follower,
+    /// or a shift register, the simulated ops that fire events, and then it leaves the state as
+    /// `events` does. A call over solved sources, a bounce, cues, a spring, or a Newtonian move,
+    /// changes nothing in the state, so the next `eval` and `value` read what the last `eval` left.
+    /// A source that fires nothing, such as a chase or a wave, adds none and steps nothing.
+    /// An invalid list (`sources_valid`) is an assert; where asserts are compiled out it reads as
+    /// the empty list, so it can never read past the program.
+    pub fn events_of(state: *State, sources: []const Id, t0: Time, t1: Time, out: []Event) Events {
+        const valid = sources_valid(&state.program, sources);
+        // Not a plain assert, which a build without safety may take as a promise and use to drop
+        // the check below.
+        if (std.debug.runtime_safety) assert(valid);
+        return state.events_from(if (valid) sources else &.{}, t0, t1, out);
+    }
+
+    /// Whether `sources` is a list `events_of` takes: strictly ascending, so with no repeat, and
+    /// each a node of `program`. A client that builds its list at run time can check it once with
+    /// this.
+    pub fn sources_valid(program: *const Program, sources: []const Id) bool {
+        for (sources, 0..) |id, at| {
+            if (id.index >= program.nodes.len) return false;
+            if (at > 0 and sources[at - 1].index >= id.index) return false;
+        }
+        return true;
+    }
+
+    /// Whether a node fires events, as section 11 lists: a bounce's position, cues, a spring or
+    /// a Newtonian move, a crossing, a follower, and a shift register.
+    pub fn fires_events(node: *const Node) bool {
+        return switch (node.op) {
+            .bounce => |op| op.output == .position,
+            .cues, .motion => true,
+            .crossing, .follow, .shift => true,
+            .constant, .add, .multiply, .minimum, .maximum, .apply, .map_range => false,
+            .wave, .tween, .noise, .chase, .delay, .oscillator => false,
+            .input, .recorded, .track, .pack, .pick, .lane, .spread => false,
+        };
+    }
+
+    /// The body of `events` and `events_of`: every source's events when `sources` is null, else
+    /// those of the listed ones, which step only when one of them must.
+    fn events_from(state: *State, sources: ?[]const Id, t0: Time, t1: Time, out: []Event) Events {
         assert(state.slab.len == state.program.slab_count);
         assert(t0.flicks <= t1.flicks);
+        const program = &state.program;
+        if (sources) |list| assert(sources_valid(program, list));
+        const steps = if (sources) |list| steps_for(program, list) else program.simulated;
+        assert(!steps or program.simulated);
         var collector = Collector.init(out);
-        state.evaluated = false;
+        // A call that steps nothing over a list of sources writes nothing in the state.
+        if (sources == null or steps) state.evaluated = false;
         if (t0.flicks == t1.flicks) return collector.result();
-        var report: Found = .{ .collector = &collector, .t0 = t0, .t1 = t1 };
-        for (state.program.nodes, 0..) |*node, index| {
-            const id: Id = .{ .index = @intCast(index) };
-            switch (node.op) {
-                .bounce => |*op| if (op.output == .position) {
-                    for (0..node.extent.lanes) |lane| {
-                        events_bounce(&state.program, op, id, family_lane(&state.program, node, lane), &report);
-                    }
-                },
-                .cues => |span| events_cues(&state.program, span, id, &report),
-                .motion => |*op| for (0..node.extent.lanes) |lane| {
-                    const at = family_lane(&state.program, node, lane);
-                    events_motion(&state.program, state.slab, node, op, id, at, &report);
-                },
-                else => {},
+        var report: Found = .{ .collector = &collector, .t0 = t0, .t1 = t1, .sources = sources };
+        if (sources) |list| {
+            // Ascending, so the solved sources are visited in node order, as below.
+            for (list) |id| events_solved(program, state.slab, id, &report);
+        } else {
+            for (0..program.nodes.len) |index| {
+                events_solved(program, state.slab, .{ .index = @intCast(index) }, &report);
             }
         }
-        if (state.program.simulated) state.events_simulated(&report);
+        if (steps) state.events_simulated(&report);
         return collector.result();
     }
 
@@ -510,17 +558,53 @@ fn move_regions(program: Program, into: []f64, from_program: Program, from: []co
     }
 }
 
-/// Where an events query puts what it finds: the collector, and the range it keeps.
+/// Whether a list of sources needs the step: one of them is a simulated op that fires events.
+fn steps_for(program: *const Program, sources: []const Id) bool {
+    for (sources) |id| {
+        assert(id.index < program.nodes.len);
+        switch (program.nodes[id.index].op) {
+            .crossing, .follow, .shift => return true,
+            else => {},
+        }
+    }
+    return false;
+}
+
+/// The events a solved source finds without the step: a bounce's position, cues, and each lane of
+/// a motion. Other nodes find none here.
+fn events_solved(program: *const Program, slab: []const f64, id: Id, report: *Found) void {
+    assert(id.index < program.nodes.len);
+    const node = &program.nodes[id.index];
+    switch (node.op) {
+        .bounce => |*op| if (op.output == .position) {
+            for (0..node.extent.lanes) |lane| {
+                events_bounce(program, op, id, family_lane(program, node, lane), report);
+            }
+        },
+        .cues => |span| events_cues(program, span, id, report),
+        .motion => |*op| for (0..node.extent.lanes) |lane| {
+            events_motion(program, slab, node, op, id, family_lane(program, node, lane), report);
+        },
+        else => {},
+    }
+}
+
+/// Where an events query puts what it finds: the collector, the range it keeps, and the sources
+/// it keeps, all when null.
 const Found = struct {
     collector: *Collector,
     t0: Time,
     t1: Time,
+    sources: ?[]const Id = null,
 
-    /// Keeps an event if its time is in the range.
+    /// Keeps an event if its time is in the range and its source is wanted.
     fn add(report: *Found, time: Time, source: Id, instance: u32, value: f64) void {
         assert(report.t0.flicks < report.t1.flicks);
         if (time.flicks < report.t0.flicks) return;
         if (time.flicks >= report.t1.flicks) return;
+        if (report.sources) |list| {
+            if (!contains(list, source)) return;
+        }
         report.collector.add(.{
             .time = time,
             .source = source,
@@ -529,6 +613,22 @@ const Found = struct {
         });
     }
 };
+
+/// Whether the ascending `sources` holds `id`, by binary search.
+fn contains(sources: []const Id, id: Id) bool {
+    assert(sources.len <= std.math.maxInt(u32));
+    var low: usize = 0;
+    var high: usize = sources.len;
+    // Halving a u32 range ends within 33 rounds.
+    for (0..33) |_| {
+        if (low == high) break;
+        const middle = low + (high - low) / 2;
+        if (sources[middle].index == id.index) return true;
+        if (sources[middle].index < id.index) low = middle + 1 else high = middle;
+    } else unreachable;
+    assert(low == high);
+    return false;
+}
 
 /// The hits of one lane of a bounce's position in the range: at each wall, the velocity just
 /// before it, `+speed` at `high` and `-speed` at `low`. Once the buffer is full, it counts the

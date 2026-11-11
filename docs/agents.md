@@ -150,6 +150,9 @@ and chases, once, while the checkpoints fill. And a window of events behind the 
 lanes page reads, restores a checkpoint and steps again every frame, so read a stepped page's
 values, or its events since the last frame with `state.events_since(now, &out)`, not a window
 behind it, and give its reader `program.reader_slab_count()` of slab rather than `slab_count`.
+A window of a bounce's or the cues' events beside stepped nodes is cheap with
+`state.events_of(&sources, t0, t1, &out)`, the list from `compiled.event_sources(name, &ids)`:
+over solved sources it steps nothing (step 23).
 
 Then, in `play/`:
 

@@ -21,7 +21,13 @@
 //! value is an array of them, OKLab for a colour; a signal of many lanes (step 17) has `"lanes"`
 //! and each value is an array of its lanes. A number has none of these, so a file of numbers
 //! samples as it did before vectors. Each event has its time in flicks, its source node, and its
-//! instance, the lane, then the name bound to its source, where one is, and its value (step 18).
+//! instance, the lane, then the name of the signal it belongs to, where one is, and its value
+//! (step 18).
+//! With `--events`, the reader asks `events_of` for the nodes `Compiled.event_sources` gives each
+//! name, merged (step 23), so the buffer holds only those sources' events, and a region's bounce
+//! with no stagger or a vector's spring, whose binding's first node is a `spread` or a `pack`,
+//! keeps its events. An event is named by the first signal in the file whose event sources hold
+//! its source, so those events carry their binding's name too, with or without `--events`.
 //!
 //! ## 4. A Client's Command
 //! `describe`, `check`, and `sample` take a client's entries (step 32), so a client with nouns
@@ -93,6 +99,8 @@ pub const Window = struct {
 var scratch: Syntax = undefined;
 var ranges: [limits.nodes]weft.Range = undefined;
 var events: [events_max]weft.Event = undefined;
+/// The name each node's events print with, by `name_sources` (section 3).
+var source_names: [limits.nodes]?[]const u8 = undefined;
 
 /// `weft check`: the file's diagnostics, or a summary of its program. True when it compiles.
 /// A client's command passes its entries as `clients` (section 4); the `weft` command none.
@@ -344,9 +352,15 @@ pub fn sample(
     for (list, 0..) |name, at| {
         ids[at] = compiled.signal(name) orelse return not_a_signal(compiled, writer, name);
     }
-    var event_ids: [signals_max]weft.Id = undefined;
-    for (filter.events, 0..) |name, at| {
-        event_ids[at] = compiled.signal(name) orelse return not_a_signal(compiled, writer, name);
+    // The nodes that fire the named signals' events, merged, ascending, for `events_of`.
+    var event_ids: [signals_max * weft.graph.components_max]weft.Id = undefined;
+    var event_count: usize = 0;
+    for (filter.events) |name| {
+        if (compiled.signal(name) == null) return not_a_signal(compiled, writer, name);
+        var found: [weft.graph.components_max]weft.Id = undefined;
+        for (compiled.event_sources(name, &found)) |id| {
+            event_count = insert_source(event_ids[0 .. event_count + 1], event_count, id);
+        }
     }
     const program = compiled.program;
     const slab = gpa.alloc(f64, @intCast(program.reader_slab_count())) catch {
@@ -392,10 +406,16 @@ pub fn sample(
     }
     try writer.writeAll("],\"events\":[");
     var state = weft.State.init(program, slab);
-    const found = state.events(.{ .flicks = window.from }, .{ .flicks = window.to }, &events);
+    const t0: weft.Time = .{ .flicks = window.from };
+    const t1: weft.Time = .{ .flicks = window.to };
+    const found = if (filter.events.len == 0)
+        state.events(t0, t1, &events)
+    else
+        state.events_of(event_ids[0..event_count], t0, t1, &events);
+    name_sources(compiled);
     var written: u32 = 0;
     for (events[0..found.count]) |event| {
-        if (!event_kept(program, event, event_ids[0..filter.events.len], filter.lanes)) continue;
+        if (!event_kept(program, event, filter.lanes)) continue;
         if (written > 0) try writer.writeAll(",");
         written += 1;
         try writer.print("{{\"t\":{d},\"source\":{d},\"instance\":{d}", .{
@@ -403,7 +423,7 @@ pub fn sample(
             event.source.index,
             event.instance,
         });
-        if (source_name(compiled, event.source)) |name| {
+        if (source_names[event.source.index]) |name| {
             try writer.writeAll(",\"name\":");
             try json_string(writer, name);
         }
@@ -437,24 +457,41 @@ fn kept_lanes(lanes: u32, wanted: ?[2]u32) [2]u32 {
     return .{ first, @max(first, end) };
 }
 
-/// Whether an event passes `--events` and `--lanes`, which only picks among a region's lanes.
-fn event_kept(program: weft.Program, event: weft.Event, sources: []const weft.Id, lanes: ?[2]u32) bool {
-    if (lanes) |range| {
-        const laned = program.nodes[event.source.index].extent.lanes > 1;
-        if (laned and (event.instance < range[0] or event.instance > range[1])) return false;
-    }
-    if (sources.len == 0) return true;
-    for (sources) |source| if (source.index == event.source.index) return true;
-    return false;
+/// Whether an event passes `--lanes`, which only picks among a region's lanes. `--events` is
+/// applied by `events_of`.
+fn event_kept(program: weft.Program, event: weft.Event, lanes: ?[2]u32) bool {
+    const range = lanes orelse return true;
+    const laned = program.nodes[event.source.index].extent.lanes > 1;
+    return !laned or (event.instance >= range[0] and event.instance <= range[1]);
 }
 
-/// The name of the signal whose node fired an event, if a name is bound to it (step 18).
-fn source_name(compiled: *const Compiled, source: weft.Id) ?[]const u8 {
-    for (compiled.checked.bindings, 0..) |binding, index| {
+/// Puts `id` into the ascending `sources[0..count]` unless it is there, and returns the new count.
+/// `sources` has room for one more.
+fn insert_source(sources: []weft.Id, count: usize, id: weft.Id) usize {
+    assert(sources.len == count + 1);
+    var at = count;
+    while (at > 0 and sources[at - 1].index > id.index) : (at -= 1) {}
+    if (at > 0 and sources[at - 1].index == id.index) return count;
+    std.mem.copyBackwards(weft.Id, sources[at + 1 ..], sources[at..count]);
+    sources[at] = id;
+    return count + 1;
+}
+
+/// Names each node that fires events by the first signal, in the file's order, whose
+/// `Compiled.event_sources` hold it (step 23), so a region's bounce with no stagger and a
+/// vector's spring print their binding's name. The first declared wins where two share a source,
+/// as `b = a` shares `a`'s: it is the name the source was made under.
+fn name_sources(compiled: *const Compiled) void {
+    const count = compiled.program.nodes.len;
+    assert(count <= limits.nodes);
+    @memset(source_names[0..count], null);
+    for (compiled.checked.bindings) |binding| {
         if (binding.kind != .signal) continue;
-        if (compiled.ids[index].first.index == source.index) return binding.name;
+        var found: [weft.graph.components_max]weft.Id = undefined;
+        for (compiled.event_sources(binding.name, &found)) |id| {
+            if (source_names[id.index] == null) source_names[id.index] = binding.name;
+        }
     }
-    return null;
 }
 
 /// The top-level signals of the file, in text order.

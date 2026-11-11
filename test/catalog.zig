@@ -98,7 +98,7 @@ const Signal = struct {
     stride_ticks: u32,
 };
 
-const Epoch = struct {
+pub const Epoch = struct {
     name: []const u8,
     seconds: i64,
 };
@@ -110,7 +110,7 @@ const signals = [_]Signal{
     .{ .name = "440hz", .hz = 440, .rate_hz = 48_000, .stride_ticks = 8 },
 };
 
-const epochs = [_]Epoch{
+pub const epochs = [_]Epoch{
     .{ .name = "zero", .seconds = 0 },
     .{ .name = "hour", .seconds = 3600 },
     .{ .name = "day", .seconds = 86_400 },
@@ -239,7 +239,7 @@ const function_inputs = [_]struct { function: weft.graph.Function, name: []const
 };
 
 /// The graphs whose events are listed, each built by `event_graph_build`.
-const EventGraph = enum {
+pub const EventGraph = enum {
     bounce,
     crossing,
     follow,
@@ -266,7 +266,7 @@ const event_graphs = std.enums.values(EventGraph);
 const events_per_run_max = 16;
 
 /// The range each event run reports: the first six seconds after the epoch.
-const event_range_seconds = 6;
+pub const event_range_seconds = 6;
 
 const samples_per_run = 24;
 
@@ -410,7 +410,7 @@ fn render_noise_run(
 
 /// The tables every graph run reads at an epoch: cues half a second into it, then a second apart,
 /// the goals of the motion graphs at them, and the follower's regions.
-const Tables = struct {
+pub const Tables = struct {
     cue_times: [Graph.cues_count]weft.Time,
     cues: weft.Cues,
     goal_entries: [Graph.goals_count]weft.Goal,
@@ -423,7 +423,7 @@ const Tables = struct {
     track_samples: [Graph.tracks_count][2]weft.Sample,
     tracks: weft.Tracks,
 
-    fn init(tables: *Tables, epoch: *const Epoch) void {
+    pub fn init(tables: *Tables, epoch: *const Epoch) void {
         tables.cues = weft.Cues.init(&tables.cue_times);
         var cue_ids: [Graph.cues_count]weft.Cue = undefined;
         for (&cue_ids, 0..) |*cue, index| {
@@ -478,7 +478,7 @@ const Tables = struct {
     }
 
     /// A builder over these tables, with the first cue as the start.
-    fn builder(tables: *const Tables, nodes: []weft.Node, slab_count_max: u32) weft.Builder {
+    pub fn builder(tables: *const Tables, nodes: []weft.Node, slab_count_max: u32) weft.Builder {
         assert(tables.cues.count == Graph.cues_count);
         return weft.Builder.init(nodes, .{
             .slab_count_max = slab_count_max,
@@ -631,7 +631,7 @@ fn render_event_run(writer: *std.Io.Writer, graph: EventGraph, epoch: *const Epo
     }
 }
 
-fn event_graph_build(graph: EventGraph, builder: *weft.Builder) weft.Builder.Error!void {
+pub fn event_graph_build(graph: EventGraph, builder: *weft.Builder) weft.Builder.Error!void {
     switch (graph) {
         // Between -1 and 1 at 1.5 units a second: a hit every 4/3 s from the first cue.
         .bounce => _ = try builder.bounce(.{

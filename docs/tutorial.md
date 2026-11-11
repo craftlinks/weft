@@ -401,7 +401,9 @@ something that happens. To chain one thing off another, either make the second a
 (section 12).
 
 **Events ahead of the playhead** are as available as events behind it: on a program with no
-simulated node, `events(t - 2 s, t + 4 s)` is a cheap way to draw what is about to happen.
+simulated node, `events(t - 2 s, t + 4 s)` is a cheap way to draw what is about to happen. On a
+program that has one, ask for the solved sources by name with `events_of` (section 10), which
+steps nothing.
 
 ---
 
@@ -613,6 +615,13 @@ for (found[0..result.count]) |event| {
 ```
 
 After `events`, the slab is at no particular time, so call `eval` before the next `value`.
+
+**Only some sources:** `state.events_of(&sources, t0, t1, &found)` gives the events of the listed
+nodes only, ascending ids, as `events` would with the others left out. A file's binding gives its
+list with `compiled.event_sources("name", &ids)`. When every listed source is solved (a bounce,
+cues, a spring, a Newtonian move), the call steps nothing and changes nothing in the reader, so a
+window behind and ahead of the playhead costs what it costs on a pure program, and `value` still
+reads the last `eval`.
 
 **Each frame, call `events_since`.** It reads the events since the last `eval`, `(last, now]`,
 then evaluates at `now`:

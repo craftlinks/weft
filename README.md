@@ -117,8 +117,8 @@ v0.2 means a client can depend on these, not that Weft is finished. Within 0.2, 
 them is a bug or a new minor version, named in this README. 0.1 promised the same list:
 
 - **The library's exports**, `src/weft.zig`: `Builder` and its calls, `Program`, `State` and its
-  `eval`, `events`, `events_since`, `values`, `extent`, `finite`, `set_input`, `record`, and
-  `adopt`, the op structs, `Cues`, `Goals`, `Regions`, `Tracks`, `Time`, `Rate`, `Event`, and
+  `eval`, `events`, `events_since`, `events_of` (step 23), `values`, `extent`, `finite`,
+  `set_input`, `record`, and `adopt`, the op structs, `Cues`, `Goals`, `Regions`, `Tracks`, `Time`, `Rate`, `Event`, and
   `weft.colour`.
 - **The language**: every call and parameter `weft describe` lists, the syntax, the canonical
   format, and the seeds a file's names derive, so a file samples the same values in every 0.2.
@@ -140,7 +140,7 @@ checker's holes above, and hints that name real `Limits` fields; `check` prints 
 `Limits` a file needs, `sample` takes `--events` and `--lanes` and any slab size, and `describe`
 says how each call takes lanes and what its events carry.
 
-**0.2.0** (steps 26, 27, 29 to 33) adds language surface, so it is a minor version: a string
+**0.2.0** (steps 23, 26, 27, 29 to 33) adds language surface, so it is a minor version: a string
 literal, and a client's nouns that only describe (step 27, see A Client's Nouns); a cue written
 after another cue, `cue hit = c1 + 500ms` (step 29); division by a number (step 30); a tween
 `after` a tween that leaves out `from` (step 31); `abs`, `min`, and `max`, with `clamp` in `std`
@@ -151,7 +151,10 @@ changes its values, but one that declares a module named after any of these call
 `quantize` beside `use std`, is now refused, since the name is taken. `schema.params_max` is 16, where it was 8. The
 `weft` command's functions are the module `commands`, so a client's own command can print
 `describe` with its nouns, and check and sample its files (step 32). `check`'s limits line for a
-file that uses `std` grows with `std`'s text.
+file that uses `std` grows with `std`'s text. `State.events_of` reads the events of chosen sources,
+stepping nothing when they are all solved, `Compiled.event_sources` gives a binding's, and `weft
+sample --events` reads through them, so it keeps a region's bounce with no stagger and a vector's
+spring, which it kept nothing of before (step 23).
 
 ## Requirements
 
@@ -506,9 +509,22 @@ since the last `eval`, `(last, now]`, then evaluates at `now`: one call that nev
 evals would not. Its first call gives the events at exactly `now`, and a repeat or a seek back
 gives none. By hand, the same is `events(s + 1, s' + 1)` in flicks. `events(s, s')` after
 `eval(s)` starts one step behind the slab, which a reader with `reader_slab_count()` of slab
-replays in one step and a reader without restores from a checkpoint. An events
-query runs every simulated node's steps across its range, whatever sources the caller wants, so
-events of pure sources are cheapest in a pure program of their own (Play's bouncers are one).
+replays in one step and a reader without restores from a checkpoint.
+
+**Events by source.** `events` runs every simulated node's steps across its range, whatever the
+caller wants. `state.events_of(&sources, t0, t1, &out)` gives the events of the listed nodes only,
+ids strictly ascending, in the order and with the overflow rule of `events` (step 23). It steps
+only when a listed source is a crossing, a follower, or a shift register; over solved sources (a
+bounce, cues, a spring, a Newtonian move) it steps nothing and changes nothing in the state, so a
+window around the playhead of a program with a chase costs what it costs on a pure one, and the
+next `eval` and `value` see what the last `eval` left. A file's binding gives its list with
+`compiled.event_sources(name, &ids)`, which follows a region's `spread` and a vector's `pack` to
+the nodes that fire. For a subset each frame, the since form is written by hand:
+
+```zig
+const found = state.events_of(&sources, .{ .flicks = last.flicks + 1 }, .{ .flicks = now.flicks + 1 }, &out);
+state.eval(now);
+```
 
 ## Ranges and Seekability
 
@@ -868,7 +884,8 @@ $ weft sample play/signals.weft --to 1 --step 0.5 --signal wave
   whatever the file, so a client short of static memory sizes one from this line.
 - **`sample`** allocates its reader's slab, so a file of any slab size can be sampled (v0.1.0's
   command held 262,144 values). `--events NAME` keeps the events of the signal bound to NAME,
-  and `--lanes A..B` keeps lanes A to B, both included, of every signal and event of a region:
+  from the nodes `Compiled.event_sources` gives, so a region's bounce with no stagger and a
+  vector's spring keep theirs (step 23), and `--lanes A..B` keeps lanes A to B, both included, of every signal and event of a region:
   each such signal gains `"lane_first"`. Every signal says `"bounded"`, false when its range has
   an infinite end, which prints as `null`.
 - **`describe`** gives each primitive's `"lanes"`, how it takes them (`region`, `stagger`,
@@ -905,7 +922,9 @@ Bless only for a change the step means to make, in that step's commit.
 `zig build bench -Doptimize=ReleaseFast` prints its build mode and one line per case: a pure
 graph of 16 waves summed, per eval; four chases on a wave plus noise playing forwards at 60 Hz, per
 frame; that graph from a fresh state, the first eval at 60 s and at 600 s; a bounce and cues,
-`events` per 128-frame block at 48 kHz; a track write at the playhead at 600 s, then the
+`events` per 128-frame block at 48 kHz; 16 waves, a bounce, and cues, with and without a chase, a
+6 s window of events around a playhead at 60 Hz and its eval, by `events` and by `events_of` the
+solved sources, and that eval alone (step 23); a track write at the playhead at 600 s, then the
 frame's eval, which is what a knob costs from now on; a compile of Play's `signals.weft`; a
 compile of modules nested 8 deep, 511 instances; and a region of a noise, a staggered tween, a
 map, a product, and a staggered bounce at 1,000 and 100,000 lanes, an eval and a frame's events

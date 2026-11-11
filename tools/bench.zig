@@ -11,6 +11,11 @@
 //! play     four chases on a wave plus noise, forwards at 60 Hz per frame, over 60 s
 //! cold     that graph from a fresh state, the first eval        at 60 s, and at 600 s
 //! events   a bounce and cues, events per 128-frame block        48 kHz blocks over 10 s
+//! sources  16 waves summed, a bounce, and cues, then the same      per frame, 60 Hz for 10 s
+//!          with a chase: `events` of 3 s behind to 3 s ahead of
+//!          a playhead and an eval, then `events_of` the bounce
+//!          and the cues beside the chase, and the eval alone
+//!          (step 23)
 //! write    the chase page with its springs' time from a track,  per frame, at 600 s
 //!          a write of the track at the playhead, then the eval
 //! compile  Play's `signals.weft` (step 12), parse to program      per compile
@@ -65,6 +70,9 @@ var cue_times: [32]weft.Time = undefined;
 var start_times: [1]weft.Time = undefined;
 var start_cues: weft.Cues = undefined;
 var events_out: [64]weft.Event = undefined;
+/// The `sources` case's cues, every half second for 20 s.
+var sources_cue_times: [40]weft.Time = undefined;
+var sources_cues: weft.Cues = undefined;
 var track_entries: [1]weft.Track = undefined;
 var track_samples: [4096]weft.Sample = undefined;
 var tracks: weft.Tracks = undefined;
@@ -79,6 +87,7 @@ pub fn main(init: std.process.Init) !void {
     play(io);
     cold(io);
     events(io);
+    sources(io);
     write(io);
     compile(io);
     modules(io);
@@ -219,6 +228,88 @@ fn events(io: std.Io) void {
         best = @min(best, now(io) - start);
     }
     report("events  bounce and cues, per block", best, blocks, total);
+}
+
+/// The `sources` case's program: 16 waves summed, a bounce, and cues every half second, with or
+/// without a chase of the sum, and the ids of the bounce's position and the cues.
+const SourcesPage = struct {
+    program: weft.Program,
+    sources: [2]weft.Id,
+};
+
+fn sources_page(with_chase: bool) SourcesPage {
+    var builder = weft.Builder.init(&nodes, .{ .slab_count_max = slab_max, .cues = &sources_cues });
+    var sum = builder.wave(.{ .shape = .sine, .hz = 0.5 }) catch |err| fail(err);
+    for (1..16) |index| {
+        const shape: weft.Shape = @fromBackingInt(@intCast(index % 4));
+        const hz = 0.5 + 0.37 * @as(f64, @floatFromInt(index));
+        const wave = builder.wave(.{ .shape = shape, .hz = hz }) catch |err| fail(err);
+        sum = builder.add(sum, wave) catch |err| fail(err);
+    }
+    const ball = builder.bounce(.{ .low = 0, .high = 1, .speed = 3, .start = .{ .index = 0 } }) catch |err|
+        fail(err);
+    const count: u32 = @intCast(sources_cues.count);
+    const beats = builder.cues(.{ .first = .{ .index = 0 }, .count = count }) catch |err| fail(err);
+    if (with_chase) {
+        _ = builder.chase(.{
+            .target = sum,
+            .from = 0,
+            .time = .{ .flicks = @divExact(flicks_per_second, 2) },
+            .overshoot = 0.1,
+        }) catch |err| fail(err);
+    }
+    assert(ball.position.index < beats.index);
+    return .{ .program = builder.finish(), .sources = .{ ball.position, beats } };
+}
+
+/// Case 6: what events cost by source (step 23). A playhead plays 10 s at 60 Hz from 3 s, and each
+/// frame reads the events of a window 3 s behind it to 3 s ahead, then evaluates at it, on a
+/// reader with checkpoints: `events` of the pure program, `events` of the same with one chase,
+/// which steps the whole window back and forth each frame, and `events_of` the bounce and the
+/// cues beside the chase, which steps nothing but the frame's own eval. A fourth line is that
+/// eval alone, so the third splits into the eval's steps and the events' own cost.
+fn sources(io: std.Io) void {
+    sources_cues = weft.Cues.init(&sources_cue_times);
+    for (0..sources_cue_times.len) |index| {
+        const half_seconds: i64 = @intCast(index);
+        _ = sources_cues.add(.{ .flicks = half_seconds * @divExact(flicks_per_second, 2) }) catch
+            unreachable;
+    }
+    const rate = weft.Rate.from_hz(60).?;
+    const frame_first = 3 * 60;
+    const frames = 600;
+    const window = 3 * flicks_per_second;
+    const Read = enum { events, events_of, none };
+    const cases = [_]struct { label: []const u8, chase: bool, read: Read }{
+        .{ .label = "sources events, pure, per frame", .chase = false, .read = .events },
+        .{ .label = "sources events, with a chase", .chase = true, .read = .events },
+        .{ .label = "sources events_of, with a chase", .chase = true, .read = .events_of },
+        .{ .label = "sources eval alone, with a chase", .chase = true, .read = .none },
+    };
+    for (cases) |case| {
+        const page = sources_page(case.chase);
+        var best: i96 = std.math.maxInt(i96);
+        var total: f64 = 0;
+        for (0..repeats) |_| {
+            var state = weft.State.init_with_checkpoints(page.program, &slab, &checkpoints);
+            const start = now(io);
+            for (frame_first..frame_first + frames) |frame| {
+                const at = weft.Time.from_ticks(@intCast(frame), rate).?;
+                const t0: weft.Time = .{ .flicks = at.flicks - window };
+                const t1: weft.Time = .{ .flicks = at.flicks + window };
+                const found: weft.Events = switch (case.read) {
+                    .events => state.events(t0, t1, &events_out),
+                    .events_of => state.events_of(&page.sources, t0, t1, &events_out),
+                    .none => .{ .count = 0, .dropped = 0 },
+                };
+                assert(found.dropped == 0);
+                state.eval(at);
+                total += @as(f64, @floatFromInt(found.count)) + state.value(page.sources[0]);
+            }
+            best = @min(best, now(io) - start);
+        }
+        report(case.label, best, frames, total);
+    }
 }
 
 /// Case 5: the chase page with its springs' time from a track, played at 60 Hz to 600 s, then for
