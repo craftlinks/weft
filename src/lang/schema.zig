@@ -43,7 +43,10 @@
 //! `max` take `+`'s shapes, a number broadcast and a colour never mixed with a vector, and `abs`
 //! keeps its input's. Their lanes are their inputs'. An entry whose `op` is `function` names its
 //! core function in `function`, so a function of one value is one entry and one value of
-//! `graph.Function`, and the checker and the back end have one arm for all of them.
+//! `graph.Function`, and the checker and the back end have one arm for all of them. Step 33's
+//! `sin`, `cos`, `exp`, `ln`, `sqrt`, `floor`, and `round` are such entries, and so is
+//! `pow(input, n)`, whose `function` is `.{ .pow = 0 }` and whose power is its `n` argument, a
+//! whole number literal from 2 to 8 that the checker requires (`Entry.function_of`).
 //!
 //! ## 4. TigerStyle Invariants
 //! - The table is comptime and checked: positional parameters come first, names are unique in an
@@ -193,7 +196,8 @@ pub const Entry = struct {
     outputs: []const []const u8 = &.{},
     summary: []const u8,
     /// The core function of an entry whose `op` is `function`, and null for every other. A
-    /// client's entry with that `op` sets it too, as the table's are checked to.
+    /// client's entry with that `op` sets it too, as the table's are checked to. A power's n is
+    /// its call's `n` (section 3c).
     function: ?graph.Function = null,
 
     /// The index of the parameter `name`, if the entry has one.
@@ -226,6 +230,17 @@ pub const Entry = struct {
             .spring, .newtonian, .follow => "the goal reached",
             .shift => "the value of the bucket entered",
             else => null,
+        };
+    }
+
+    /// The core function a call of this entry applies, given its `n` where it is a power (section
+    /// 3c). Null for an entry whose `op` is not `function`.
+    pub fn function_of(entry: *const Entry, n: u64) ?graph.Function {
+        const function = entry.function orelse return null;
+        assert(entry.op == .function);
+        return switch (function) {
+            .pow => .{ .pow = @intCast(@min(n, std.math.maxInt(u8))) },
+            else => function,
         };
     }
 
@@ -357,6 +372,31 @@ pub const entries = [_]Entry{
     .{ .name = "abs", .op = .function, .function = .abs, .role = .signal, .summary = "the absolute value of a signal, per component", .params = &.{
         .{ .name = "input", .kind = .signal, .positional = true, .shaped = true },
     } },
+    .{ .name = "sin", .op = .function, .function = .sin, .role = .signal, .summary = "the sine of a signal in radians, per component", .params = &.{
+        .{ .name = "input", .kind = .signal, .positional = true, .shaped = true },
+    } },
+    .{ .name = "cos", .op = .function, .function = .cos, .role = .signal, .summary = "the cosine of a signal in radians, per component", .params = &.{
+        .{ .name = "input", .kind = .signal, .positional = true, .shaped = true },
+    } },
+    .{ .name = "exp", .op = .function, .function = .exp, .role = .signal, .summary = "e to the power of a signal, held at e^709, per component", .params = &.{
+        .{ .name = "input", .kind = .signal, .positional = true, .shaped = true },
+    } },
+    .{ .name = "ln", .op = .function, .function = .ln, .role = .signal, .summary = "the natural log of a signal, held at the log of 2^-1074 at and below 0, per component", .params = &.{
+        .{ .name = "input", .kind = .signal, .positional = true, .shaped = true },
+    } },
+    .{ .name = "sqrt", .op = .function, .function = .sqrt, .role = .signal, .summary = "the square root of a signal, 0 at and below 0, per component", .params = &.{
+        .{ .name = "input", .kind = .signal, .positional = true, .shaped = true },
+    } },
+    .{ .name = "floor", .op = .function, .function = .floor, .role = .signal, .summary = "the largest whole number at or below a signal, per component", .params = &.{
+        .{ .name = "input", .kind = .signal, .positional = true, .shaped = true },
+    } },
+    .{ .name = "round", .op = .function, .function = .round, .role = .signal, .summary = "the nearest whole number to a signal, a half away from zero, per component", .params = &.{
+        .{ .name = "input", .kind = .signal, .positional = true, .shaped = true },
+    } },
+    .{ .name = "pow", .op = .function, .function = .{ .pow = 0 }, .role = .signal, .summary = "a signal to a whole power from 2 to 8, per component", .params = &.{
+        .{ .name = "input", .kind = .signal, .positional = true, .shaped = true },
+        .{ .name = "n", .kind = .integer, .positional = true },
+    } },
     .{ .name = "min", .op = .minimum, .role = .signal, .summary = "the smaller of two signals, per component", .params = &.{
         .{ .name = "a", .kind = .signal, .positional = true, .shaped = true },
         .{ .name = "b", .kind = .signal, .positional = true, .shaped = true },
@@ -438,6 +478,7 @@ pub fn find(name: []const u8, role: Role) ?*const Entry {
 
 /// Every entry's name once, for suggestions.
 pub const call_names = names: {
+    @setEvalBranchQuota(10_000);
     var list: [entries.len][]const u8 = undefined;
     var count = 0;
     for (entries) |entry| {

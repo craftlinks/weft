@@ -463,7 +463,7 @@ const Drawn = struct {
             }
         }.of;
         const other: Id = .{ .index = random.uintLessThan(u32, @max(builder.node_count, 1)) };
-        const choice = if (builder.node_count == 0) 0 else random.uintLessThan(u32, 26);
+        const choice = if (builder.node_count == 0) 0 else random.uintLessThan(u32, 27);
         const from = struct {
             fn maybe(r: std.Random, id: Id) ?Id {
                 return if (r.boolean()) id else null;
@@ -640,6 +640,16 @@ const Drawn = struct {
             23 => try builder.apply(.abs, any),
             24 => try builder.minimum(any, other),
             25 => try builder.maximum(any, other),
+            26 => try builder.apply(switch (random.uintLessThan(u8, 8)) {
+                0 => .sin,
+                1 => .cos,
+                2 => .exp,
+                3 => .ln,
+                4 => .sqrt,
+                5 => .floor,
+                6 => .round,
+                else => .{ .pow = random.intRangeAtMost(u8, 2, 8) },
+            }, any),
             else => try builder.add(any, any),
         };
     }

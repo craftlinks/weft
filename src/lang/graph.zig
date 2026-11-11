@@ -581,7 +581,8 @@ const Back = struct {
             },
             .function => {
                 const input = try back.signal_id(v[0]);
-                const result = builder.apply(entry.function.?, input);
+                const n = if (v.len == 2) v[1].integer else 0;
+                const result = builder.apply(entry.function_of(n).?, input);
                 return .{ .first = try back.attempt(result, item, call) };
             },
             .minimum, .maximum => {
@@ -632,6 +633,7 @@ const Back = struct {
             error.InvalidOdds => .{ .param = "odds", .message = "`odds` must be in [0, 1]" },
             error.InvalidBuckets => .{ .param = "buckets", .message = "`buckets` must be from 1 to 64" },
             error.InvalidPhase => .{ .param = "phase", .message = "`phase` must be in [0, 1)" },
+            error.InvalidPower => .{ .param = "n", .message = "`n` must be a whole number from 2 to 8" },
             error.InvalidRange => switch (op orelse .wave) {
                 .input => .{ .param = "initial", .message = "`initial` must be inside the range, whose low end is at most its high" },
                 .map => .{ .param = "from", .message = "`from` must have a width that fits a double" },

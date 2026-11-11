@@ -30,6 +30,27 @@
 //! The ends use `graph.minimum` and `graph.maximum`, so a signed zero at an end is the same on
 //! every target.
 //!
+//! ## 2b. Functions of a Value, Step 33
+//! Each of these is the function of `elementary.zig`, section 4a, at a range's ends, which is why
+//! each is total: an end of minus or plus infinity has a value too.
+//! - `sqrt`, `floor`, and `round` are monotone and correctly rounded, so their computed values are
+//!   monotone too: the range is the function at the two ends, exact (`monotone`).
+//! - `pow` with an odd n is monotone, so the same. With an even n it is monotone in |x|: the
+//!   larger of the ends' values, and a low end of 0 where the input spans 0. A product rounds
+//!   monotonically for each sign, so these are exact, and `pow(x, 2)` over [-1, 1] is [0, 1].
+//! - `exp` and `ln` are monotone, but their series can move by an ulp against the order of their
+//!   inputs, so their ranges are the ends' values widened by `margin_rounding` of their scale.
+//!   Both are finite whatever the input, since `exp` holds e^709 and `ln` holds its ends.
+//! - `sin` and `cos` work on the turns the op itself computes: |x| / tau, with its whole turns
+//!   taken off, which is monotone in |x| and exact after the division. A side of zero whose turns
+//!   span a whole turn, or an infinite end, gives [-1, 1]. Otherwise its turns lie inside two
+//!   turns from the whole number below them, so the range is the ends' values, with 1 where a
+//!   peak's turn lies between them and -1 where a trough's does, found by comparing turns
+//!   exactly. An input that stays inside one monotone stretch gets the ends alone. The series
+//!   are monotone to an ulp or so between peaks, so the result is widened by `margin_trig`,
+//!   about 16 ulps at 1, and clipped to [-1, 1]. A range across 0 is the hull of its two sides,
+//!   since sine is odd and cosine even and the op computes them that way.
+//!
 //! ## 3. Springs
 //! A spring is a linear second-order system from rest, driven by a goal that is piecewise constant:
 //! goals at cues, a target held over each step, or a follower's goals. It holds its start at rest
@@ -181,6 +202,109 @@ pub fn maximum(a: Range, b: Range) Range {
     a.assert_valid();
     b.assert_valid();
     return .{ .low = graph.maximum(a.low, b.low), .high = graph.maximum(a.high, b.high) };
+}
+
+/// The margin, absolute, of a sine's or a cosine's range (section 2b).
+pub const margin_trig: f64 = 0x1p-48;
+
+/// The range of a function `f` that is monotone non-decreasing and correctly rounded, from its
+/// values at the ends (section 2b). Exact.
+pub fn monotone(a: Range, comptime f: fn (f64) f64) Range {
+    a.assert_valid();
+    const result: Range = .{ .low = f(a.low), .high = f(a.high) };
+    result.assert_valid();
+    return result;
+}
+
+/// The range of `x^n` by repeated products (section 2b). Exact.
+pub fn power(a: Range, n: u8) Range {
+    a.assert_valid();
+    const low = elementary.power(a.low, n);
+    const high = elementary.power(a.high, n);
+    if (n % 2 == 1) return .{ .low = low, .high = high };
+    if (a.low >= 0) return .{ .low = low, .high = high };
+    if (a.high <= 0) return .{ .low = high, .high = low };
+    return .{ .low = 0, .high = graph.maximum(low, high) };
+}
+
+/// The range of `e^x` (section 2b), widened by its margin, and never below 0.
+pub fn exponential(a: Range) Range {
+    a.assert_valid();
+    const ends = Range.of(elementary.exponential(a.low), elementary.exponential(a.high));
+    const widened = ends.widen(ends.scale(), margin_rounding);
+    return .{ .low = @max(widened.low, 0), .high = widened.high };
+}
+
+/// The range of `ln x` (section 2b), widened by its margin.
+pub fn logarithm(a: Range) Range {
+    a.assert_valid();
+    const ends = Range.of(elementary.logarithm(a.low), elementary.logarithm(a.high));
+    return ends.widen(ends.scale(), margin_rounding);
+}
+
+/// Where a periodic function of turns has its peak and its trough, in turns.
+const Extremes = struct { peak: f64, trough: f64 };
+
+/// The range of the sine or the cosine of turns over `[a, b]` radians, `0 <= a <= b`, before its
+/// margin (section 2b): the ends' values, and 1 and -1 where a peak or a trough lies between.
+fn trig_side(a: f64, b: f64, comptime f: fn (f64) f64, extremes: Extremes) Range {
+    assert(a >= 0);
+    assert(a <= b);
+    if (!std.math.isFinite(b)) return .{ .low = -1, .high = 1 };
+    const turns_a = a / std.math.tau;
+    const turns_b = b / std.math.tau;
+    if (turns_b - turns_a >= 1) return .{ .low = -1, .high = 1 };
+    // Exact: a whole number taken off a double at least as large, below 2^53.
+    const whole = @floor(turns_a);
+    const from = turns_a - whole;
+    const to = turns_b - whole;
+    assert(from >= 0 and from < 1);
+    assert(to >= from and to < 2);
+    var result = Range.of(f(a), f(b));
+    for ([_]f64{ extremes.peak, extremes.peak + 1 }) |turn| {
+        if (from <= turn and turn <= to) result.high = 1;
+    }
+    for ([_]f64{ extremes.trough, extremes.trough + 1 }) |turn| {
+        if (from <= turn and turn <= to) result.low = -1;
+    }
+    return result;
+}
+
+/// A trig range widened by `margin_trig` and clipped to [-1, 1].
+fn trig_finish(range: Range) Range {
+    const widened = range.widen(1, margin_trig);
+    return .{ .low = @max(widened.low, -1), .high = @min(widened.high, 1) };
+}
+
+/// The range of `sin x`, x in radians (section 2b).
+pub fn sine(a: Range) Range {
+    a.assert_valid();
+    const extremes: Extremes = .{ .peak = 0.25, .trough = 0.75 };
+    const f = elementary.sine_radians;
+    var result: ?Range = null;
+    if (a.high >= 0) result = trig_side(@max(a.low, 0), a.high, f, extremes);
+    if (a.low < 0) {
+        // Sine is odd: the side below 0 is the side above it, negated.
+        const mirrored = trig_side(@max(-a.high, 0), -a.low, f, extremes);
+        const negative: Range = .{ .low = -mirrored.high, .high = -mirrored.low };
+        result = if (result) |positive| positive.hull(negative) else negative;
+    }
+    return trig_finish(result.?);
+}
+
+/// The range of `cos x`, x in radians (section 2b).
+pub fn cosine(a: Range) Range {
+    a.assert_valid();
+    const extremes: Extremes = .{ .peak = 0, .trough = 0.5 };
+    const f = elementary.cosine_radians;
+    var result: ?Range = null;
+    if (a.high >= 0) result = trig_side(@max(a.low, 0), a.high, f, extremes);
+    if (a.low < 0) {
+        // Cosine is even: the side below 0 is the side above it.
+        const mirrored = trig_side(@max(-a.high, 0), -a.low, f, extremes);
+        result = if (result) |positive| positive.hull(mirrored) else mirrored;
+    }
+    return trig_finish(result.?);
 }
 
 /// The peak overshoot of a move from rest at damping ratio `zeta`, which section 3 explains.

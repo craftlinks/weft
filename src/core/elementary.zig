@@ -1,4 +1,5 @@
-//! Elementary functions: sine and cosine in turns, a decaying exponential, and a logarithm.
+//! Elementary functions: sine and cosine in turns, a decaying exponential, and a logarithm, and
+//! the total functions of a value the graph's `apply` reads (section 4a).
 //!
 //! # Deep Architectural Guide for Reviewers:
 //!
@@ -26,9 +27,39 @@
 //! worked out at compile time, so there are no literal constants to trust. A minimax fit would need
 //! fewer terms, at the cost of a table of numbers no reader can check.
 //!
+//! ## 4a. Functions of a Value
+//! `graph.Function` (step 33) reads these, and every one is total: any f64 a signal can hold,
+//! infinities included, gives a finite value or the infinity it was given, never NaN, and never
+//! an assert. A NaN, which reaches a pure node only after an overflow upstream, such as
+//! `inf - inf`, passes through as NaN, as it does through a sum, so `State.finite` still says
+//! so. Each is a function of its input alone, so the range rules in `range.zig` evaluate
+//! it at a range's ends.
+//! - `sine_radians` and `cosine_radians` take radians, as a formula writes them. The angle is
+//!   made positive (sine is odd and cosine even, so the sign is restored exactly), divided by
+//!   tau, which is the one rounding, and the whole turns taken off, which is exact. So the same
+//!   input gives the same bits everywhere, and accuracy falls with the size of the input: the
+//!   division's error is an ulp of x / tau, about 1e-10 turns at 1e6 radians. From 2^53 tau on,
+//!   every input is a whole number of turns, so the sine is 0 and the cosine 1. An infinite input
+//!   reads as 0 radians.
+//! - `exponential` is `exp` below 0, the same bits, and the same reduction above it up to 709,
+//!   where e^709 is about 8.2e307. Above that it holds e^709, so a value stays finite, as a loop
+//!   saturates (`simulation.zig`, section 7); below -708 it is 0.
+//! - `logarithm` is `log` for a positive finite input. Zero, a negative value, and minus infinity
+//!   are held at the log of the smallest positive f64, 2^-1074, about -744.44, and plus infinity
+//!   at the log of the largest, about 709.78.
+//! - `square_root` is `@sqrt`, correctly rounded by IEEE 754 on every target, of a positive
+//!   input, and 0 for any other: zero, minus zero, or a negative value.
+//! - `round_half_away` rounds a half away from zero, as C's `round` does: -0.5 to -1, 0.5 to 1,
+//!   1.5 to 2, 2.5 to 3, and keeps the sign of a zero, so -0.4 is -0. It is written from
+//!   `@floor`, an exact subtraction, and an exact addition, not left to `@round`, whose lowering
+//!   differs by target. `@floor` is IEEE 754's roundToIntegralTowardNegative everywhere.
+//! - `power` multiplies x by itself n - 1 times, left to right, so `power(x, 2)` is `x * x` bit
+//!   for bit. It overflows to an infinity as a product does.
+//!
 //! ## 5. TigerStyle Invariants
 //! - No allocation, no state, no libc, and fixed-length loops: safe on an audio thread.
 //! - `sine_cosine` returns values in [-1, 1], and `exp` returns values in [0, 1].
+//! - The functions of section 4a return NaN only for NaN.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -76,16 +107,118 @@ pub fn exp(x: f64) f64 {
     assert(!std.math.isNan(x));
     assert(x <= 0);
     if (x < exp_floor) return 0;
+    const result = exp_reduced(x);
+    assert(result >= 0);
+    assert(result <= 1);
+    return result;
+}
+
+/// Above this, `exponential` holds e^709, the largest whole power whose reduction keeps its scale
+/// a normal double (section 4a).
+pub const exp_ceiling: f64 = 709;
+
+/// e^x for x from `exp_floor` to `exp_ceiling`: a whole number of factors of 2 and a remainder
+/// within half of ln 2 (section 3).
+fn exp_reduced(x: f64) f64 {
+    assert(x >= exp_floor);
+    assert(x <= exp_ceiling);
     const twos = @floor(x * std.math.log2e + 0.5);
     const remainder = (x - twos * ln2_high) - twos * ln2_low;
     assert(@abs(remainder) <= std.math.ln2 / 2.0 + 1e-12);
-    const power: i64 = @intFromFloat(twos);
-    assert(power >= -1022);
-    assert(power <= 0);
-    const scale: f64 = @bitCast(@as(u64, @intCast(power + 1023)) << 52);
-    const result = polynomial(&exp_terms, remainder) * scale;
+    const exponent: i64 = @intFromFloat(twos);
+    assert(exponent >= -1022);
+    assert(exponent <= 1023);
+    const scale: f64 = @bitCast(@as(u64, @intCast(exponent + 1023)) << 52);
+    return polynomial(&exp_terms, remainder) * scale;
+}
+
+/// e^x for any x: `exp` at or below 0, the same reduction up to `exp_ceiling`, and e^709 above
+/// it (section 4a).
+pub fn exponential(x: f64) f64 {
+    if (std.math.isNan(x)) return x;
+    if (x <= 0) return exp(x);
+    const result = exp_reduced(if (x > exp_ceiling) exp_ceiling else x);
+    assert(result >= 1);
+    assert(std.math.isFinite(result));
+    return result;
+}
+
+/// ln x for any x: `log` of a positive finite x, and held at the ends of the doubles otherwise
+/// (section 4a).
+pub fn logarithm(x: f64) f64 {
+    if (std.math.isNan(x)) return x;
+    if (!(x > 0)) return log_floor;
+    if (x == std.math.inf(f64)) return log_ceiling;
+    const result = log(x);
+    assert(std.math.isFinite(result));
+    return result;
+}
+
+/// `log` of the smallest and the largest positive doubles, worked out once, at compile time, by
+/// the same function, so they are the bits a run would compute.
+const log_floor: f64 = log_at_comptime(std.math.floatTrueMin(f64));
+const log_ceiling: f64 = log_at_comptime(std.math.floatMax(f64));
+
+fn log_at_comptime(comptime x: f64) f64 {
+    @setEvalBranchQuota(10_000);
+    return comptime log(x);
+}
+
+/// The square root of a positive x, and 0 for any other (section 4a).
+pub fn square_root(x: f64) f64 {
+    if (std.math.isNan(x)) return x;
+    return if (x > 0) @sqrt(x) else 0;
+}
+
+/// x rounded to a whole number, a half away from zero, the sign of a zero kept (section 4a).
+pub fn round_half_away(x: f64) f64 {
+    if (std.math.isNan(x)) return x;
+    const magnitude = @abs(x);
+    // From 2^52 on, every double is whole, and an infinity is itself.
+    if (!(magnitude < 0x1p52)) return x;
+    const whole = @floor(magnitude);
+    // Both exact: the fraction of a double below 2^52, and a whole number below 2^52 plus 1.
+    const rounded = if (magnitude - whole >= 0.5) whole + 1 else whole;
+    return if (std.math.signbit(x)) -rounded else rounded;
+}
+
+/// The fewest and the most factors `power` takes.
+pub const power_min = 2;
+pub const power_max = 8;
+
+/// x to the whole power n, from `power_min` to `power_max`: x times itself n - 1 times, left to
+/// right (section 4a).
+pub fn power(x: f64, n: u8) f64 {
+    assert(n >= power_min and n <= power_max);
+    var result = x;
+    for (1..n) |_| result = result * x;
+    return result;
+}
+
+/// The sine of `x` radians (section 4a).
+pub fn sine_radians(x: f64) f64 {
+    if (std.math.isNan(x)) return x;
+    if (!std.math.isFinite(x)) return 0;
+    const value = sine_cosine(turns_of(@abs(x))).sine;
+    return if (std.math.signbit(x)) -value else value;
+}
+
+/// The cosine of `x` radians (section 4a).
+pub fn cosine_radians(x: f64) f64 {
+    if (std.math.isNan(x)) return x;
+    if (!std.math.isFinite(x)) return 1;
+    return sine_cosine(turns_of(@abs(x))).cosine;
+}
+
+/// The part of a turn that `radians`, finite and at least 0, is past its whole turns: one
+/// rounding in the division, and none in taking the whole turns off.
+pub fn turns_of(radians: f64) f64 {
+    assert(radians >= 0);
+    assert(std.math.isFinite(radians));
+    const turns = radians / std.math.tau;
+    const result = turns - @floor(turns);
     assert(result >= 0);
-    assert(result <= 1);
+    assert(result < 1);
     return result;
 }
 
@@ -193,6 +326,63 @@ fn polynomial(terms: []const f64, x: f64) f64 {
 }
 
 const testing = std.testing;
+
+// Locks section 4a's rounding: a half goes away from zero, -0.5 to -1, 0.5 to 1, 1.5 to 2, 2.5
+// to 3, -2.5 to -3, the largest double below 0.5 to 0, -0.4 to -0; and it agrees with `@round`
+// on this target for every one of them.
+test "round takes a half away from zero" {
+    const cases = [_][2]f64{
+        .{ -0.5, -1 },               .{ 0.5, 1 },                 .{ 1.5, 2 },     .{ 2.5, 3 },
+        .{ -2.5, -3 },               .{ -1.5, -2 },               .{ 0.4, 0 },     .{ -0.4, -0.0 },
+        .{ 0.49999999999999994, 0 }, .{ 0x1p52 + 1, 0x1p52 + 1 }, .{ -0.0, -0.0 }, .{ 4503599627370495.5, 4503599627370496 },
+    };
+    for (cases) |case| {
+        const got = round_half_away(case[0]);
+        try testing.expectEqual(@as(u64, @bitCast(case[1])), @as(u64, @bitCast(got)));
+        try testing.expectEqual(@as(u64, @bitCast(@round(case[0]))), @as(u64, @bitCast(got)));
+    }
+    try testing.expectEqual(std.math.inf(f64), round_half_away(std.math.inf(f64)));
+}
+
+// Locks the totals of section 4a: sqrt of -1, -0, and -inf is +0; ln of 0 and of -1 is the log of
+// 2^-1074, about -744.44, and of +inf about 709.78; e^710 and e^inf are e^709; sin and cos of an
+// infinity are 0 and 1; sin(-0) is -0; pow(x, 2) is x * x; and a NaN passes through each.
+test "the functions of a value are total and finite" {
+    for ([_]f64{ -1, -0.0, -std.math.inf(f64) }) |x| {
+        try testing.expectEqual(@as(u64, 0), @as(u64, @bitCast(square_root(x))));
+    }
+    try testing.expectEqual(@as(f64, 3), square_root(9));
+    try testing.expectApproxEqAbs(@as(f64, -744.4400719213812), logarithm(0), 1e-12);
+    try testing.expectEqual(logarithm(0), logarithm(-1));
+    try testing.expectEqual(logarithm(0), logarithm(-std.math.inf(f64)));
+    try testing.expectApproxEqAbs(@as(f64, 709.782712893384), logarithm(std.math.inf(f64)), 1e-12);
+    try testing.expectEqual(exponential(709), exponential(710));
+    try testing.expectEqual(exponential(709), exponential(std.math.inf(f64)));
+    try testing.expectApproxEqRel(@as(f64, 8.218407461554972e307), exponential(709), 1e-15);
+    try testing.expectEqual(exp(-1), exponential(-1));
+    try testing.expectEqual(@as(f64, 0), exponential(-std.math.inf(f64)));
+    try testing.expectApproxEqRel(@as(f64, std.math.e), exponential(1), 1e-15);
+    try testing.expectEqual(@as(f64, 0), sine_radians(std.math.inf(f64)));
+    try testing.expectEqual(@as(f64, 1), cosine_radians(-std.math.inf(f64)));
+    try testing.expect(std.math.signbit(sine_radians(-0.0)));
+    for ([_]f64{ 0.1, -1.7, 3e100 }) |x| try testing.expectEqual(x * x, power(x, 2));
+    try testing.expectEqual(@as(f64, -3.375), power(-1.5, 3));
+    const nan = std.math.nan(f64);
+    const functions = [_]*const fn (f64) f64{ exponential, logarithm, square_root, round_half_away, sine_radians, cosine_radians };
+    for (functions) |f| try testing.expect(std.math.isNan(f(nan)));
+}
+
+// Locks the radian sine and cosine against `@sin` and `@cos` of this target within 4e-16 from
+// -10 to 10, and the oddness and evenness: sin(-x) is -sin(x) and cos(-x) is cos(x), bit for bit.
+test "sine and cosine in radians are accurate and symmetric" {
+    var x: f64 = -10;
+    while (x <= 10) : (x += 0.0137) {
+        try testing.expectApproxEqAbs(@sin(x), sine_radians(x), 4e-16 * @max(1, @abs(x)));
+        try testing.expectApproxEqAbs(@cos(x), cosine_radians(x), 4e-16 * @max(1, @abs(x)));
+        try testing.expectEqual(-sine_radians(x), sine_radians(-x));
+        try testing.expectEqual(cosine_radians(x), cosine_radians(-x));
+    }
+}
 
 /// The sine or cosine of `turns` of a cycle in f128, far beyond f64: the plain series with 40
 /// terms, whose first omitted term is below 1e-40 for any angle in a cycle.

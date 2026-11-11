@@ -8,7 +8,7 @@
 //! locked by the regress golden. If a graph's text compiles to the same nodes, field for field,
 //! the text gives the same samples, with no second golden. Fourteen of the fifteen are here: the
 //! recorded one plays a client's samples, which the language does not have. So are the four
-//! graphs of `abs`, `min`, and `max` (step 26).
+//! graphs of `abs`, `min`, and `max` (step 26), and the eight of step 33, named `fn_NAME`.
 //!
 //! ## 2. One Preamble
 //! Every graph reads the catalog's tables, so each text starts with the same preamble: its three
@@ -81,6 +81,14 @@ const cases = [_]Case{
     .{ .name = "min", .text = "out = min(wave(sine, 0.7hz), wave(triangle, 1hz))\n" },
     .{ .name = "max", .text = sequence ++ "out = max(sequence, wave(sine, 0.7hz) * 0.5)\n" },
     .{ .name = "clamp", .text = "out = min(max(wave(sine, 0.7hz) * 2, -0.5), 1)\n" },
+    .{ .name = "fn_sin", .text = "out = sin(wave(sine, 0.7hz) * 4)\n" },
+    .{ .name = "fn_cos", .text = "out = cos(wave(sine, 0.7hz) * 4)\n" },
+    .{ .name = "fn_exp", .text = "out = exp(wave(sine, 0.7hz) * 3)\n" },
+    .{ .name = "fn_ln", .text = "out = ln(wave(sine, 0.7hz))\n" },
+    .{ .name = "fn_sqrt", .text = "out = sqrt(wave(sine, 0.7hz))\n" },
+    .{ .name = "fn_floor", .text = "out = floor(wave(sine, 0.7hz) * 3)\n" },
+    .{ .name = "fn_round", .text = "out = round(wave(sine, 0.7hz) * 2.5)\n" },
+    .{ .name = "fn_pow", .text = "out = pow(wave(sine, 0.7hz) * 1.5, 3)\n" },
 };
 
 var compiled: weft.lang.Compiled(.{ .tokens = 1024, .tree = 512, .names = 64, .nodes = 64, .slab = 256, .cues = 8, .goals = 16, .regions = 8, .tracks = 4, .track_samples = 4 }) = undefined;

@@ -34,11 +34,14 @@
 //! The product is the quotient exactly when `c` is a power of two, and otherwise within an ulp of
 //! it, the same bits on every target. Two numbers fold to their quotient itself.
 //!
-//! `abs`, `min`, and `max` (step 26) are calls, not operators, and fold the same way: given only
-//! numbers, the call is the constant the core's own function gives (`graph.Function.of`,
-//! `graph.minimum`, `graph.maximum`), the bits its node would hold, so `max(1, 2)` builds one
-//! node, and a module such as `std`'s `clamp` given numbers builds none of its own. The call's
-//! record stays in `calls`, which a back end never reaches from an expression.
+//! `abs`, `min`, and `max` (step 26), and step 33's functions of a value, are calls, not
+//! operators, and fold the same way: given only numbers, the call is the constant the core's own
+//! function gives (`graph.Function.of`, `graph.minimum`, `graph.maximum`), the bits its node
+//! would hold, so `max(1, 2)` builds one node, and a module such as `std`'s `clamp` given numbers
+//! builds none of its own. The call's record stays in `calls`, which a back end never reaches
+//! from an expression. A power that overflows folds to an infinity, which the back end refuses
+//! as it refuses `1e300 * 1e300`. `pow`'s `n` is a whole number literal from 2 to 8, checked
+//! here, so a signal, 1, 9, 2.5, or -2 is refused at it.
 //!
 //! ## 4. Times
 //! A time literal is a whole number of flicks, worked out in integers from its digits: seconds
@@ -432,6 +435,7 @@ const reserved = [_][]const u8{ "seed", "start", "cue", "track", "module", "use"
 
 /// The most lanes a region has (section 9), the core's own limit.
 const graph = @import("../core/graph.zig");
+const graph_elementary = @import("../core/elementary.zig");
 pub const lanes_max = graph.lanes_max;
 
 const Checker = struct {
@@ -987,9 +991,10 @@ const Checker = struct {
         const values = checker.memory.values[first..][0..entry.params.len];
         switch (entry.op) {
             .function => {
-                assert(values.len == 1);
+                assert(values.len == 1 or values.len == 2);
                 const x = checker.is_constant(values[0].signal) orelse return null;
-                return entry.function.?.of(x);
+                const n = if (values.len == 2) values[1].integer else 0;
+                return entry.function_of(n).?.of(x);
             },
             .minimum, .maximum => {
                 assert(values.len == 2);
@@ -1687,6 +1692,16 @@ const Checker = struct {
         return checker.memory.exprs[expr].lanes;
     }
 
+    /// `pow(x, n)`'s power: a whole number from 2 to 8 (section 3).
+    fn power_in_range(checker: *Checker, index: u32, number: f64) Fail!void {
+        const low = graph_elementary.power_min;
+        const high = graph_elementary.power_max;
+        if (number >= low and number <= high and @floor(number) == number) return;
+        const diagnostic = checker.fail(index, .out_of_range, "a power is a whole number from {d} to {d}", .{ low, high });
+        error_module.hint(diagnostic, "for 1 write the signal itself; for more than 8 multiply two, such as `pow(x, 8) * pow(x, 2)`", .{});
+        return error.Checked;
+    }
+
     /// `lanes(n, …)`'s count: opens a region of n lanes for its body (section 9).
     fn open_region(checker: *Checker, index: u32, number: f64) Fail!void {
         if (checker.region) |count| {
@@ -1969,6 +1984,7 @@ const Checker = struct {
             },
             .integer => {
                 const number = try checker.literal_number(index, "a whole number");
+                if (entry.op == .function) try checker.power_in_range(index, number);
                 if (!(number >= 0 and number <= 0x1p32 and @floor(number) == number)) {
                     _ = checker.fail(index, .out_of_range, "`{s}` is a whole number from 0 to 2^32", .{param.name});
                     return error.Checked;

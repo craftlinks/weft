@@ -75,7 +75,16 @@
 //! and the maximum, one line each, `zeros PAIR OP VALUE`. They come last, so every line before
 //! them is a line of step 10.
 //!
-//! ## 12. TigerStyle Invariants
+//! ## 12. Functions of a Value, Step 33
+//! Eight graphs read `sin`, `cos`, `exp`, `ln`, `sqrt`, `floor`, `round`, and `pow` of a wave at
+//! every epoch, each across its domain's edge where it has one: `ln` and `sqrt` of a wave that
+//! goes below 0, `floor` and `round` of one that crosses halves. Then a run of constants locks
+//! the cases a target could answer its own way, one line each, `function NAME INDEX VALUE`:
+//! round at the halves and at negative values, floor at -0.5 and -0, the trig functions at large
+//! arguments, `exp` past its ceiling and floor, `ln` at and below 0 and at a subnormal, `sqrt`
+//! of negatives, and powers. They come last, so every line before them is a line of step 26.
+//!
+//! ## 13. TigerStyle Invariants
 //! - The text fits in `text_size_max` by construction, so `render` cannot fail.
 
 const std = @import("std");
@@ -201,6 +210,34 @@ const zero_pairs = [_][2]f64{
     .{ 0.0, -0.0 }, .{ -0.0, 0.0 }, .{ -0.0, -0.0 }, .{ 0.0, 0.0 }, .{ 0.5, 0.5 }, .{ -2, 3 },
 };
 
+/// The graphs of section 12, each built by `function_graph_build`, after the zeros.
+const FunctionGraph = enum {
+    sin,
+    cos,
+    exp,
+    ln,
+    sqrt,
+    floor,
+    round,
+    pow,
+};
+
+const function_graphs = std.enums.values(FunctionGraph);
+
+/// The inputs of section 12's run of constants, for each function.
+const function_inputs = [_]struct { function: weft.graph.Function, name: []const u8, inputs: []const f64 }{
+    .{ .function = .round, .name = "round", .inputs = &.{ -2.5, -1.5, -0.5, -0.4, -0.0, 0.5, 1.5, 2.5, 0.49999999999999994, 4503599627370495.5, -4503599627370495.5 } },
+    .{ .function = .floor, .name = "floor", .inputs = &.{ -0.5, -0.0, 0.0, 2.5, -2.5, 4503599627370495.5 } },
+    .{ .function = .sin, .name = "sin", .inputs = &.{ -0.0, 1, -1, 3.141592653589793, 1e6, -1e6, 1e15, 1e300, 1e-300 } },
+    .{ .function = .cos, .name = "cos", .inputs = &.{ 0, 1, -1, 3.141592653589793, 1e6, -1e6, 1e15, 1e300 } },
+    .{ .function = .exp, .name = "exp", .inputs = &.{ -800, -708, -1, -0.0, 1, 2.5, 700, 709, 710, 1e300 } },
+    .{ .function = .ln, .name = "ln", .inputs = &.{ -1, -0.0, 0, 0x1p-1074, 1e-300, 0.5, 1, 2, 1e300 } },
+    .{ .function = .sqrt, .name = "sqrt", .inputs = &.{ -1, -0.0, 0, 2, 1e-300, 1e300 } },
+    .{ .function = .{ .pow = 2 }, .name = "pow2", .inputs = &.{ -1.1, 0.1, 1e200 } },
+    .{ .function = .{ .pow = 3 }, .name = "pow3", .inputs = &.{ -1.1, 0.1, -1e200 } },
+    .{ .function = .{ .pow = 8 }, .name = "pow8", .inputs = &.{ -1.1, 0.1, 1e-50 } },
+};
+
 /// The graphs whose events are listed, each built by `event_graph_build`.
 const EventGraph = enum {
     bounce,
@@ -246,8 +283,17 @@ const runaway_sample_count = 2 * runaway_samples_per_run;
 const value_sample_count = value_graphs.len * epochs.len * samples_per_run;
 const zero_sample_count = 3 * zero_pairs.len;
 
+/// Section 12's samples: its graphs at every epoch, then a line a constant input.
+const function_sample_count = function_graphs.len * epochs.len * samples_per_run;
+const function_input_count = count: {
+    var count: usize = 0;
+    for (function_inputs) |row| count += row.inputs.len;
+    break :count count;
+};
+
 pub const sample_count = wave_sample_count + noise_sample_count + graph_sample_count +
-    runaway_sample_count + value_sample_count + zero_sample_count;
+    runaway_sample_count + value_sample_count + zero_sample_count + function_sample_count +
+    function_input_count;
 
 pub const event_count = count: {
     var count: u32 = 0;
@@ -274,6 +320,8 @@ comptime {
     assert(event_count == 144);
     assert(value_sample_count == 384);
     assert(zero_sample_count == 18);
+    assert(function_sample_count == 768);
+    assert(function_input_count == 68);
     assert(Graph.slab_count_max >= Graph.nodes_count_max + 2 * weft.motion.cursor_count);
     assert(text_size_max < 1 << 20);
     for (signals) |signal| assert(weft.Rate.from_hz(signal.rate_hz) != null);
@@ -307,6 +355,10 @@ pub fn render(text: *[text_size_max]u8) []const u8 {
         for (&epochs) |*epoch| render_graph_run(&writer, graph, epoch);
     }
     render_zeros(&writer);
+    for (function_graphs) |graph| {
+        for (&epochs) |*epoch| render_graph_run(&writer, graph, epoch);
+    }
+    render_function_inputs(&writer);
     assert(writer.buffered().len > line_count);
     assert(writer.buffered()[writer.buffered().len - 1] == '\n');
     return writer.buffered();
@@ -529,6 +581,23 @@ fn render_zeros(writer: *std.Io.Writer) void {
             assert(writer.buffered().len - size_before <= line_size_max);
         }
     }
+}
+
+/// Writes each function of `function_inputs` at each of its inputs, from nodes, as section 12
+/// explains.
+fn render_function_inputs(writer: *std.Io.Writer) void {
+    for (function_inputs) |row| for (row.inputs, 0..) |x, index| {
+        var nodes: [2]weft.Node = undefined;
+        var builder = weft.Builder.init(&nodes, .{ .slab_count_max = 2 });
+        const input = builder.constant(x) catch unreachable;
+        const output = builder.apply(row.function, input) catch unreachable;
+        var slab: [2]f64 = undefined;
+        var state = weft.State.init(builder.finish(), &slab);
+        state.eval(.{ .flicks = 0 });
+        const size_before = writer.buffered().len;
+        writer.print("function {s} {d} {x}\n", .{ row.name, index, state.value(output) }) catch unreachable;
+        assert(writer.buffered().len - size_before <= line_size_max);
+    };
 }
 
 /// Lists the events of the first `event_range_seconds` of `graph` at `epoch`, as section 7
@@ -763,6 +832,8 @@ pub fn graph_nodes(name: []const u8, nodes: *[Graph.nodes_count_max]weft.Node) ?
         graph_build(graph, &builder) catch unreachable
     else if (std.meta.stringToEnum(ValueGraph, name)) |graph|
         value_graph_build(graph, &builder) catch unreachable
+    else if (function_graph_name(name)) |graph|
+        function_graph_build(graph, &builder) catch unreachable
     else
         return null;
     const program = builder.finish();
@@ -774,8 +845,34 @@ fn build_any(graph: anytype, builder: *weft.Builder) weft.Builder.Error!weft.Id 
     return switch (@TypeOf(graph)) {
         Graph => graph_build(graph, builder),
         ValueGraph => value_graph_build(graph, builder),
+        FunctionGraph => function_graph_build(graph, builder),
         else => @compileError("not a catalog graph"),
     };
+}
+
+/// The `FunctionGraph` the language's test names `fn_NAME`, since `abs`, `min`, and `max` name
+/// graphs of section 11 already and these would read as calls.
+fn function_graph_name(name: []const u8) ?FunctionGraph {
+    if (!std.mem.startsWith(u8, name, "fn_")) return null;
+    return std.meta.stringToEnum(FunctionGraph, name[3..]);
+}
+
+fn function_graph_build(graph: FunctionGraph, builder: *weft.Builder) weft.Builder.Error!weft.Id {
+    const wave = try builder.wave(.{ .shape = .sine, .hz = 0.7 });
+    switch (graph) {
+        // Four radians either way: more than half a turn, so each crosses a peak.
+        .sin => return builder.apply(.sin, try builder.multiply(wave, try builder.constant(4))),
+        .cos => return builder.apply(.cos, try builder.multiply(wave, try builder.constant(4))),
+        // From e^-3 to e^3.
+        .exp => return builder.apply(.exp, try builder.multiply(wave, try builder.constant(3))),
+        // The wave itself, so half of it is at or below 0 and held.
+        .ln => return builder.apply(.ln, wave),
+        .sqrt => return builder.apply(.sqrt, wave),
+        // Three and two and a half times the wave: steps at whole numbers and at halves.
+        .floor => return builder.apply(.floor, try builder.multiply(wave, try builder.constant(3))),
+        .round => return builder.apply(.round, try builder.multiply(wave, try builder.constant(2.5))),
+        .pow => return builder.apply(.{ .pow = 3 }, try builder.multiply(wave, try builder.constant(1.5))),
+    }
 }
 
 fn value_graph_build(graph: ValueGraph, builder: *weft.Builder) weft.Builder.Error!weft.Id {

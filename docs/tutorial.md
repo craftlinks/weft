@@ -922,7 +922,11 @@ The limits worth knowing before you design around Weft:
   otherwise within one unit in the last place, the same on every target. A `crossing` is the one
   way to make a gate; a `map` is the one way to rescale. Since 0.2, `abs(x)`, `min(a, b)`, and
   `max(a, b)` exist, per component and per lane like `+`, with exact ranges, and `use std` gives
-  `clamp(x, low, high)`; there is still no `floor`, `sin` of a value, `sqrt`, or `exp`.
+  `clamp(x, low, high)`. So do `sin` and `cos` in radians, `exp`, `ln`, `sqrt`, `floor`,
+  `round` (a half away from zero), and `pow(x, n)` for a whole n from 2 to 8, each total:
+  `sqrt(-1)` is 0, `ln(0)` about -744.44, `exp(1000)` e^709. `sin` and `cos` lose accuracy as
+  their input grows: about 1e-10 at a million radians, and from 2^53 tau on they are 0 and 1.
+  `use std` gives `quantize(x, step)` for a fixed `step`. There is no `tan` or `atan2`.
 - **No strings in a signal.** A value is one to four numbers. Since step 27 a string literal,
   `"text"`, exists for one use: a parameter of a client's noun (README, A Client's Nouns).
 - **A track holds a bounded number of writes** (`Limits.track_samples`, 1,024 by default).
@@ -950,6 +954,8 @@ target).
 | `'hz' takes a frequency` | A bare number | Write `2hz`, `500ms`, `1.5s` |
 | `not a whole number of flicks` | A time finer than the grid | Round to 5 places of a second |
 | `4 lanes and 5 lanes do not go together` | Two regions of different sizes | Make the counts equal |
+| `a power is a whole number from 2 to 8` | `pow(x, 1)`, `pow(x, 10)`, `pow(x, 0.5)`, or `pow(x, k)` with k a name | Write `x`, multiply powers, use `sqrt`, or write the number |
+| A `floor` of a chase steps between frames, or at a frame you did not expect | `floor` reads the chase's value interpolated between its fixed steps | Expected: a step falls where the smooth value crosses a whole number |
 | ``there is no call `clamp` `` | `clamp` is a module of `std`, not a primitive | Add `use std`, and pass `--use std=src/lang/std.weft` to `weft` |
 | `` `min` is a primitive, not a module's name ``, or ``the module `clamp` is declared twice`` | A module of your own from before 0.2 named `abs`, `min`, or `max`, or `clamp` beside `use std` | Rename it, or delete it and use the call |
 | `error.Invalid` with no message | `compile(...) catch unreachable` | Render `compiled.errors()`; it names the `Limits` field to raise |

@@ -1,10 +1,13 @@
-//! `abs`, `min`, and `max` in the language (step 26), and `std`'s `clamp`: what they build, what
-//! they fold to, their shapes and lanes, their ranges, and their errors.
+//! The functions of a value in the language: `abs`, `min`, and `max` (step 26), `sin`, `cos`,
+//! `exp`, `ln`, `sqrt`, `floor`, `round`, and `pow` (step 33), and `std`'s `clamp` and
+//! `quantize`: what they build, what they fold to, their shapes and lanes, their ranges, and
+//! their errors.
 //!
 //! # Deep Architectural Guide for Reviewers:
 //!
 //! ## 1. Equality
-//! `clamp` is a module, so a file that calls it is compiled beside the file written out, and
+//! `clamp` and `quantize` are modules, so a file that calls one is compiled beside the file
+//! written out, and
 //! their nodes are compared with `std.meta.eql`, field by field, as `modules.zig` compares any
 //! module with its hand-written graph. The catalog's own graphs of these calls are compared with
 //! the builder in `lang.zig`, and their samples are locked by the regress golden.
@@ -259,6 +262,126 @@ test "abs, min, and max refuse what does not fit, as arithmetic does" {
             .message = "clamp needs `high`",
             .hint = "add `high: …`",
             .span = "clamp(wave(sine, 1hz), 0)",
+        },
+    };
+    for (cases) |case| try expect_one(case);
+}
+
+// Locks step 33's folding: each function of a number is the constant the core's function gives,
+// bit for bit, one node each: sin(1), cos(0) = 1, exp(1000) held at e^709, ln(0) held at the log
+// of 2^-1074, sqrt(-4) = 0, floor(-0.5) = -1, round(2.5) = 3, round(-0.5) = -1, and pow(3, 4) =
+// 81.
+test "the functions of a value fold numbers to the core's constant" {
+    const source =
+        \\a = sin(1)
+        \\b = cos(0)
+        \\c = exp(1000)
+        \\d = ln(0)
+        \\e = sqrt(-4)
+        \\f = floor(-0.5)
+        \\g = round(2.5)
+        \\h = round(-0.5)
+        \\i = pow(3, 4)
+        \\
+    ;
+    try compile(&with_module, source);
+    try testing.expectEqual(@as(usize, 9), with_module.program.nodes.len);
+    const F = weft.graph.Function;
+    const expected = [_]struct { []const u8, f64 }{
+        .{ "a", F.of(.sin, 1) }, .{ "b", 1 },  .{ "c", F.of(.exp, 709) }, .{ "d", F.of(.ln, 0x1p-1074) },
+        .{ "e", 0 },             .{ "f", -1 }, .{ "g", 3 },               .{ "h", -1 },
+        .{ "i", 81 },
+    };
+    for (expected) |pair| {
+        const node = with_module.program.nodes[with_module.signal(pair[0]).?.index];
+        errdefer std.debug.print("{s}: {any}\n", .{ pair[0], node.op });
+        try testing.expectEqual(bits(pair[1]), bits(node.op.constant));
+    }
+}
+
+// Locks `pow(x, 2)` against `x * x`: one node where the product is one too, the same value bit
+// for bit at every time read, and a range of [0, 2.25] for 1.5 times a wave, where the product's
+// is [-2.25, 2.25].
+test "pow(x, 2) is x * x with a tighter range" {
+    const source =
+        \\x = wave(sine, 0.7hz) * 1.5
+        \\p = pow(x, 2)
+        \\q = x * x
+        \\
+    ;
+    try compile(&with_module, source);
+    try testing.expectEqual(weft.Range{ .low = 0, .high = 2.25 }, range_of(&with_module, "p"));
+    try testing.expectEqual(weft.Range{ .low = -2.25, .high = 2.25 }, range_of(&with_module, "q"));
+    var state = weft.State.init(with_module.program, slab[0..with_module.program.slab_count]);
+    for (0..200) |step| {
+        state.eval(.{ .flicks = @intCast(step * 3_528_017) });
+        try testing.expectEqual(bits(state.value(with_module.signal("q").?)), bits(state.value(with_module.signal("p").?)));
+    }
+}
+
+// Locks `std`'s `quantize(x, step)`: `round(x / step) * step` node for node, so 0.3 snaps to 0.25
+// and -0.4 to -0.5 by quarters, and -0.375, a half, goes away from zero to -0.5.
+test "std's quantize is round of a quotient, times the step" {
+    try expect_same(
+        "use std\nx = wave(sine, 1hz)\nout = quantize(x, 0.25)\n",
+        "x = wave(sine, 1hz)\nout = round(x / 0.25) * 0.25\n",
+    );
+    try compile(&with_module, "use std\na = quantize(0.3, 0.25)\nb = quantize(-0.4, 0.25)\nc = quantize(-0.375, 0.25)\n");
+    try testing.expectEqualSlices(f64, &.{0.25}, try values_at_zero(&with_module, "a"));
+    try testing.expectEqualSlices(f64, &.{-0.5}, try values_at_zero(&with_module, "b"));
+    try testing.expectEqualSlices(f64, &.{-0.5}, try values_at_zero(&with_module, "c"));
+}
+
+// Locks the shapes and lanes of step 33: sin of a vec2 is a vec2, each component its own sine;
+// floor over four lanes of `lane * 0.6` is 0, 0, 1, 1; and floor of a chase is simulated, so its
+// program is stepped, while round of a wave leaves a program closed form.
+test "the functions of a value work per component and per lane, and keep the input's class" {
+    const source =
+        \\cue c0 = 0s
+        \\v = sin(vec2(0, 1))
+        \\f = lanes(4, floor(lane * 0.6))
+        \\
+    ;
+    try compile(&with_module, source);
+    try testing.expectEqualSlices(f64, &.{ 0, weft.graph.Function.of(.sin, 1) }, try values_at_zero(&with_module, "v"));
+    try testing.expectEqualSlices(f64, &.{ 0, 0, 1, 1 }, try values_at_zero(&with_module, "f"));
+    try compile(&with_module, "cue c0 = 0s\nr = round(wave(sine, 1hz) * 3)\n");
+    try testing.expect(!with_module.program.report().stepped);
+    try compile(&with_module, "cue c0 = 0s\nr = floor(chase(wave(sine, 1hz), time: 0.5s) * 3)\n");
+    try testing.expect(with_module.program.report().stepped);
+}
+
+// Locks the refusals of step 33: a power of 1, 9, 2.5, or -2, or a name, each refused once at the
+// power; and `quantize` by a signal or by 0, refused as a divisor at the call, since the module's
+// body divides.
+test "pow and quantize refuse what is not a fixed number" {
+    const power_message = "a power is a whole number from 2 to 8";
+    const power_hint = "for 1 write the signal itself; for more than 8 multiply two, such as `pow(x, 8) * pow(x, 2)`";
+    const cases = [_]Expected{
+        .{ .source = "x = pow(wave(sine, 1hz), 1)\n", .code = .out_of_range, .message = power_message, .hint = power_hint, .span = "1" },
+        .{ .source = "x = pow(wave(sine, 1hz), 9)\n", .code = .out_of_range, .message = power_message, .hint = power_hint, .span = "9" },
+        .{ .source = "x = pow(wave(sine, 1hz), 2.5)\n", .code = .out_of_range, .message = power_message, .hint = power_hint, .span = "2.5" },
+        .{ .source = "x = pow(wave(sine, 1hz), -2)\n", .code = .out_of_range, .message = power_message, .hint = power_hint, .span = "-2" },
+        .{
+            .source = "n = 2\nx = pow(wave(sine, 1hz), n)\n",
+            .code = .not_live,
+            .message = "a whole number is fixed when it is built, so `n` cannot set it",
+            .hint = "write a number; to move it, map the output instead",
+            .span = "n",
+        },
+        .{
+            .source = "use std\nx = quantize(wave(sine, 1hz), wave(saw, 1hz))\n",
+            .code = .not_live,
+            .message = "a divisor is a number, fixed when the program is built",
+            .hint = "to scale by a signal, multiply by one",
+            .span = "quantize(wave(sine, 1hz), wave(saw, 1hz))",
+        },
+        .{
+            .source = "use std\nx = quantize(wave(sine, 1hz), 0)\n",
+            .code = .out_of_range,
+            .message = "there is no division by 0",
+            .hint = "a divisor is a number other than 0",
+            .span = "quantize(wave(sine, 1hz), 0)",
         },
     };
     for (cases) |case| try expect_one(case);
