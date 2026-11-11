@@ -128,6 +128,15 @@ pub const CueName = struct {
     element: ?u32 = null,
 };
 
+/// The input of a `spread`, which gives one node's value to every lane, else the node itself.
+fn through_spread(nodes: []const graph.Node, id: graph.Id) graph.Id {
+    assert(id.index < nodes.len);
+    return switch (nodes[id.index].op) {
+        .spread => |input| input,
+        else => id,
+    };
+}
+
 /// Hashes the tags and texts of an item's tokens, comments and newlines left out, so spacing and
 /// comments never change a fingerprint.
 fn hash_tokens(hash: *std.hash.Fnv1a_64, tree: *const parse.Tree, index: u32) void {
@@ -547,6 +556,49 @@ pub fn Compiled(comptime limits: Limits) type {
         pub fn outputs(compiled: *const Self, name: []const u8) ?Ids {
             const index = compiled.binding(name, .signal) orelse return null;
             return compiled.ids[index];
+        }
+
+        /// The nodes that fire the events of the signal `name`, the list `State.events_of` takes
+        /// (step 23): its first node, followed through a `spread` to its input and through a
+        /// `pack` to its components, sorted, with the nodes that fire nothing left out. So a bounce
+        /// in a region with no stagger, which is one bounce spread over the lanes, and a vector's
+        /// spring, one spring a component, give their events. Empty for a name that is not a
+        /// signal. `out` holds at least `graph.components_max` ids.
+        pub fn event_sources(
+            compiled: *const Self,
+            name: []const u8,
+            out: []graph.Id,
+        ) []const graph.Id {
+            assert(out.len >= graph.components_max);
+            const first = compiled.signal(name) orelse return out[0..0];
+            const nodes = compiled.program.nodes;
+            const top = through_spread(nodes, first);
+            var candidates: [graph.components_max]graph.Id = undefined;
+            var candidate_count: usize = 0;
+            switch (nodes[top.index].op) {
+                .pack => |pack| for (pack.inputs[0..pack.count]) |input| {
+                    candidates[candidate_count] = through_spread(nodes, input);
+                    candidate_count += 1;
+                },
+                else => {
+                    candidates[0] = top;
+                    candidate_count = 1;
+                },
+            }
+            var count: usize = 0;
+            for (candidates[0..candidate_count]) |id| {
+                if (!State.fires_events(&nodes[id.index])) continue;
+                // An insertion that keeps `out` ascending, dropping a component read twice.
+                var at = count;
+                while (at > 0 and out[at - 1].index > id.index) : (at -= 1) {}
+                if (at > 0 and out[at - 1].index == id.index) continue;
+                std.mem.copyBackwards(graph.Id, out[at + 1 .. count + 1], out[at..count]);
+                out[at] = id;
+                count += 1;
+            }
+            assert(count <= graph.components_max);
+            assert(State.sources_valid(&compiled.program, out[0..count]));
+            return out[0..count];
         }
 
         pub fn track(compiled: *const Self, name: []const u8) ?track_module.TrackId {

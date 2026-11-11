@@ -128,6 +128,13 @@
 //! consecutive ranges run each step once and never restore a checkpoint, and an `eval(t1)` after
 //! them runs at most the one step a t1 on a step leaves.
 //!
+//! A reader can ask for some sources only: `events_of(sources, t0, t1)` gives the events of the
+//! listed nodes, in the order and with the overflow rule of `events` (step 23). The solved sources
+//! are found apart from the step already, so a list steps only when it names a crossing, a
+//! follower, or a shift register, and then it steps as `events` does and keeps only the listed
+//! sources' events. A list of solved sources reads the cue table, the goals, and a motion's
+//! cursor, and writes nothing, so it leaves the state, the slab, and the checkpoints as they were.
+//!
 //! ## 12. Ranges, Classes, and Live Input
 //! `Program.ranges` gives each node a range its values never leave, and `Program.classes` the
 //! class of each, as `range.zig` explains: both are worked out from the ops in a forward pass, with
@@ -235,7 +242,9 @@
 //! - `events` allocates nothing and takes no lock. Its work is the seek `eval` would make to t0,
 //!   the steps the range spans, one more pass, and for each event at most `out.len` moves of the
 //!   events kept. A source that sorts after a full buffer only counts, by arithmetic for a bounce
-//!   and cues, and a motion runs at most 131 closed forms per goal in the range.
+//!   and cues, and a motion runs at most 131 closed forms per goal in the range. `events_of` does
+//!   the same work for its listed sources, with no step when none of them needs one, and a binary
+//!   search of the list for each event a step finds.
 //! - `ranges` and `classes` allocate nothing and are bounded: at most `delay_rounds_max` plus
 //!   `widen_rounds_max` plus one forward passes, and `3 * node_count + 1` passes.
 //! - A recording appends at most one sample per committed pass, and never past its table.

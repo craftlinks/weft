@@ -309,6 +309,15 @@ Two details make events safe to build on:
 - **The caller's buffer bounds the memory.** When it fills, the collector keeps the *earliest*
   events and counts the rest exactly in `dropped`. Nothing is silently lost.
 
+**By source.** `events` runs the step over its whole range whenever the program has a simulated
+node, even when the caller only wants a bounce. `events_of(sources, t0, t1)` takes a sorted list
+of node ids and gives only their events, in the same order and with the same overflow rule. It
+steps only when a listed source is stepped (a crossing, a follower, a shift register); over solved
+sources it touches nothing in the reader, so a window of a bounce's hits around the playhead of a
+program with a chase costs microseconds instead of a millisecond, and the next `eval` is the one
+it would have been. `Compiled.event_sources(name)` turns a binding into its list, following a
+region's `spread` and a vector's `pack` to the nodes that actually fire.
+
 ---
 
 ## 7. What May Change Under a Running Program

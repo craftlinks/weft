@@ -11,8 +11,9 @@
 //!                   [--lanes A..B] [--use NAME=PATH]...
 //! weft parse FILE --json
 //! ```
-//! At most two `--use`. `--events NAME` keeps the events of the signal bound to NAME, and
-//! `--lanes A..B` keeps lanes A to B of every signal and event, both included.
+//! At most two `--use`. `--events NAME` keeps the events of the signal bound to NAME, from the
+//! nodes `Compiled.event_sources` gives, and `--lanes A..B` keeps lanes A to B of every signal and
+//! event, both included.
 //! Times are seconds, read as decimals and turned into flicks, as the library's times are.
 //! Exit 0 on success, 1 when the file has errors, and 2 on bad arguments or a file that cannot be
 //! read.

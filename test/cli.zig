@@ -247,6 +247,69 @@ test "sample keeps the events and lanes asked for" {
     try testing.expectEqualStrings(sample_filtered_golden, writer.buffered());
 }
 
+// Locks `--events` through `Compiled.event_sources` (step 23): a bounce in a region with no
+// stagger, one bounce spread over four lanes, keeps its 5 hits in [0, 3 s), where it kept none;
+// the same bounce staggered keeps 20, 5 a lane; a `vec2` spring keeps both its components' goals;
+// and a crossing keeps the 3 rising crossings of a 1 Hz wave in [0, 3 s). Each event is named by
+// its binding, with or without `--events`, and a source two bindings share is named by the first.
+test "sample keeps the events of a spread, a pack, and a crossing" {
+    const text =
+        \\cue go = 0s
+        \\cue c1 = 1s
+        \\plain = lanes(4, bounce(0..1, speed: 2, at: go))
+        \\staggered = lanes(4, bounce(0..1, speed: 2, at: go, stagger: 100ms))
+        \\v = spring([go: vec2(0, 0), c1: vec2(1, 2)], time: 0.5s)
+        \\w = wave(sine, 1hz)
+        \\x = crossing(w, level: 0.5)
+        \\
+    ;
+    const window: commands.Window = .{ .from = 0, .to = 2_116_800_000, .step = 705_600_000 };
+    const cases = [_]struct { name: []const u8, events: usize }{
+        .{ .name = "plain", .events = 5 },
+        .{ .name = "staggered", .events = 20 },
+        .{ .name = "v", .events = 2 },
+        .{ .name = "x", .events = 3 },
+    };
+    for (cases) |case| {
+        var writer: std.Io.Writer = .fixed(&output);
+        try testing.expect(try commands.sample(testing.allocator, &compiled, &writer, .{ .name = "sources.weft", .text = text }, &.{}, &.{}, &.{"w"}, window, .{
+            .events = &.{case.name},
+        }));
+        const sampled = writer.buffered();
+        const events_at = std.mem.indexOf(u8, sampled, "\"events\":[").?;
+        errdefer std.debug.print("{s}: {s}\n", .{ case.name, sampled[events_at..] });
+        try testing.expectEqual(case.events, std.mem.count(u8, sampled[events_at..], "{\"t\":"));
+        // Each named by its binding, through the spread and the pack too.
+        var name_buffer: [32]u8 = undefined;
+        const named = try std.fmt.bufPrint(&name_buffer, "\"name\":\"{s}\"", .{case.name});
+        try testing.expectEqual(case.events, std.mem.count(u8, sampled[events_at..], named));
+    }
+    // Without `--events`, every event is named by its binding as well: 5 + 20 + 2 + 3.
+    var all: std.Io.Writer = .fixed(&output);
+    try testing.expect(try commands.sample(testing.allocator, &compiled, &all, .{ .name = "sources.weft", .text = text }, &.{}, &.{}, &.{"w"}, window, .{}));
+    const every = all.buffered()[std.mem.indexOf(u8, all.buffered(), "\"events\":[").?..];
+    try testing.expectEqual(@as(usize, 30), std.mem.count(u8, every, "{\"t\":"));
+    try testing.expectEqual(@as(usize, 30), std.mem.count(u8, every, "\"name\":"));
+    try testing.expectEqual(@as(usize, 5), std.mem.count(u8, every, "\"name\":\"plain\""));
+    // Both names together keep each one's events once, in one order.
+    var writer: std.Io.Writer = .fixed(&output);
+    try testing.expect(try commands.sample(testing.allocator, &compiled, &writer, .{ .name = "sources.weft", .text = text }, &.{}, &.{}, &.{"w"}, window, .{
+        .events = &.{ "x", "plain", "x" },
+    }));
+    const sampled = writer.buffered();
+    try testing.expectEqual(@as(usize, 8), std.mem.count(u8, sampled[std.mem.indexOf(u8, sampled, "\"events\":[").?..], "{\"t\":"));
+
+    // `alias` shares `first`'s bounce, so its events are named `first`, declared first.
+    const shared = "cue go = 0s\nfirst = bounce(0..1, speed: 2, at: go)\nalias = first\n";
+    writer = .fixed(&output);
+    try testing.expect(try commands.sample(testing.allocator, &compiled, &writer, .{ .name = "shared.weft", .text = shared }, &.{}, &.{}, &.{"first"}, window, .{
+        .events = &.{"alias"},
+    }));
+    const aliased = writer.buffered()[std.mem.indexOf(u8, writer.buffered(), "\"events\":[").?..];
+    try testing.expectEqual(@as(usize, 5), std.mem.count(u8, aliased, "\"name\":\"first\""));
+    try testing.expectEqual(@as(usize, 0), std.mem.count(u8, aliased, "\"name\":\"alias\""));
+}
+
 // Locks that the command samples a file of any slab: 40,000 lanes of followers need more than
 // the 262,144 values v0.1.0's command held.
 test "sample runs a region larger than a fixed slab" {

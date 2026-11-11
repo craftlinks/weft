@@ -82,6 +82,15 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "catalog", .module = catalog },
             },
         }),
+        b.createModule(.{
+            .root_source_file = b.path("test/sources.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "weft", .module = weft },
+                .{ .name = "catalog", .module = catalog },
+            },
+        }),
     };
     for (test_roots) |root| {
         test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = root })).step);
