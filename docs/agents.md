@@ -56,6 +56,7 @@ seed 7                                   # the file's seed; every noise draws fr
 cue c0 = 0s                              # a named time
 cue bar = 0s..60s every 2s               # a series: bar[0] to bar[30]
 cue late = bar[30] + 500ms               # a cue after a cue, summed when the file compiles
+cue word = [1s, 1080ms, 1400ms]          # a series as a list: uneven, in time order
 track speed = 0.5 in 0..2                # a value a client writes, from a time on
 
 wave = wave(sine, 0.5hz)                 # pure: a function of t
@@ -72,6 +73,7 @@ tint = srgb(0.9, 0.4, 0.2)               # a colour, kept as OKLab; tint.l is it
 dots = lanes(100, noise(smooth, 1hz))    # 100 lanes, each its own noise
 fall = lanes(100, tween(from: 1, to: 0, at: c0, over: 1s, stagger: 10ms))   # one after another
 index = lanes(100, lane * 0.01)          # each lane's index
+pop = lanes(3, tween(from: 0, to: 1, at: word[lane], over: 300ms))   # lane i at cue word[i]
 fb = delay(0)
 loop = chase(1 + fb * -0.8, time: 0.5s)
 fb <- loop                               # a cycle goes through a delay, fed by name
@@ -109,6 +111,9 @@ Rules that trip agents most often:
   can still overflow, so a client calls `state.finite()` after `eval` on a program with a loop.
 - **Lanes meet where their counts are equal or one side has one lane.** A name bound outside a
   region is shared by every lane. `lane` and `stagger:` belong inside `lanes(n, …)`.
+- **A cue for each lane** is `series[lane]`, only as the `at` of a `tween` or a `bounce`, with
+  a cue for every lane and no `stagger:`. The index is `lane` itself; for any other pattern
+  write the series as a list.
 - **Spring and Newtonian goals are at cues**, not times: declare the cues first.
 - **A simulated signal** (chase, follow, shift, delay, crossing, oscillator) runs from the start
   cue, the first cue unless `start c` names another, so the file needs a cue.

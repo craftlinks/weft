@@ -129,6 +129,9 @@ pub const Param = struct {
     shaped: bool = false,
     default: Default = .required,
     words: []const []const u8 = &.{},
+    /// A cue that may be chosen by lane, `series[lane]` inside a region (step 28): the `at` of a
+    /// `tween` and a `bounce` only, which start lane g at the series' cue g.
+    by_lane: bool = false,
 };
 
 pub const Role = enum { signal, mover };
@@ -293,7 +296,7 @@ pub const entries = [_]Entry{
     .{ .name = "tween", .op = .tween, .role = .signal, .summary = "a move from one value to another, from a cue", .params = &.{
         .{ .name = "from", .kind = .number, .shaped = true, .default = .after },
         .{ .name = "to", .kind = .number, .shaped = true },
-        .{ .name = "at", .kind = .cue },
+        .{ .name = "at", .kind = .cue, .by_lane = true },
         .{ .name = "over", .kind = .time },
         .{ .name = "ease", .kind = .ease, .default = .{ .word = 0 }, .words = ease_words },
         .{ .name = "after", .kind = .signal, .shaped = true, .default = .absent },
@@ -348,7 +351,7 @@ pub const entries = [_]Entry{
     .{ .name = "bounce", .op = .bounce, .role = .signal, .outputs = &.{"velocity"}, .summary = "a value bouncing between two walls", .params = &.{
         .{ .name = "range", .kind = .number_range, .positional = true },
         .{ .name = "speed", .kind = .number },
-        .{ .name = "at", .kind = .cue },
+        .{ .name = "at", .kind = .cue, .by_lane = true },
         .{ .name = "stagger", .kind = .time, .default = .{ .time = 0 } },
     } },
     .{ .name = "crossing", .op = .crossing, .role = .signal, .summary = "a gate on a level, firing at each crossing", .params = &.{
@@ -461,6 +464,7 @@ comptime {
                 .after => assert(param_a.kind == .number and param_a.shaped and entry.op == .tween),
                 .required => {},
             }
+            if (param_a.by_lane) assert(param_a.kind == .cue and (entry.op == .tween or entry.op == .bounce));
             for (entry.params[index_a + 1 ..]) |param_b| assert(!std.mem.eql(u8, param_a.name, param_b.name));
         }
     }

@@ -636,13 +636,15 @@ fn program_hash(program: weft.Program, tracks: *const weft.Tracks) u64 {
 // text replaced in step 12, checked field for field then, so a change to either file or to the
 // compiler that moves a node shows here, before the goldens. Step 17's `stagger` fields moved
 // them only by their printing: with those fields cut from each node's text, both were the step
-// 12 hashes, 0xdea1386a4be8a783 and 0x69071b1bdb435f6a.
+// 12 hashes, 0xdea1386a4be8a783 and 0x69071b1bdb435f6a. Step 28's `cue_by_lane` field moved them
+// the same way: with ", .cue_by_lane = false" cut, both were 0x8ebcd160a135c39d and
+// 0x8def344e14662829 again.
 test "the text compiles to the programs it replaced" {
     try testing.expect(built.build(source));
     built_bouncers.build();
-    try testing.expectEqual(@as(u64, 0x8ebcd160a135c39d), program_hash(built.program, built.tracks));
+    try testing.expectEqual(@as(u64, 0x0fa761f8b9ab026a), program_hash(built.program, built.tracks));
     const bouncer_tracks = &built_bouncers.compiled.tables.tracks;
-    try testing.expectEqual(@as(u64, 0x8def344e14662829), program_hash(built_bouncers.program, bouncer_tracks));
+    try testing.expectEqual(@as(u64, 0x6ffd7f6225076541), program_hash(built_bouncers.program, bouncer_tracks));
 }
 
 // Locks what the rows find by name: the spring's and the Newtonian move's shared path, the chase's

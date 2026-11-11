@@ -254,12 +254,15 @@ fn json_entry(writer: *std.Io.Writer, entry: *const schema.Entry) !void {
         if (at > 0) try writer.writeAll(",");
         try writer.writeAll("{\"name\":");
         try json_string(writer, param.name);
-        try writer.print(",\"kind\":\"{s}\",\"live\":{s},\"shaped\":{s},\"positional\":{s},\"default\":", .{
+        try writer.print(",\"kind\":\"{s}\",\"live\":{s},\"shaped\":{s},\"positional\":{s}", .{
             @tagName(param.kind),
             if (param.live) "true" else "false",
             if (param.shaped) "true" else "false",
             if (param.positional) "true" else "false",
         });
+        // Only where it is true, the `at` of `tween` and `bounce` (step 28), so no other line moves.
+        if (param.by_lane) try writer.writeAll(",\"by_lane\":true");
+        try writer.writeAll(",\"default\":");
         switch (param.default) {
             .required => try writer.writeAll("null"),
             .number => |number| try json_number(writer, number),

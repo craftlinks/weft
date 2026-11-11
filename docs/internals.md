@@ -416,6 +416,12 @@ whose values genuinely differ per element get `n` slots: a noise (lane *i* hashe
 else has as many lanes as its inputs, and a one-lane input is broadcast. So a constant or a knob
 costs one number however many lanes read it.
 
+A stagger gives every lane the same gap. **A cue for each lane** (step 28) lets the gaps differ:
+a tween or a bounce with `cue_by_lane` starts lane *i* at cue `start + i` of the cue table, which
+the language writes `at: letters[lane]` over a series written as a list of times. The cue table
+is already read by `eval` and by `events`, so this costs one load and one add a lane, the events
+of a bounce stay solved without stepping, and moving one cue with `Cues.move` moves one lane.
+
 The loops over lanes are plain `for` loops over contiguous `f64`, which the compiler vectorises
 on its own. 100,000 lanes of a typical region evaluate in about 2.5 ms.
 

@@ -208,6 +208,15 @@
 //! instance is its lane g, so `event.zig`'s order of time, source, then instance holds across
 //! lanes. A staggered motion reads its lanes in time order, so its cursor folds forward.
 //!
+//! A tween or a bounce may choose its cue by lane (step 28): with `cue_by_lane`, lane g starts at
+//! cue `start + g` (`lane_cue`, the one definition), then `g * stagger` later as before, so lanes
+//! can start at uneven times a client writes in the cue table. Such a node takes the region's
+//! lanes, outside a region it is `LaneMismatch`, and a last lane past the cue table is
+//! `UnknownCue`. The pass, a bounce's events, and both of a bounce's outputs read the same cue, so
+//! a lane's position, velocity, and hits agree, a by-lane bounce's events stay solved, and a cue
+//! moved moves one lane. The field is a bool rather than a stride because the language writes
+//! only cue g for lane g; a stride would replace it in `lane_cue` alone.
+//!
 //! ## 17. Functions of a Value
 //! `apply` takes a `Function` of one value, and `minimum` and `maximum` the smaller and larger of
 //! two (step 26). Each is pure and works per component and per lane as `add` does: `apply` keeps
@@ -347,6 +356,21 @@ pub fn lane_time(time: Time, stagger: Time, lane: u64) Time {
     return .{ .flicks = time.flicks -% offset };
 }
 
+/// The cue lane `lane` of a family starts at when its op chooses a cue by lane (step 28): the
+/// cue `lane` places after `start`, so lane g of a region reads cue `start.index + g`. The one
+/// definition, which the builder, the pass, and the events read.
+pub fn lane_cue(start: Cue, lane: u32) Cue {
+    assert(@as(u64, start.index) + lane <= std.math.maxInt(u32));
+    return .{ .index = start.index + lane };
+}
+
+/// A node whose cue is chosen by lane is laned, and its last lane's cue is in the table.
+fn assert_cue_by_lane(program: Program, node: *const Node, start: Cue) void {
+    assert(node.extent.laned);
+    const last = @as(u64, start.index) + program.lane_first + node.extent.lanes - 1;
+    assert(last < program.cues.count);
+}
+
 /// Moves from `from` to `to`, over `duration` from the time of the cue `start`.
 pub const Tween = struct {
     from: f64,
@@ -359,6 +383,9 @@ pub const Tween = struct {
     previous: ?Id,
     /// How much later each lane of a region starts (section 16).
     stagger: Time = .{ .flicks = 0 },
+    /// Lane g of the region starts at cue `start.index + g` (`lane_cue`, step 28), so the op
+    /// takes the region's lanes.
+    cue_by_lane: bool = false,
 
     /// The value at or after `start_time`.
     pub fn value_after(tween: *const Tween, time: Time, start_time: Time) f64 {
@@ -475,6 +502,8 @@ pub const Bounce = struct {
     start: Cue,
     /// How much later each lane of a region starts (section 16).
     stagger: Time = .{ .flicks = 0 },
+    /// Lane g of the region starts at cue `start.index + g` (`lane_cue`, step 28).
+    cue_by_lane: bool = false,
 };
 
 /// The two nodes of a bounce.
@@ -498,6 +527,8 @@ pub const BounceNode = struct {
     start: Cue,
     output: Output,
     stagger: Time = .{ .flicks = 0 },
+    /// As `Bounce.cue_by_lane`, the same on the position and the velocity.
+    cue_by_lane: bool = false,
 
     pub const Output = enum { position, velocity };
 
@@ -999,6 +1030,7 @@ pub const Program = struct {
                 },
                 .tween => |op| {
                     assert(op.start.index < program.cues.count);
+                    if (op.cue_by_lane) assert_cue_by_lane(program, node, op.start);
                     if (op.previous) |previous| assert(previous.index < index);
                 },
                 .motion => |op| {
@@ -1009,6 +1041,7 @@ pub const Program = struct {
                 },
                 .bounce => |op| {
                     assert(op.start.index < program.cues.count);
+                    if (op.cue_by_lane) assert_cue_by_lane(program, node, op.start);
                     assert(op.leg_flicks >= 1);
                     assert(op.leg_flicks < bounce_flicks_max);
                 },
@@ -1517,7 +1550,7 @@ pub const Builder = struct {
         if (!std.math.isFinite(source.to)) return error.NotFinite;
         if (source.duration.flicks <= 0) return error.InvalidDuration;
         if (!source.ease.valid()) return error.InvalidEase;
-        var extent = try builder.staggered_extent(source.stagger);
+        var extent = try builder.cued_extent(source.start, source.cue_by_lane, source.stagger);
         if (source.previous) |previous| extent = try joined(&.{ extent, builder.nodes[previous.index].extent });
         return builder.push_shaped(.{ .tween = source }, extent);
     }
@@ -1701,7 +1734,7 @@ pub const Builder = struct {
         // A leg of at least a flick puts each hit on its own flick. NaN fails both.
         if (!(leg_flicks >= 1)) return error.InvalidDuration;
         if (!(leg_flicks < bounce_flicks_max)) return error.InvalidDuration;
-        const extent = try builder.staggered_extent(source.stagger);
+        const extent = try builder.cued_extent(source.start, source.cue_by_lane, source.stagger);
         if (builder.nodes.len - builder.node_count < 2) return error.NodeCapacityExceeded;
         const output_count: u64 = extent.count();
         if (builder.slab_count + 2 * output_count > builder.slab_count_max) {
@@ -1715,6 +1748,7 @@ pub const Builder = struct {
             .start = source.start,
             .output = .position,
             .stagger = source.stagger,
+            .cue_by_lane = source.cue_by_lane,
         };
         const position = builder.push_shaped(.{ .bounce = node }, extent) catch unreachable;
         node.output = .velocity;
@@ -1841,6 +1875,17 @@ pub const Builder = struct {
     fn source_extent(builder: *const Builder) Extent {
         if (builder.lanes == null) return one_lane;
         return builder.region_extent() catch unreachable;
+    }
+
+    /// The extent of a cued source, a tween or a bounce: with a cue by lane, the region's lanes,
+    /// refused outside a region, and each lane's cue in the table; otherwise as staggered.
+    fn cued_extent(builder: *const Builder, start: Cue, cue_by_lane: bool, stagger: Time) Error!Extent {
+        if (!cue_by_lane) return builder.staggered_extent(stagger);
+        const extent = try builder.region_extent();
+        if (stagger.flicks != 0) _ = try builder.staggered_extent(stagger);
+        const last = @as(u64, start.index) + builder.lane_first + extent.lanes - 1;
+        if (last >= builder.cue_table.count) return error.UnknownCue;
+        return extent;
     }
 
     /// A staggered source's extent: one lane when it is not staggered, the region's otherwise,
