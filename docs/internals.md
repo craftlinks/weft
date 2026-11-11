@@ -272,11 +272,16 @@ needs B and B needs A at the same instant, into something the builder rejects by
 
 ### What a step looks like
 
-One step is: a pass over every node at the step's time, then an update of each simulated node
-from the values that pass produced. A chase reads its target's new value and advances its spring
-by 1/480 s. A follower checks whether it has arrived, counts down its pause, or draws a new goal
-by hashing its seed with its goal count. Their state sits in the slab after their output, as
-section 2 showed.
+One step is: a pass at the step's time, then an update of each simulated node from the values
+that pass produced. A chase reads its target's new value and advances its spring by 1/480 s. A
+follower checks whether it has arrived, counts down its pause, or draws a new goal by hashing its
+seed with its goal count. Their state sits in the slab after their output, as section 2 showed.
+
+The step's pass covers only what the step reads: the simulated nodes and every node they read,
+directly or through others. The builder marks those when it finishes, sweeping backwards from the
+simulated nodes, since every input but a delay's comes before its reader. So three chases among a
+thousand lanes of pure colour step three chases and their targets, not the lanes. The pass at the
+time read still fills every node, so what a read returns is the same bits either way.
 
 ---
 

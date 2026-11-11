@@ -71,11 +71,22 @@
 //! state. A crossing runs on the step too, for its events only, as section 11 explains: its output
 //! is exact at any time, so it keeps no values to interpolate, only its input at the last step.
 //!
-//! One step is a pass over every node at the step's time, with each simulated node giving its
-//! value there, then an update of each simulated node from that pass. A read at t between steps k
-//! and k + 1 brings the slab to step k + 1, then a pass at t gives each simulated node
+//! One step is a pass at the step's time, with each simulated node giving its value there, then
+//! an update of each simulated node from that pass. A read at t between steps k and k + 1 brings
+//! the slab to step k + 1, then a pass over every node at t gives each simulated node
 //! `before * (1 - w) + after * w`, where w is how far t is past step k. So a reader at any rate
 //! sees the same value at the same time, and a step only reads inputs at times up to t.
+//!
+//! A step's pass covers only what a step reads (step 34): every simulated node, and every node one
+//! reads, directly or through others, a parameter from a node and a crossing's input among them.
+//! `Builder.finish` marks them in `Node.step_skip`, by one sweep backwards from the simulated
+//! nodes; a delay's input, the one that can come after its reader (section 10), is marked before
+//! the sweep, so one sweep is the fixed point. A step's update and its events (section 11) read
+//! only simulated nodes' regions and marked outputs, so a step gives the same bits as a pass over
+//! every node would. The other nodes' outputs hold whatever an earlier pass left until the pass
+//! at the time read, which every read of a value runs first and which reads no output before it
+//! writes it, so no read sees one. A program with no simulated node never steps and keeps every
+//! mark 0, which is also the mark of a node never finished: a step over it passes every node.
 //!
 //! Reaching a step costs steps, so a reader keeps checkpoints: copies of its slab, one a second,
 //! in memory it gives `State.init_with_checkpoints`. A read restores the nearest checkpoint before
@@ -123,10 +134,10 @@
 //! A range must not run ahead of its reader. `events(t0, t1)` commits steps only while every event
 //! they can hold is before t1, which leaves the slab at step ceil((t1 - start) / step): the step
 //! `eval(t1)` needs, or the one before when t1 is on a step. The events of that last step are
-//! found by a read-only look: a pass at its time, which overwrites only node outputs, and each
-//! source's check, which commits nothing. The next range starts from that very step, so
-//! consecutive ranges run each step once and never restore a checkpoint, and an `eval(t1)` after
-//! them runs at most the one step a t1 on a step leaves.
+//! found by a read-only look: a step's pass at its time (section 9), which overwrites only node
+//! outputs, and each source's check, which commits nothing. The next range starts from that very
+//! step, so consecutive ranges run each step once and never restore a checkpoint, and an
+//! `eval(t1)` after them runs at most the one step a t1 on a step leaves.
 //!
 //! A reader can ask for some sources only: `events_of(sources, t0, t1)` gives the events of the
 //! listed nodes, in the order and with the overflow rule of `events` (step 23). The solved sources
@@ -247,7 +258,11 @@
 //! - `eval` allocates nothing, takes no lock, and is one bounded pass over the node array. A motion
 //!   node folds over at most its own goals. A simulated program first runs at most
 //!   `checkpoint_interval - 1` steps once the checkpoints before the time are filled, and the
-//!   steps since the last one filled otherwise.
+//!   steps since the last one filled otherwise. A step's pass visits each node it reads and one
+//!   node of each run it skips, so at most the node count.
+//! - `Builder.finish` marks what a step reads in four passes over the nodes, and
+//!   `Program.assert_valid` checks the marks: a read node's inputs are read, a simulated node is
+//!   read, and each skipped run counts down to its end.
 //! - `events` allocates nothing and takes no lock. Its work is the seek `eval` would make to t0,
 //!   the steps the range spans, one more pass, and for each event at most `out.len` moves of the
 //!   events kept. A source that sorts after a full buffer only counts, by arithmetic for a bounce
@@ -919,6 +934,10 @@ pub const Node = struct {
     /// The index in the slab of this node's first value.
     offset: u32,
     extent: Extent,
+    /// 0 when a step reads this node, else how many nodes from this one on a step does not read,
+    /// so a step skips them at once (section 9). `Builder.finish` works it out; 0, which a node
+    /// has until then, steps every node, as a step did before step 34.
+    step_skip: u32 = 0,
 };
 
 comptime {
@@ -1062,6 +1081,7 @@ pub const Program = struct {
             }
         }
         assert(offset == program.slab_count);
+        assert_step_reads(program.nodes);
         assert(program.recent_count == 0 or program.recent_count == simulated_regions);
         assert(program.simulated == (simulated_count > 0));
         if (program.simulated) assert(program.start.index < program.cues.count);
@@ -1820,6 +1840,7 @@ pub const Builder = struct {
         assert(builder.slab_count <= builder.slab_count_max);
         assert(builder.delays_open == 0);
         builder.finished = true;
+        mark_step_reads(builder.nodes[0..builder.node_count], builder.simulated);
         const program: Program = .{
             .nodes = builder.nodes[0..builder.node_count],
             .cues = builder.cue_table,
@@ -1947,6 +1968,71 @@ pub const Builder = struct {
 };
 
 const one_lane: Extent = .{ .lanes = 1, .components = 1 };
+
+/// Works out each node's `step_skip` from what a step reads, as section 9 explains: every
+/// simulated node, and every node one reads, directly or through others. Bounded: four passes
+/// over the nodes, reading at most four inputs a node. A program with no simulated node never
+/// steps, so its nodes keep 0, and a node of it is the same bytes in any such program.
+fn mark_step_reads(nodes: []Node, simulated: bool) void {
+    assert(nodes.len <= std.math.maxInt(u32));
+    for (nodes) |*node| assert(node.step_skip == 0);
+    if (!simulated) return;
+    // First a flag: 0 for read, 1 for not.
+    for (nodes) |*node| node.step_skip = if (node.op.simulated()) 0 else 1;
+    // A simulated node's inputs, among them a delay's, the one input that can come after its
+    // reader (section 10).
+    for (nodes) |*node| {
+        if (node.op.simulated()) mark_inputs_read(nodes, node);
+    }
+    // Then backwards. Every reader of node n but a delay comes after it, so the sweep has visited
+    // them when it reaches n, and a delay marked its input above: n's mark is final when it is
+    // read, and one sweep reaches the fixed point.
+    var index = nodes.len;
+    while (index > 0) {
+        index -= 1;
+        if (nodes[index].step_skip == 0) mark_inputs_read(nodes, &nodes[index]);
+    }
+    // Last, each run of nodes not read, counted from its end.
+    var run: u32 = 0;
+    index = nodes.len;
+    while (index > 0) {
+        index -= 1;
+        if (nodes[index].step_skip == 0) {
+            run = 0;
+        } else {
+            run += 1;
+            nodes[index].step_skip = run;
+        }
+    }
+}
+
+fn mark_inputs_read(nodes: []Node, node: *const Node) void {
+    assert(node.step_skip == 0);
+    for (node.op.inputs()) |maybe| {
+        const input = maybe orelse continue;
+        nodes[input.index].step_skip = 0;
+    }
+}
+
+/// That a step reads every simulated node and every input of a node it reads, and that each run
+/// of nodes it skips counts down to its end. Every node 0 passes, as a program built before step
+/// 34, or by hand, has it.
+fn assert_step_reads(nodes: []const Node) void {
+    for (nodes, 0..) |*node, index| {
+        const skip = node.step_skip;
+        if (skip == 0) {
+            for (node.op.inputs()) |maybe| {
+                const input = maybe orelse continue;
+                assert(nodes[input.index].step_skip == 0);
+            }
+        } else {
+            assert(!node.op.simulated());
+            assert(skip <= nodes.len - index);
+            const next: u32 = if (index + 1 < nodes.len) nodes[index + 1].step_skip else 0;
+            assert(next == skip - 1);
+        }
+    }
+}
 
 /// The law of a spring with this `time` and `overshoot`, or the refusal of either.
 fn spring_law(time: Time, overshoot: f64) Builder.Error!motion.SpringLaw {
@@ -2076,4 +2162,5 @@ test {
     _ = @import("graph_test/tracks.zig");
     _ = @import("graph_test/lanes.zig");
     _ = @import("graph_test/functions.zig");
+    _ = @import("graph_test/step_reads.zig");
 }

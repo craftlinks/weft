@@ -22,7 +22,9 @@
 //! modules  a patch of modules nested 8 deep, 511 instances           per compile
 //! lanes    a noise, a staggered tween, a map, a product, and a      per frame, at 1,000 and
 //!          staggered bounce over n lanes: an eval, then the events  100,000 lanes
-//! node     64 nodes of one op playing forwards at 60 Hz             per node, per frame
+//! beside   three chases beside 32 waves summed and 1,000 lanes     cold at 90 s, and per
+//!          that no chase reads (step 34)                           frame at 60 Hz for 10 s
+//! node    64 nodes of one op playing forwards at 60 Hz             per node, per frame
 //! seek     Play's file read at 600 s, then at 300.99 s              the read at 300.99 s
 //! recomp   Play's file with a pure line edited at 600 s: compile,   per recompile
 //!          carry, and the first eval
@@ -93,6 +95,7 @@ pub fn main(init: std.process.Init) !void {
     modules(io);
     lanes(io, 1_000);
     lanes(io, 100_000);
+    beside(io);
     per_node(io);
     seek(io);
     recompile(io);
@@ -495,6 +498,84 @@ fn lanes(io: std.Io, count: u32) void {
     report(eval_label, best_eval, frames, total);
     const events_label = std.fmt.bufPrint(&label_buffer, "lanes   {d} lanes, events per frame", .{count}) catch unreachable;
     report(events_label, best_events, frames, found_total);
+}
+
+var beside_nodes: [128]weft.Node = undefined;
+
+/// The page of case 8b: three chases of a wave plus noise, beside what none of them reads, 32
+/// waves summed and a region of 1,000 lanes of the lanes page, as a film with a few simulated
+/// signals among many pure ones would have.
+fn beside_page() struct { program: weft.Program, chase: weft.Id, bars: weft.Id } {
+    start_cues = weft.Cues.init(&start_times);
+    _ = start_cues.add(.{ .flicks = 0 }) catch |err| fail(err);
+    var builder = weft.Builder.init(&beside_nodes, .{ .slab_count_max = lanes_slab.len, .cues = &start_cues });
+    const wave = builder.wave(.{ .shape = .sine, .hz = 0.5 }) catch |err| fail(err);
+    const noise = builder.noise(.{ .shape = .smooth, .hz = 1, .seed = 1 }) catch |err| fail(err);
+    const target = builder.add(wave, noise) catch |err| fail(err);
+    var chase: weft.Id = undefined;
+    for (0..3) |index| {
+        const tenths: i64 = 2 + @as(i64, @intCast(index));
+        chase = builder.chase(.{
+            .target = target,
+            .from = 0,
+            .time = .{ .flicks = tenths * @divExact(flicks_per_second, 10) },
+            .overshoot = 0.05 * @as(f64, @floatFromInt(index)),
+        }) catch |err| fail(err);
+    }
+    var sum = builder.wave(.{ .shape = .sine, .hz = 0.25 }) catch |err| fail(err);
+    for (1..32) |index| {
+        const shape: weft.Shape = @fromBackingInt(@intCast(index % 4));
+        const hz = 0.5 + 0.37 * @as(f64, @floatFromInt(index));
+        const other = builder.wave(.{ .shape = shape, .hz = hz }) catch |err| fail(err);
+        sum = builder.add(sum, other) catch |err| fail(err);
+    }
+    builder.lanes = 1_000;
+    const ms: i64 = @divExact(flicks_per_second, 1000);
+    const lane_noise = builder.noise(.{ .shape = .smooth, .hz = 0.25, .seed = 3 }) catch |err| fail(err);
+    const rise = builder.tween(.{
+        .from = 0,
+        .to = 1,
+        .duration = .{ .flicks = 600 * ms },
+        .ease = weft.Ease.out,
+        .start = .{ .index = 0 },
+        .previous = null,
+        .stagger = .{ .flicks = 2 * ms },
+    }) catch |err| fail(err);
+    const height = builder.map_range(.{ .input = lane_noise, .input_low = -1, .input_high = 1, .output_low = 0.2, .output_high = 1 }) catch |err| fail(err);
+    const bars = builder.multiply(rise, height) catch |err| fail(err);
+    builder.lanes = null;
+    const program = builder.finish();
+    assert(program.slab_count <= lanes_slab.len);
+    return .{ .program = program, .chase = chase, .bars = bars };
+}
+
+/// Case 8b (step 34): the page of `beside_page`, from a fresh state, the first eval at 90 s,
+/// 43,200 steps; then playing forwards at 60 Hz for 10 s, per frame.
+fn beside(io: std.Io) void {
+    const page = beside_page();
+    assert(page.program.simulated);
+    const slab_used = lanes_slab[0..page.program.slab_count];
+    var best_cold: i96 = std.math.maxInt(i96);
+    var best_play: i96 = std.math.maxInt(i96);
+    var total: f64 = 0;
+    const rate = weft.Rate.from_hz(60).?;
+    const frames = 600;
+    for (0..repeats) |_| {
+        var state = weft.State.init(page.program, slab_used);
+        var start = now(io);
+        state.eval(seconds(90));
+        best_cold = @min(best_cold, now(io) - start);
+        total += state.value(page.chase) + state.values(page.bars)[999];
+        state = weft.State.init(page.program, slab_used);
+        start = now(io);
+        for (0..frames) |frame| {
+            state.eval(weft.Time.from_ticks(@intCast(frame), rate).?);
+            total += state.value(page.chase) + state.values(page.bars)[999];
+        }
+        best_play = @min(best_play, now(io) - start);
+    }
+    report("beside  3 chases, 1,000 lanes, cold at 90 s", best_cold, 1, total);
+    report("beside  the same, 60 Hz, per frame", best_play, frames, total);
 }
 
 /// The ops of case 9, each 64 nodes of a program of its own.
