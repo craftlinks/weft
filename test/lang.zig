@@ -7,7 +7,8 @@
 //! The catalog's graphs (`catalog.zig`) are built by hand with the builder, and their samples are
 //! locked by the regress golden. If a graph's text compiles to the same nodes, field for field,
 //! the text gives the same samples, with no second golden. Fourteen of the fifteen are here: the
-//! recorded one plays a client's samples, which the language does not have.
+//! recorded one plays a client's samples, which the language does not have. So are the four
+//! graphs of `abs`, `min`, and `max` (step 26).
 //!
 //! ## 2. One Preamble
 //! Every graph reads the catalog's tables, so each text starts with the same preamble: its three
@@ -76,6 +77,10 @@ const cases = [_]Case{
     \\out = follow(pair, by: newtonian(speed: glide_v, accel: limit, decel: limit), tolerance: 0.02, pause: 0s..300ms, seed: 8)
     \\
     },
+    .{ .name = "abs", .text = "out = abs(wave(sine, 0.7hz) + wave(saw, 1hz) * 0.5)\n" },
+    .{ .name = "min", .text = "out = min(wave(sine, 0.7hz), wave(triangle, 1hz))\n" },
+    .{ .name = "max", .text = sequence ++ "out = max(sequence, wave(sine, 0.7hz) * 0.5)\n" },
+    .{ .name = "clamp", .text = "out = min(max(wave(sine, 0.7hz) * 2, -0.5), 1)\n" },
 };
 
 var compiled: weft.lang.Compiled(.{ .tokens = 1024, .tree = 512, .names = 64, .nodes = 64, .slab = 256, .cues = 8, .goals = 16, .regions = 8, .tracks = 4, .track_samples = 4 }) = undefined;

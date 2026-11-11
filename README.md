@@ -111,17 +111,17 @@ and most of the rules above. The sections below show each part in use. An agent 
 starts with [`docs/agents.md`](docs/agents.md): how to learn the toolbox from `weft describe`,
 the language on one page, how a Play page is put together, and how to add a primitive.
 
-## What v0.1 Promises
+## What v0.2 Promises
 
-v0.1 means a client can depend on these, not that Weft is finished. Within 0.1, a change to any of
-them is a bug or a new minor version, named in this README:
+v0.2 means a client can depend on these, not that Weft is finished. Within 0.2, a change to any of
+them is a bug or a new minor version, named in this README. 0.1 promised the same list:
 
 - **The library's exports**, `src/weft.zig`: `Builder` and its calls, `Program`, `State` and its
   `eval`, `events`, `events_since`, `values`, `extent`, `finite`, `set_input`, `record`, and
   `adopt`, the op structs, `Cues`, `Goals`, `Regions`, `Tracks`, `Time`, `Rate`, `Event`, and
   `weft.colour`.
 - **The language**: every call and parameter `weft describe` lists, the syntax, the canonical
-  format, and the seeds a file's names derive, so a file samples the same values in every 0.1.
+  format, and the seeds a file's names derive, so a file samples the same values in every 0.2.
 - **The command line's JSON**: the fields of `describe`, `sample`, and `parse --json`. A new field
   may appear; none is renamed or removed.
 - **The rules**: every frame a function of t, no allocation, lock, or I/O in `src/core` and
@@ -140,11 +140,16 @@ checker's holes above, and hints that name real `Limits` fields; `check` prints 
 `Limits` a file needs, `sample` takes `--events` and `--lanes` and any slab size, and `describe`
 says how each call takes lanes and what its events carry.
 
-**Unreleased, for 0.2** (step 27) adds language surface, so it waits for a minor version: a string
-literal, and a client's nouns that only describe (see A Client's Nouns), and a cue written after
-another cue, `cue hit = c1 + 500ms` (step 29). No file 0.1 accepted changes its values.
-`schema.params_max` is 16, where it was 8. The `weft` command's functions are the module
-`commands`, so a client's own command can print `describe` with its nouns.
+**0.2.0** (steps 26, 27, and 29 to 32) adds language surface, so it is a minor version: a string
+literal, and a client's nouns that only describe (step 27, see A Client's Nouns); a cue written
+after another cue, `cue hit = c1 + 500ms` (step 29); division by a number (step 30); a tween
+`after` a tween that leaves out `from` (step 31); and `abs`, `min`, and `max`, with `clamp` in
+`std` (step 26), and the core's `minimum`, `maximum`, and `apply` ops. No file 0.1 accepted
+changes its values, but one that declares a module named `abs`, `min`, or `max`, or `clamp` beside
+`use std`, is now refused, since the name is taken. `schema.params_max` is 16, where it was 8. The
+`weft` command's functions are the module `commands`, so a client's own command can print
+`describe` with its nouns, and check and sample its files (step 32). `check`'s limits line for a
+file that uses `std` grows with `std`'s text.
 
 ## Requirements
 
@@ -215,6 +220,7 @@ test/
   nouns.zig           a score: nouns that only describe beside a program, strings, and their errors
   score.zig           that score and its nouns, shared with cli.zig's client command
   division.zig        a quotient by a number against the product with its reciprocal, and refusals
+  functions.zig       abs, min, max, and std's clamp: what they build and fold to, ranges, refusals
   chains.zig          a tween chain with `from` left out against the chain written out
   golden/signals.txt  the committed samples
   golden/cli/         the weft command's committed output
@@ -269,9 +275,9 @@ state.eval(time);                              // allocates nothing, locks nothi
 const value = state.value(output);
 ```
 
-The ops are `constant`, `add`, `multiply`, `map_range`, `wave`, `noise`, `tween`, `spring`,
-`newtonian`, `chase`, `follow`, `shift`, `delay`, `bounce`, `crossing`, `cues`, `input`,
-`recorded`, `oscillator`, and `track`. The builder refuses by name what does not fit or cannot
+The ops are `constant`, `add`, `multiply`, `minimum`, `maximum`, `apply` (a `Function` of one
+value, `.abs`), `map_range`, `wave`, `noise`, `tween`, `spring`, `newtonian`, `chase`, `follow`,
+`shift`, `delay`, `bounce`, `crossing`, `cues`, `input`, `recorded`, `oscillator`, and `track`. The builder refuses by name what does not fit or cannot
 be evaluated: `error.NodeCapacityExceeded`, `error.SlabCapacityExceeded`, `error.UnknownNode`,
 `error.NotFinite`, `error.InvalidRange`, `error.UnknownCue`, `error.InvalidDuration`,
 `error.InvalidEase`, `error.InvalidRate`, `error.UnknownGoals`, `error.InvalidOvershoot`,
@@ -519,7 +525,7 @@ state.record(level, &recording);               // what each pass reads, written 
 ```
 
 A range is conservative: a stated bound is never wrong, though it can be wider than the truth.
-Sums, products, waves, and noise are exact; an interpolation, a map, a tween, or a motion is
+Sums, products, `abs`, `min`, `max`, waves, and noise are exact; an interpolation, a map, a tween, or a motion is
 widened by a margin relative to its scale. A spring's range includes its overshoot: one move from
 rest overshoots by its peak overshoot, 16.3% at a damping ratio of 0.5, and a spring with more
 goals, a chase, or a spring follower stays within (1 + os) / (1 - os) of the half-width of its
@@ -623,6 +629,12 @@ const goal = compiled.goal("spring");        // a path and its from, a chase's t
   program is built, not 0, and never a signal, whose range could hold 0. The product is the
   quotient exactly when `c` is a power of two and within one ulp of it otherwise, the same bits on
   every target; two numbers fold to the quotient itself.
+- **`abs(x)`, `min(a, b)`, and `max(a, b)`** are pure calls, per component and per lane as `+`
+  is: a vector or a colour goes in whole, a number is broadcast, and the call has the lanes of
+  what it reads. Their ranges are exact, so `abs` of a signal over [-1, 1] is [0, 1], and
+  `std`'s `clamp(x, low, high)` is `min(max(x, low), high)`, exact too. Given only numbers, a
+  call folds to its constant. A signed zero has one answer on every target: `abs(-0)` is +0,
+  `min` of -0 and +0 is -0, and `max` is +0.
 - **Seeds**: an explicit `seed:` wins; otherwise it is a hash of the declaration's name, so a new
   line never reshuffles another.
 - **Errors** give a line, a column, a reason, and a hint, as Zig prints its own:
@@ -644,7 +656,7 @@ A module is a named graph with parameters. It expands where it is used, like a m
 into the nodes the same graph written out would make, so a program never contains a module:
 
 ```txt
-use std                                     # snappy, heavy, breathe, bob
+use std                                     # snappy, heavy, breathe, bob, clamp
 
 module wobble(t: 0.3s) = spring(time: t)    # a mover, for `by:`
 module hop(s, at) in -1..1 = bounce(0..1, speed: s, at: at) * 2 - 1
@@ -681,7 +693,8 @@ compiled.compile_with(&.{.{ .name = "std", .text = weft.lang.std_library }}, sou
 
 A value has a shape: a number, a `vec2`, a `vec3`, or a colour, three components in OKLab. Two
 pure ops carry shapes through the graph, `pack`, scalars into one value, and `pick`, one component
-out, and arithmetic and `map` work per component, a number broadcast across the others:
+out, and arithmetic, `map`, `abs`, `min`, and `max` work per component, a number broadcast across
+the others:
 
 ```txt
 cue c0 = 0s
@@ -896,7 +909,7 @@ shift register, an oscillator, tracks, cues, and pure nodes around them. A frame
 
 | What | Cost |
 | --- | --- |
-| A node a frame at 60 Hz, pure: constant, track, cues, map, add, multiply | 2 to 3 ns |
+| A node a frame at 60 Hz, pure: constant, track, cues, map, add, multiply, and since step 26 abs, min, max | 2 to 3 ns |
 | … wave, tween, Newtonian move, spring, noise, bounce | 6, 10, 14, 22, 20, and 27 ns |
 | … simulated, with its 8 steps a frame: crossing, delay, shift, oscillator, chase, follower | 41, 52, 94, 105, 181, and 235 ns |
 | A lane, in a region of a noise, a staggered tween, a map, a product, and a bounce | 25 to 44 ns a frame |

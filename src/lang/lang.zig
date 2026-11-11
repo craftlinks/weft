@@ -812,6 +812,11 @@ const fuzz_seeds = [_][]const u8{
     "cue c0 = 0s\nb = lanes(8, tween(from: 0, to: lane * 0.1, at: c0, over: 1s, stagger: 5ms))\n" ++
         "n = lanes(8, noise(smooth, 1hz) + lane / 4)\nh = lanes(8, bounce(0..1, speed: 1, at: c0, stagger: -2ms))\n" ++
         "fb = lanes(8, delay(0))\nfb <- n * 0.5 + fb * 0.25\nv = lanes(8, vec2(lane, 1)) + b\n",
+    // Functions of a value (step 26): numbers that fold, a vector, lanes, a simulated input,
+    // and a clamp as a module.
+    "cue c0 = 0s\nw = wave(sine, 1hz)\na = abs(w - 0.5)\nm = min(vec2(w, 1), 0.5) + max(-0, 0)\n" ++
+        "x = max(lanes(4, lane), abs(-1))\nmodule hold(v, lo, hi) = min(max(v, lo), hi)\n" ++
+        "c = hold(chase(w, time: 0.25s) * 2, -1, 1)\nk = lanes(4, min(abs(lane - 2), w))\n",
     // A loop that runs away within half a second, so the reader meets the bound (step 19).
     "cue c0 = 0s\nfb = delay(0)\nloop = chase(1 + fb * 1e100, time: 0.01s)\nfb <- loop\nx = loop * loop * loop\n",
 };

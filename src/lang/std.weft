@@ -11,3 +11,6 @@ module breathe(base, amount) = base * (1 + amount * wave(sine, 0.2hz))
 
 # A value that bobs around its base at 1 Hz.
 module bob(base, amount: 0.1) = base + amount * wave(sine, 1hz)
+
+# A value held between two bounds: `low` below them, `high` above, and `high` if `low` is above it.
+module clamp(x, low, high) = min(max(x, low), high)

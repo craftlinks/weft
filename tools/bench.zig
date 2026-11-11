@@ -407,7 +407,7 @@ fn lanes(io: std.Io, count: u32) void {
 }
 
 /// The ops of case 9, each 64 nodes of a program of its own.
-const Kind = enum { constant, add, multiply, map, wave, noise, tween, spring, newtonian, bounce, cues, track, chase, follow, shift, delay, crossing, oscillator };
+const Kind = enum { constant, add, multiply, map, abs, min, max, wave, noise, tween, spring, newtonian, bounce, cues, track, chase, follow, shift, delay, crossing, oscillator };
 
 var kind_goal_entries: [2]weft.Goal = undefined;
 var kind_region_entries: [1]weft.Region = undefined;
@@ -436,6 +436,9 @@ fn kind_program(kind: Kind) weft.Program {
         .tracks = &tracks,
     });
     const input = builder.wave(.{ .shape = .sine, .hz = 0.5 }) catch |err| fail(err);
+    // The second operand of `min` and `max`, so half of a wave's values pass each way. Only
+    // their programs have it, so every other op's is as it was.
+    const half = if (kind == .min or kind == .max) builder.constant(0) catch |err| fail(err) else input;
     const ms: i64 = @divExact(flicks_per_second, 1000);
     for (0..64) |index| {
         const seed: u64 = index;
@@ -444,6 +447,9 @@ fn kind_program(kind: Kind) weft.Program {
             .add => builder.add(input, input),
             .multiply => builder.multiply(input, input),
             .map => builder.map_range(.{ .input = input, .input_low = -1, .input_high = 1, .output_low = 0, .output_high = 1 }),
+            .abs => builder.apply(.abs, input),
+            .min => builder.minimum(input, half),
+            .max => builder.maximum(input, half),
             .wave => builder.wave(.{ .shape = .triangle, .hz = 1 + 0.1 * @as(f64, @floatFromInt(index)) }),
             .noise => builder.noise(.{ .shape = .smooth, .hz = 1, .seed = seed }),
             .tween => builder.tween(.{ .from = 0, .to = 1, .duration = seconds(3), .ease = weft.Ease.in_out, .start = c0, .previous = null }),

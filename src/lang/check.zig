@@ -34,6 +34,12 @@
 //! The product is the quotient exactly when `c` is a power of two, and otherwise within an ulp of
 //! it, the same bits on every target. Two numbers fold to their quotient itself.
 //!
+//! `abs`, `min`, and `max` (step 26) are calls, not operators, and fold the same way: given only
+//! numbers, the call is the constant the core's own function gives (`graph.Function.of`,
+//! `graph.minimum`, `graph.maximum`), the bits its node would hold, so `max(1, 2)` builds one
+//! node, and a module such as `std`'s `clamp` given numbers builds none of its own. The call's
+//! record stays in `calls`, which a back end never reaches from an expression.
+//!
 //! ## 4. Times
 //! A time literal is a whole number of flicks, worked out in integers from its digits: seconds
 //! are exact to 5 decimal places and milliseconds to 2, since 705,600,000 = 2^9 3^2 5^5 7^2.
@@ -105,8 +111,9 @@
 //! that must agree, such as a tween's `from` and `to`, broadcast a number to a vector but never to
 //! a colour, whose components are not alike. A parameter takes one value unless the table marks
 //! it `shaped`: then `tween`'s ends, a path's goals and a motion's `from` may be a vector or a
-//! colour written in numbers (`Vector`), and `chase`'s target, `map`'s input, and a tween's
-//! `after` a shaped signal, and the call's shape is theirs. A vector path is one run a component.
+//! colour written in numbers (`Vector`), and `chase`'s target, `map`'s input, `abs`'s input, and
+//! a tween's `after` a shaped signal, and the call's shape is theirs. `min` and `max` take two
+//! shaped signals and combine their shapes as `+` does. A vector path is one run a component.
 //! `.x .y .z` and `.l .a .b` read a component of a name bound to a vector or a colour.
 //!
 //! ## 9. Lanes
@@ -424,7 +431,8 @@ pub const run_max = 256;
 const reserved = [_][]const u8{ "seed", "start", "cue", "track", "module", "use", "lane" };
 
 /// The most lanes a region has (section 9), the core's own limit.
-pub const lanes_max = @import("../core/graph.zig").lanes_max;
+const graph = @import("../core/graph.zig");
+pub const lanes_max = graph.lanes_max;
 
 const Checker = struct {
     tree: *const Tree,
@@ -917,6 +925,7 @@ const Checker = struct {
                     if (entry.op == .delay) checker.delay_calls += 1;
                     const shape = try checker.call_shape(call, index);
                     const lanes = try checker.call_lanes(call, index);
+                    if (checker.folded(call)) |number| return checker.constant(number, index);
                     return checker.push_expr(.{ .tag = .call, .a = call, .item = index, .shape = shape, .lanes = lanes });
                 }
                 if (checker.find_module(name)) |module| return checker.expand_signal(module, index);
@@ -967,6 +976,28 @@ const Checker = struct {
                 return error.Checked;
             },
             else => unreachable,
+        }
+    }
+
+    /// The constant a call of `abs`, `min`, or `max` given only numbers folds to (section 3), or
+    /// null for any other call.
+    fn folded(checker: *const Checker, call: u32) ?f64 {
+        const entry = checker.memory.calls[call].entry;
+        const first = checker.memory.calls[call].values;
+        const values = checker.memory.values[first..][0..entry.params.len];
+        switch (entry.op) {
+            .function => {
+                assert(values.len == 1);
+                const x = checker.is_constant(values[0].signal) orelse return null;
+                return entry.function.?.of(x);
+            },
+            .minimum, .maximum => {
+                assert(values.len == 2);
+                const a = checker.is_constant(values[0].signal) orelse return null;
+                const b = checker.is_constant(values[1].signal) orelse return null;
+                return if (entry.op == .minimum) graph.minimum(a, b) else graph.maximum(a, b);
+            },
+            else => return null,
         }
     }
 
@@ -1811,6 +1842,10 @@ const Checker = struct {
             },
             .chase => return checker.shape_of(values[0].signal),
             .map => return checker.shape_of(values[0].signal),
+            .function => return checker.shape_of(values[0].signal),
+            .minimum, .maximum => {
+                return checker.combine(index, values[0].signal, values[1].signal, false);
+            },
             .lanes => return checker.shape_of(values[1].signal),
             else => return Shape.scalar,
         }

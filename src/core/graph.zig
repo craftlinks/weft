@@ -169,14 +169,15 @@
 //! ## 15. Shapes: Vectors and Colour
 //! A node's output is its own shape: 1 to `components_max` components a lane (step 16). Two pure
 //! ops carry shapes and no op's maths changes: `pack` makes a value of 2 to 4 components from as
-//! many scalar nodes, and `pick` takes one component out. `add` and `multiply` work per component
-//! on equal shapes, or broadcast a scalar operand across the other's components; `map_range` maps
-//! each component. Every other op reads and makes one value, so the builder refuses a vector
-//! where it reads one (`ShapeMismatch`), and a moving vector is one scalar node per component,
-//! packed: each component of a spring is independent, and a front end builds them. A colour is
-//! three components in OKLab (`colour.zig`), so a tween or a spring between two colours is a
-//! straight line through OKLab. A pack's range is the hull of its inputs', and a pick of a pack
-//! has the picked input's own range. Within a lane, components are consecutive in the slab.
+//! many scalar nodes, and `pick` takes one component out. `add`, `multiply`, `minimum`, and
+//! `maximum` work per component on equal shapes, or broadcast a scalar operand across the other's
+//! components; `map_range` and `apply` map each component (section 17). Every other op reads and
+//! makes one value, so the builder refuses a vector where it reads one (`ShapeMismatch`), and a
+//! moving vector is one scalar node per component, packed: each component of a spring is
+//! independent, and a front end builds them. A colour is three components in OKLab (`colour.zig`),
+//! so a tween or a spring between two colours is a straight line through OKLab. A pack's range is
+//! the hull of its inputs', and a pick of a pack has the picked input's own range. Within a lane,
+//! components are consecutive in the slab.
 //!
 //! ## 16. Lanes
 //! One program evaluates many elements as lanes (step 17): each node has its own lane count, and
@@ -189,8 +190,9 @@
 //!   shift register, whose lane g has its node's seed hashed with g; a delay; and a wave, tween,
 //!   spring, Newtonian move, or bounce whose `stagger` is not 0, whose lane g reads the time
 //!   `t - g * stagger`, which for a cued op is its cues moved `g * stagger` later.
-//! - Arithmetic, a map, a pack, a pick, a chase, a crossing, an oscillator, and a tween with
-//!   `previous` have the most lanes of their inputs, and an input of one lane is broadcast.
+//! - Arithmetic, a minimum, a maximum, a function of a value, a map, a pack, a pick, a chase, a
+//!   crossing, an oscillator, and a tween with `previous` have the most lanes of their inputs, and
+//!   an input of one lane is broadcast.
 //! - A parameter from a node takes one lane, since a node has one law, and everything else is one
 //!   lane, so a constant or a knob costs one value however many lanes read it.
 //! Two counts above 1 in one op, or a parameter or a delay's feed of too many, are refused
@@ -198,6 +200,18 @@
 //! n equal lanes, so a region's value has its count even where nothing in it varies. An event's
 //! instance is its lane g, so `event.zig`'s order of time, source, then instance holds across
 //! lanes. A staggered motion reads its lanes in time order, so its cursor folds forward.
+//!
+//! ## 17. Functions of a Value
+//! `apply` takes a `Function` of one value, and `minimum` and `maximum` the smaller and larger of
+//! two (step 26). Each is pure and works per component and per lane as `add` does: `apply` keeps
+//! its input's extent, and `minimum` and `maximum` take `add`'s shapes and lanes, a scalar or a
+//! lane broadcast. Each has a range rule in `range.zig`, sound for any inputs in their ranges and
+//! exact for independent ones, since abs, min, and max round nothing. A function is one enum
+//! value, its value in `Function.of`, and its range in `function_range`, so a new function adds
+//! a line to each and no op. Signed zero has one answer on every target, where `@min` and `@max`
+//! leave it to the instruction: |-0| is +0, the minimum of -0 and +0 either way round is -0, and
+//! the maximum is +0. Equal inputs give that value. NaN never reaches a signal, so neither order
+//! of a NaN is promised, though both are the same bits on every target.
 //!
 //! ## 13. TigerStyle Invariants
 //! - Capacities come from the caller, and the builder refuses what does not fit, by name.
@@ -568,10 +582,54 @@ pub const Recorded = struct {
     high: f64,
 };
 
+/// A function of one value, applied per component and per lane (section 17).
+pub const Function = enum {
+    /// |x|, with its sign bit cleared, so |-0| is +0. `maximum(x, -x)` has the same values, but
+    /// interval arithmetic takes x and -x as independent, so its range over [-1, 1] would be
+    /// [-1, 1]; this one's is [0, 1].
+    abs,
+
+    /// The function's value at `x`, the same bits on every target.
+    pub fn of(function: Function, x: f64) f64 {
+        return switch (function) {
+            .abs => @abs(x),
+        };
+    }
+};
+
+/// `function` of `input`, per component and per lane (section 17).
+pub const Apply = struct {
+    input: Id,
+    function: Function,
+};
+
+/// The smaller of `a` and `b`, with -0 below +0 (section 17). Not `@min`, which leaves a signed
+/// zero to the instruction: x86's `minsd` gives its second operand, and wasm's `f64.min` -0.
+pub fn minimum(a: f64, b: f64) f64 {
+    if (a < b) return a;
+    if (b < a) return b;
+    // Equal, or a NaN, which a signal never holds: -0 and +0 compare equal, so the sign decides.
+    return if (std.math.signbit(a)) a else b;
+}
+
+/// The larger of `a` and `b`, with +0 above -0 (section 17).
+pub fn maximum(a: f64, b: f64) f64 {
+    if (a > b) return a;
+    if (b > a) return b;
+    return if (std.math.signbit(a)) b else a;
+}
+
 pub const Op = union(enum) {
     constant: f64,
     add: Binary,
     multiply: Binary,
+    /// The smaller of two values per component, a scalar broadcast as `add` does (section 17).
+    /// `-maximum(-a, -b)` has the same values in four nodes.
+    minimum: Binary,
+    /// The larger of two values per component, a scalar broadcast as `add` does (section 17).
+    maximum: Binary,
+    /// A function of one value (section 17).
+    apply: Apply,
     map_range: MapRange,
     wave: Wave,
     tween: Tween,
@@ -613,6 +671,7 @@ pub const Op = union(enum) {
             .crossing => output_count + 1,
             .constant, .add, .multiply, .map_range, .wave, .tween, .noise, .bounce, .cues => 0,
             .input, .recorded, .track, .pack, .pick, .lane, .spread => 0,
+            .minimum, .maximum, .apply => 0,
         };
     }
 
@@ -622,6 +681,7 @@ pub const Op = union(enum) {
             .chase, .follow, .shift, .delay, .crossing, .oscillator => true,
             .constant, .add, .multiply, .map_range, .wave, .tween, .noise, .motion => false,
             .bounce, .cues, .input, .recorded, .track, .pack, .pick, .lane, .spread => false,
+            .minimum, .maximum, .apply => false,
         };
     }
 
@@ -630,6 +690,7 @@ pub const Op = union(enum) {
         return switch (op.*) {
             .constant, .add, .multiply, .map_range, .wave, .tween, .noise => .pure,
             .bounce, .cues, .recorded, .track, .pack, .pick, .lane, .spread => .pure,
+            .minimum, .maximum, .apply => .pure,
             .motion => .exact,
             .chase, .follow, .shift, .delay, .crossing, .oscillator => .simulated,
             .input => .live,
@@ -640,7 +701,8 @@ pub const Op = union(enum) {
     /// an input too (section 14).
     pub fn inputs(op: *const Op) [4]?Id {
         return switch (op.*) {
-            .add, .multiply => |binary| .{ binary.left, binary.right, null, null },
+            .add, .multiply, .minimum, .maximum => |pair| .{ pair.left, pair.right, null, null },
+            .apply => |apply| .{ apply.input, null, null, null },
             .map_range => |map| .{ map.input, null, null, null },
             .tween => |tween| .{ tween.previous, null, null, null },
             .chase => |chase| .{
@@ -852,9 +914,15 @@ pub const Program = struct {
                     assert(op.phase >= 0 and op.phase < 1);
                 },
                 .track => |id| assert(id.index < program.tracks.count),
-                .add, .multiply => |op| {
+                .add, .multiply, .minimum, .maximum => |op| {
                     assert(op.left.index < index);
                     assert(op.right.index < index);
+                },
+                .apply => |op| {
+                    assert(op.input.index < index);
+                    const input = program.nodes[op.input.index].extent;
+                    assert(input.lanes == node.extent.lanes);
+                    assert(input.components == node.extent.components);
                 },
                 .map_range => |op| assert(op.input.index < index),
                 .pack => |op| {
@@ -1038,6 +1106,9 @@ pub const Program = struct {
             .constant => |constant| Range.point(constant),
             .add => |op| range_module.add(result[op.left.index], result[op.right.index]),
             .multiply => |op| range_module.multiply(result[op.left.index], result[op.right.index]),
+            .minimum => |op| range_module.minimum(result[op.left.index], result[op.right.index]),
+            .maximum => |op| range_module.maximum(result[op.left.index], result[op.right.index]),
+            .apply => |op| function_range(op.function, result[op.input.index]),
             .map_range => |*op| map_range_range(op, result[op.input.index]),
             .wave, .noise => .{ .low = -1, .high = 1 },
             .tween => |*op| tween_range(op, if (op.previous) |id| result[id.index] else null),
@@ -1296,6 +1367,26 @@ pub const Builder = struct {
     pub fn multiply(builder: *Builder, left: Id, right: Id) Error!Id {
         const extent = try builder.binary_extent(left, right);
         return builder.push_shaped(.{ .multiply = .{ .left = left, .right = right } }, extent);
+    }
+
+    /// The smaller of `left` and `right` per component, with a scalar broadcast as `add` does
+    /// (section 17).
+    pub fn minimum(builder: *Builder, left: Id, right: Id) Error!Id {
+        const extent = try builder.binary_extent(left, right);
+        return builder.push_shaped(.{ .minimum = .{ .left = left, .right = right } }, extent);
+    }
+
+    /// The larger of `left` and `right` per component, with a scalar broadcast as `add` does.
+    pub fn maximum(builder: *Builder, left: Id, right: Id) Error!Id {
+        const extent = try builder.binary_extent(left, right);
+        return builder.push_shaped(.{ .maximum = .{ .left = left, .right = right } }, extent);
+    }
+
+    /// `function` of `of`, per component and per lane: the node has `of`'s extent (section 17).
+    pub fn apply(builder: *Builder, function: Function, of: Id) Error!Id {
+        try builder.check_known(of);
+        const extent = builder.nodes[of.index].extent;
+        return builder.push_shaped(.{ .apply = .{ .input = of, .function = function } }, extent);
     }
 
     /// A value whose components are `ids`, each a scalar, 2 to `components_max` of them.
@@ -1655,8 +1746,8 @@ pub const Builder = struct {
         if (id.index >= builder.node_count) return error.UnknownNode;
     }
 
-    /// A node built so far whose output is one value, as every op but arithmetic, `map_range`,
-    /// and `pick` reads (section 15).
+    /// A node built so far whose output is one value, as every op but arithmetic, `minimum`,
+    /// `maximum`, `apply`, `map_range`, and `pick` reads (sections 15 and 17).
     fn check_scalar(builder: *const Builder, id: Id) Error!void {
         try builder.check_known(id);
         if (builder.nodes[id.index].extent.components != 1) return error.ShapeMismatch;
@@ -1806,6 +1897,13 @@ fn map_range_range(map: *const MapRange, input: Range) Range {
     return result.widen(@max(result.scale(), outputs * reach), range_module.margin_rounding);
 }
 
+/// The range of `function` over `input`, by the rules of `range.zig`, section 2a.
+fn function_range(function: Function, input: Range) Range {
+    return switch (function) {
+        .abs => range_module.abs(input),
+    };
+}
+
 /// The range of a tween: `from`, `to`, and the form at the eased progress's extremes, which the
 /// cubic Bezier keeps within the hull of 0, its two y controls, and 1, then `previous` before it.
 fn tween_range(tween: *const Tween, previous: ?Range) Range {
@@ -1858,4 +1956,5 @@ test {
     _ = @import("graph_test/ranges.zig");
     _ = @import("graph_test/tracks.zig");
     _ = @import("graph_test/lanes.zig");
+    _ = @import("graph_test/functions.zig");
 }

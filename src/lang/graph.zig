@@ -26,10 +26,12 @@
 //! and stops the back end, since later nodes may read the one refused.
 //!
 //! ## 6. Vectors
-//! The core's vector nodes are only `pack` and `pick`, and its per-component arithmetic and map
-//! (`graph.zig`, section 15). So a vector tween, spring, Newtonian move, or chase is built as one
-//! scalar node a component, each from that component's ends, goals, or target, then packed: two
-//! scalar springs side by side read exactly what a `vec2` spring reads. A component of a vector
+//! The core's vector nodes are only `pack` and `pick`, and its per-component arithmetic, map,
+//! `apply`, `minimum`, and `maximum` (`graph.zig`, sections 15 and 17), so `abs`, `min`, and
+//! `max` of a vector or a colour are one node each, as `+` is. A vector tween, spring, Newtonian
+//! move, or chase is built as one scalar node a component, each from that component's ends,
+//! goals, or target, then packed: two scalar springs side by side read exactly what a `vec2`
+//! spring reads. A component of a vector
 //! is the pack's own input where the vector is a pack, and a `pick` otherwise. An `srgb` colour is
 //! converted to OKLab here, three constants packed. A vector motion records no goal source, so a
 //! client draws no goal for it.
@@ -576,6 +578,20 @@ const Back = struct {
                     .output_high = v[2].number_range[1],
                 };
                 return .{ .first = try back.attempt(builder.map_range(source), item, call) };
+            },
+            .function => {
+                const input = try back.signal_id(v[0]);
+                const result = builder.apply(entry.function.?, input);
+                return .{ .first = try back.attempt(result, item, call) };
+            },
+            .minimum, .maximum => {
+                const a = try back.signal_id(v[0]);
+                const b = try back.signal_id(v[1]);
+                const result = switch (entry.op) {
+                    .minimum => builder.minimum(a, b),
+                    else => builder.maximum(a, b),
+                };
+                return .{ .first = try back.attempt(result, item, call) };
             },
             .spring_mover, .newtonian_mover => unreachable,
         }

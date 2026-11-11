@@ -347,7 +347,8 @@ Because a program is plain data, it can be analysed. `src/core/range.zig` holds 
 
 **Ranges.** For each node, Weft works out a `[low, high]` the value can never leave, in one
 forward pass over the array: a sine is in `[-1, 1]`; the sum of two ranges is the sum of their
-ends; a product is the hull of the four corner products. This is *interval arithmetic*. For a
+ends; a product is the hull of the four corner products; `min` and `max` take the smaller or
+larger of each end, and `abs` folds a range across zero at 0. This is *interval arithmetic*. For a
 spring it uses a result from control theory that bounds how far a spring can swing past its
 inputs, as a function of its overshoot. For a loop through a delay it iterates to a fixed point,
 and reports infinity if the loop does not settle.

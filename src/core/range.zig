@@ -21,6 +21,15 @@
 //! Interval arithmetic treats every input as independent, so `x * x` over [-1, 1] is [-1, 1] and
 //! not [0, 1]. That is wide, and never wrong.
 //!
+//! ## 2a. Functions of a Value
+//! abs, min, and max round nothing, and each is monotone in each input where its sign is fixed,
+//! so their ranges are exact for independent inputs, with no margin (step 26). `minimum(a, b)` is
+//! the smaller low and the smaller high, `maximum` the larger of each, and `abs` the input itself
+//! at or above 0, the input negated at or below 0, and from 0 to the larger magnitude across 0.
+//! Each end is reached where the inputs are at their own ends, so a test can find it by sampling.
+//! The ends use `graph.minimum` and `graph.maximum`, so a signed zero at an end is the same on
+//! every target.
+//!
 //! ## 3. Springs
 //! A spring is a linear second-order system from rest, driven by a goal that is piecewise constant:
 //! goals at cues, a target held over each step, or a follower's goals. It holds its start at rest
@@ -53,7 +62,8 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const elementary = @import("elementary.zig");
-const Id = @import("graph.zig").Id;
+const graph = @import("graph.zig");
+const Id = graph.Id;
 
 const inf = std.math.inf(f64);
 
@@ -147,6 +157,30 @@ pub fn multiply(a: Range, b: Range) Range {
         result.high = @max(result.high, corner);
     }
     return result;
+}
+
+/// The range of `|a|`, as section 2a explains. Exact.
+pub fn abs(a: Range) Range {
+    a.assert_valid();
+    if (a.low >= 0) return a;
+    if (a.high <= 0) return .{ .low = -a.high, .high = -a.low };
+    const result: Range = .{ .low = 0, .high = graph.maximum(-a.low, a.high) };
+    assert(result.high > 0);
+    return result;
+}
+
+/// The range of the smaller of `a` and `b`, as section 2a explains. Exact.
+pub fn minimum(a: Range, b: Range) Range {
+    a.assert_valid();
+    b.assert_valid();
+    return .{ .low = graph.minimum(a.low, b.low), .high = graph.minimum(a.high, b.high) };
+}
+
+/// The range of the larger of `a` and `b`, as section 2a explains. Exact.
+pub fn maximum(a: Range, b: Range) Range {
+    a.assert_valid();
+    b.assert_valid();
+    return .{ .low = graph.maximum(a.low, b.low), .high = graph.maximum(a.high, b.high) };
 }
 
 /// The peak overshoot of a move from rest at damping ratio `zeta`, which section 3 explains.
@@ -255,6 +289,27 @@ test "interval arithmetic is exact where rounding is monotone" {
     const zero = Range.point(0).widen(0, margin_rounding);
     try testing.expect(zero.low < 0);
     try testing.expect(zero.high > 0);
+}
+
+// Locks the worked ranges of section 2a: |[-3, 2]| is [0, 3], |[-3, -1]| is [1, 3], |[1, 2]| is
+// itself, an unbounded side stays unbounded, and min and max of [-1, 1] and [0, 2] are [-1, 1]
+// and [0, 2]; a range ending at -0 gives -0 where both lows are a zero.
+test "abs, min, and max have exact ranges" {
+    try testing.expectEqual(Range{ .low = 0, .high = 3 }, abs(.{ .low = -3, .high = 2 }));
+    try testing.expectEqual(Range{ .low = 1, .high = 3 }, abs(.{ .low = -3, .high = -1 }));
+    try testing.expectEqual(Range{ .low = 1, .high = 2 }, abs(.{ .low = 1, .high = 2 }));
+    try testing.expectEqual(Range{ .low = 0, .high = inf }, abs(.{ .low = -inf, .high = 2 }));
+    try testing.expectEqual(Range{ .low = 0, .high = inf }, abs(Range.unbounded));
+    const wave: Range = .{ .low = -1, .high = 1 };
+    const above: Range = .{ .low = 0, .high = 2 };
+    try testing.expectEqual(Range{ .low = -1, .high = 1 }, minimum(wave, above));
+    try testing.expectEqual(Range{ .low = 0, .high = 2 }, maximum(wave, above));
+    try testing.expectEqual(Range{ .low = -inf, .high = 1 }, minimum(Range.unbounded, wave));
+    try testing.expectEqual(Range{ .low = -1, .high = inf }, maximum(Range.unbounded, wave));
+    const zeros = minimum(.{ .low = 0, .high = 1 }, .{ .low = -0.0, .high = 1 });
+    try testing.expect(std.math.signbit(zeros.low));
+    const plus = maximum(.{ .low = -0.0, .high = 1 }, .{ .low = 0, .high = 1 });
+    try testing.expect(!std.math.signbit(plus.low));
 }
 
 // Locks the worked values of section 3: 16.3% at a damping ratio of 0.5, a factor of 1.3896, and

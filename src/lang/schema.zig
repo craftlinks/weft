@@ -16,7 +16,9 @@
 //!
 //! ## 3. Names Match the Builder
 //! Every entry is one builder call with the builder's own names, so the table, the builder, and
-//! its documentation say the same thing. Shorter names come from modules (step 13).
+//! its documentation say the same thing. Shorter names come from modules (step 13). `abs`, `min`,
+//! and `max` are the exception, the names a formula writes, for `apply(.abs, …)`, `minimum`, and
+//! `maximum` (section 3c).
 //!
 //! ## 3a. Nouns That Only Describe
 //! A client has two ways to add a call (steps 14 and 27). `Op.client` is a signal the client
@@ -34,6 +36,14 @@
 //! tween's `to`, so a chain of tweens says each value once. The checker fills it in, so the call
 //! a back end reads is the one the longer text gives, and with no tween to read it from, `from`
 //! is required as before. `describe` prints the default as `"after"`.
+//!
+//! ## 3c. Functions of a Value
+//! `abs`, `min`, and `max` (step 26) are pure calls whose every parameter is a shaped signal, so
+//! a vector or a colour goes in whole and the call works per component, as `+` does: `min` and
+//! `max` take `+`'s shapes, a number broadcast and a colour never mixed with a vector, and `abs`
+//! keeps its input's. Their lanes are their inputs'. An entry whose `op` is `function` names its
+//! core function in `function`, so a function of one value is one entry and one value of
+//! `graph.Function`, and the checker and the back end have one arm for all of them.
 //!
 //! ## 4. TigerStyle Invariants
 //! - The table is comptime and checked: positional parameters come first, names are unique in an
@@ -151,6 +161,11 @@ pub const Op = enum {
     /// A client's noun that only describes (section 3a): a declaration of its own, whose signal
     /// arguments the back end builds and whose call it skips.
     noun,
+    /// A function of one value, the entry's `function` (section 3c).
+    function,
+    /// `min` and `max`: the smaller and the larger of two values (section 3c).
+    minimum,
+    maximum,
 };
 
 /// How a call takes lanes (step 17), which `describe` prints and the checker follows.
@@ -177,6 +192,9 @@ pub const Entry = struct {
     /// Its outputs beyond the first, by name; the first is the call itself.
     outputs: []const []const u8 = &.{},
     summary: []const u8,
+    /// The core function of an entry whose `op` is `function`, and null for every other. A
+    /// client's entry with that `op` sets it too, as the table's are checked to.
+    function: ?graph.Function = null,
 
     /// The index of the parameter `name`, if the entry has one.
     pub fn param(entry: *const Entry, name: []const u8) ?u32 {
@@ -191,6 +209,7 @@ pub const Entry = struct {
             .noise, .follow, .shift, .delay => .region,
             .wave, .tween, .spring, .newtonian, .bounce => .stagger,
             .chase, .crossing, .map, .oscillator, .pack, .srgb, .client => .inputs,
+            .function, .minimum, .maximum => .inputs,
             .cues, .input, .spring_mover, .newtonian_mover => .one,
             .lanes => .makes,
             .noun => .apart,
@@ -335,6 +354,17 @@ pub const entries = [_]Entry{
         .{ .name = "from", .kind = .number_range, .positional = true },
         .{ .name = "to", .kind = .number_range },
     } },
+    .{ .name = "abs", .op = .function, .function = .abs, .role = .signal, .summary = "the absolute value of a signal, per component", .params = &.{
+        .{ .name = "input", .kind = .signal, .positional = true, .shaped = true },
+    } },
+    .{ .name = "min", .op = .minimum, .role = .signal, .summary = "the smaller of two signals, per component", .params = &.{
+        .{ .name = "a", .kind = .signal, .positional = true, .shaped = true },
+        .{ .name = "b", .kind = .signal, .positional = true, .shaped = true },
+    } },
+    .{ .name = "max", .op = .maximum, .role = .signal, .summary = "the larger of two signals, per component", .params = &.{
+        .{ .name = "a", .kind = .signal, .positional = true, .shaped = true },
+        .{ .name = "b", .kind = .signal, .positional = true, .shaped = true },
+    } },
     .{ .name = "vec2", .op = .pack, .role = .signal, .summary = "a 2D vector of two signals", .params = &.{
         .{ .name = "x", .kind = .signal, .positional = true },
         .{ .name = "y", .kind = .signal, .positional = true },
@@ -373,6 +403,7 @@ comptime {
     @setEvalBranchQuota(20_000);
     for (entries) |entry| {
         assert(entry.params.len <= params_max);
+        assert((entry.op == .function) == (entry.function != null));
         var named = false;
         for (entry.params, 0..) |param_a, index_a| {
             if (param_a.positional) assert(!named) else named = true;

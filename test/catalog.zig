@@ -67,7 +67,15 @@
 //! and one whose gain is a track turned back to 0.5 at 150 s, which comes back down to 2. They
 //! come last, so every line before them is a line of step 9.
 //!
-//! ## 11. TigerStyle Invariants
+//! ## 11. Functions of a Value
+//! Four graphs read `abs`, `min`, and `max` (step 26) at every epoch, as the graphs of step 5 do:
+//! the drift's distance from 0, the lower of two waves, the higher of the sequence and a wave,
+//! and a wave clamped as `std`'s `clamp` builds it. Then one run of constants locks signed zero,
+//! the case where `@min` and `@max` differ by target: for each pair of a few, |a|, the minimum,
+//! and the maximum, one line each, `zeros PAIR OP VALUE`. They come last, so every line before
+//! them is a line of step 10.
+//!
+//! ## 12. TigerStyle Invariants
 //! - The text fits in `text_size_max` by construction, so `render` cannot fail.
 
 const std = @import("std");
@@ -177,6 +185,22 @@ const graphs_after_events = [_]Graph{
     .recorded, .oscillator, .live_chase, .live_sway, .live_glide,
 };
 
+/// The graphs of section 11, each built by `value_graph_build`, after the runaway.
+const ValueGraph = enum {
+    abs,
+    min,
+    max,
+    clamp,
+};
+
+const value_graphs = std.enums.values(ValueGraph);
+
+/// The pairs of section 11's run of constants: each signed zero either way round, equal values,
+/// and two that differ.
+const zero_pairs = [_][2]f64{
+    .{ 0.0, -0.0 }, .{ -0.0, 0.0 }, .{ -0.0, -0.0 }, .{ 0.0, 0.0 }, .{ 0.5, 0.5 }, .{ -2, 3 },
+};
+
 /// The graphs whose events are listed, each built by `event_graph_build`.
 const EventGraph = enum {
     bounce,
@@ -218,7 +242,12 @@ const runaway_samples_per_run = 31;
 const runaway_stride_seconds = 10;
 const runaway_sample_count = 2 * runaway_samples_per_run;
 
-pub const sample_count = wave_sample_count + noise_sample_count + graph_sample_count + runaway_sample_count;
+/// Section 11's samples: its graphs at every epoch, then three lines a pair of constants.
+const value_sample_count = value_graphs.len * epochs.len * samples_per_run;
+const zero_sample_count = 3 * zero_pairs.len;
+
+pub const sample_count = wave_sample_count + noise_sample_count + graph_sample_count +
+    runaway_sample_count + value_sample_count + zero_sample_count;
 
 pub const event_count = count: {
     var count: u32 = 0;
@@ -243,6 +272,8 @@ comptime {
     const graphs_last = std.enums.values(Graph)[graphs.len..];
     for (graphs_after_events, graphs_last) |late, last| assert(late == last);
     assert(event_count == 144);
+    assert(value_sample_count == 384);
+    assert(zero_sample_count == 18);
     assert(Graph.slab_count_max >= Graph.nodes_count_max + 2 * weft.motion.cursor_count);
     assert(text_size_max < 1 << 20);
     for (signals) |signal| assert(weft.Rate.from_hz(signal.rate_hz) != null);
@@ -272,6 +303,10 @@ pub fn render(text: *[text_size_max]u8) []const u8 {
     }
     render_runaway(&writer, false);
     render_runaway(&writer, true);
+    for (value_graphs) |graph| {
+        for (&epochs) |*epoch| render_graph_run(&writer, graph, epoch);
+    }
+    render_zeros(&writer);
     assert(writer.buffered().len > line_count);
     assert(writer.buffered()[writer.buffered().len - 1] == '\n');
     return writer.buffered();
@@ -406,13 +441,14 @@ const Tables = struct {
     }
 };
 
-fn render_graph_run(writer: *std.Io.Writer, graph: Graph, epoch: *const Epoch) void {
+/// Samples a `Graph` or a `ValueGraph` at `epoch`.
+fn render_graph_run(writer: *std.Io.Writer, graph: anytype, epoch: *const Epoch) void {
     var tables: Tables = undefined;
     tables.init(epoch);
     var nodes: [Graph.nodes_count_max]weft.Node = undefined;
     var slab: [Graph.slab_count_max]f64 = undefined;
     var builder = tables.builder(&nodes, slab.len);
-    const output = graph_build(graph, &builder) catch unreachable;
+    const output = build_any(graph, &builder) catch unreachable;
     var state = weft.State.init(builder.finish(), &slab);
 
     const rate = weft.Rate.from_hz(48_000).?;
@@ -469,6 +505,30 @@ fn runaway_build(builder: *weft.Builder, gain_track: weft.TrackId) weft.Builder.
     });
     try builder.close(feedback, loop);
     return loop;
+}
+
+/// Writes |a|, the minimum, and the maximum of each pair of `zero_pairs`, from nodes, as section 11
+/// explains.
+fn render_zeros(writer: *std.Io.Writer) void {
+    for (zero_pairs, 0..) |pair, index| {
+        var nodes: [5]weft.Node = undefined;
+        var builder = weft.Builder.init(&nodes, .{ .slab_count_max = 5 });
+        const a = builder.constant(pair[0]) catch unreachable;
+        const b = builder.constant(pair[1]) catch unreachable;
+        const outputs = [_]weft.Id{
+            builder.apply(.abs, a) catch unreachable,
+            builder.minimum(a, b) catch unreachable,
+            builder.maximum(a, b) catch unreachable,
+        };
+        var slab: [5]f64 = undefined;
+        var state = weft.State.init(builder.finish(), &slab);
+        state.eval(.{ .flicks = 0 });
+        for (outputs, [_][]const u8{ "abs", "min", "max" }) |id, name| {
+            const size_before = writer.buffered().len;
+            writer.print("zeros {d} {s} {x}\n", .{ index, name, state.value(id) }) catch unreachable;
+            assert(writer.buffered().len - size_before <= line_size_max);
+        }
+    }
 }
 
 /// Lists the events of the first `event_range_seconds` of `graph` at `epoch`, as section 7
@@ -696,13 +756,53 @@ fn graph_build(graph: Graph, builder: *weft.Builder) weft.Builder.Error!weft.Id 
 /// The nodes of the graph `name` at epoch zero, and its output, for the language's test, which
 /// writes each graph as text and checks it builds these nodes (`test/lang.zig`).
 pub fn graph_nodes(name: []const u8, nodes: *[Graph.nodes_count_max]weft.Node) ?struct { count: usize, output: weft.Id } {
-    const graph = std.meta.stringToEnum(Graph, name) orelse return null;
     var tables: Tables = undefined;
     tables.init(&epochs[0]);
     var builder = tables.builder(nodes, Graph.slab_count_max);
-    const output = graph_build(graph, &builder) catch unreachable;
+    const output = if (std.meta.stringToEnum(Graph, name)) |graph|
+        graph_build(graph, &builder) catch unreachable
+    else if (std.meta.stringToEnum(ValueGraph, name)) |graph|
+        value_graph_build(graph, &builder) catch unreachable
+    else
+        return null;
     const program = builder.finish();
     return .{ .count = program.nodes.len, .output = output };
+}
+
+/// The output of a `Graph` or a `ValueGraph`, built.
+fn build_any(graph: anytype, builder: *weft.Builder) weft.Builder.Error!weft.Id {
+    return switch (@TypeOf(graph)) {
+        Graph => graph_build(graph, builder),
+        ValueGraph => value_graph_build(graph, builder),
+        else => @compileError("not a catalog graph"),
+    };
+}
+
+fn value_graph_build(graph: ValueGraph, builder: *weft.Builder) weft.Builder.Error!weft.Id {
+    switch (graph) {
+        // The drift's distance from 0, which it crosses.
+        .abs => return builder.apply(.abs, try graph_build(.drift, builder)),
+        // The lower of two slow waves, which cross each other.
+        .min => {
+            const first = try builder.wave(.{ .shape = .sine, .hz = 0.7 });
+            const second = try builder.wave(.{ .shape = .triangle, .hz = 1 });
+            return builder.minimum(first, second);
+        },
+        // The higher of the sequence and half a slow wave.
+        .max => {
+            const sequence = try build_sequence(builder);
+            const wave = try builder.wave(.{ .shape = .sine, .hz = 0.7 });
+            const half = try builder.multiply(wave, try builder.constant(0.5));
+            return builder.maximum(sequence, half);
+        },
+        // Twice a slow wave held in [-0.5, 1], as `std`'s `clamp` builds it.
+        .clamp => {
+            const wave = try builder.wave(.{ .shape = .sine, .hz = 0.7 });
+            const loud = try builder.multiply(wave, try builder.constant(2));
+            const above = try builder.maximum(loud, try builder.constant(-0.5));
+            return builder.minimum(above, try builder.constant(1));
+        },
+    }
 }
 
 pub const graph_nodes_max = Graph.nodes_count_max;
