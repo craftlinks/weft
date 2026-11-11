@@ -817,6 +817,11 @@ const fuzz_seeds = [_][]const u8{
     "cue c0 = 0s\nw = wave(sine, 1hz)\na = abs(w - 0.5)\nm = min(vec2(w, 1), 0.5) + max(-0, 0)\n" ++
         "x = max(lanes(4, lane), abs(-1))\nmodule hold(v, lo, hi) = min(max(v, lo), hi)\n" ++
         "c = hold(chase(w, time: 0.25s) * 2, -1, 1)\nk = lanes(4, min(abs(lane - 2), w))\n",
+    // Functions of a value (step 33): every one, numbers that fold and overflow, a vector, lanes,
+    // a simulated input, and a quantize as a module.
+    "cue c0 = 0s\nw = wave(sine, 1hz) * 4\ns = sin(w) + cos(vec2(w, 1)).y\ne = exp(w * 200) + ln(w)\n" ++
+        "q = sqrt(w - 1) + floor(w) + round(-0.5)\np = pow(w, 3) + pow(1e200, 2)\n" ++
+        "module snap(v, step) = round(v / step) * step\nk = lanes(4, snap(chase(w, time: 0.25s), 0.5) + lane)\n",
     // A loop that runs away within half a second, so the reader meets the bound (step 19).
     "cue c0 = 0s\nfb = delay(0)\nloop = chase(1 + fb * 1e100, time: 0.01s)\nfb <- loop\nx = loop * loop * loop\n",
 };

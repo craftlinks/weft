@@ -1,6 +1,6 @@
-//! Tests of the graph: the functions of a value (step 26, `graph.zig` section 17), `apply` with
-//! `abs`, and `minimum` and `maximum`: their values, signed zero, shapes, lanes, refusals, and
-//! range rules.
+//! Tests of the graph: the functions of a value (steps 26 and 33, `graph.zig` section 17), `apply`
+//! with each `Function`, and `minimum` and `maximum`: their values, signed zero, shapes, lanes,
+//! refusals, classes, and range rules.
 //!
 //! They read `graph.zig`, `state.zig`, and `range.zig` as a client would.
 
@@ -15,6 +15,9 @@ const Function = graph_module.Function;
 const Id = graph_module.Id;
 const Node = graph_module.Node;
 const Program = graph_module.Program;
+const elementary = @import("../elementary.zig");
+const Cues = @import("../cue.zig").Cues;
+const Time = @import("../time.zig").Time;
 
 fn bits(value: f64) u64 {
     return @bitCast(value);
@@ -24,8 +27,8 @@ fn bits(value: f64) u64 {
 // signed zero one answer either way round: |-0| is +0, min(-0, +0) and min(+0, -0) are -0, max of
 // them +0, and equal inputs give that value.
 test "abs, min, and max compute their values, with one answer for signed zero" {
-    try testing.expectEqual(@as(f64, 2.5), Function.abs.of(-2.5));
-    try testing.expectEqual(bits(0), bits(Function.abs.of(-0.0)));
+    try testing.expectEqual(@as(f64, 2.5), Function.of(.abs, -2.5));
+    try testing.expectEqual(bits(0), bits(Function.of(.abs, -0.0)));
     try testing.expectEqual(@as(f64, -1), graph_module.minimum(3, -1));
     try testing.expectEqual(@as(f64, 3), graph_module.maximum(3, -1));
     const zero = bits(0.0);
@@ -238,4 +241,212 @@ test "a clamp composed of max and min has an exact range" {
     try testing.expectEqual(@as(f64, 0.25), seen[0].high);
     try testing.expectEqual(@as(f64, -3), seen[1].low);
     try testing.expectEqual(@as(f64, 3), seen[1].high);
+}
+
+/// Every function of step 33, a power of each parity among them.
+const step_33_functions = [_]Function{
+    .sin, .cos, .exp, .ln, .sqrt, .floor, .round, .{ .pow = 2 }, .{ .pow = 3 }, .{ .pow = 8 },
+};
+
+// Locks step 33's values through nodes: each function of a constant input is the elementary
+// function's value, bit for bit, and `pow(x, 2)` is the node `x * x` builds, for x = -1.7.
+test "each function of a value computes its value through a node" {
+    const inputs = [_]f64{ -1.7, -0.5, -0.0, 0.5, 2.5, 1e6 };
+    for (step_33_functions) |function| for (inputs) |x| {
+        var nodes: [4]Node = undefined;
+        var builder = Builder.init(&nodes, .{ .slab_count_max = 4 });
+        const input = try builder.constant(x);
+        const applied = try builder.apply(function, input);
+        const product = try builder.multiply(input, input);
+        var slab: [4]f64 = undefined;
+        var state = State.init(builder.finish(), &slab);
+        state.eval(.{ .flicks = 0 });
+        try testing.expectEqual(bits(function.of(x)), bits(state.value(applied)));
+        if (std.meta.eql(function, Function{ .pow = 2 })) {
+            try testing.expectEqual(bits(state.value(product)), bits(state.value(applied)));
+        }
+    };
+    try testing.expectEqual(@as(f64, -1), Function.of(.round, -0.5));
+    try testing.expectEqual(@as(f64, 3), Function.of(.round, 2.5));
+    try testing.expectEqual(@as(f64, -1), Function.of(.floor, -0.5));
+    try testing.expectEqual(@as(f64, 0), Function.of(.sqrt, -4));
+}
+
+// Locks the power's refusal by name: 0, 1, 9, and 255 are `InvalidPower`, nothing is built, and
+// 2 and 8 are taken.
+test "the builder refuses a power outside 2 to 8" {
+    var nodes: [4]Node = undefined;
+    var builder = Builder.init(&nodes, .{ .slab_count_max = 4 });
+    const one = try builder.constant(1);
+    for ([_]u8{ 0, 1, 9, 255 }) |n| {
+        try testing.expectError(error.InvalidPower, builder.apply(.{ .pow = n }, one));
+    }
+    try testing.expectEqual(@as(u32, 1), builder.node_count);
+    _ = try builder.apply(.{ .pow = 2 }, one);
+    _ = try builder.apply(.{ .pow = 8 }, one);
+}
+
+/// Input ranges for step 33's range test: inside one monotone stretch of the sine, across a peak,
+/// across zero, wider than a turn, huge, at and below zero for `ln` and `sqrt`, across a half for
+/// `round`, past e^709 for `exp`, and unbounded on either side or both.
+const inf = std.math.inf(f64);
+const wide_ranges = [_][2]f64{
+    .{ 0.1, 1.2 }, .{ 1.0, 2.0 },     .{ -0.3, 0.4 },      .{ -2, 9 },         .{ 4, 4.5 },
+    .{ -7, -6.5 }, .{ 1e6, 1e6 + 1 }, .{ 1e15, 1e15 + 8 }, .{ -1e300, 1e300 }, .{ -3, 0 },
+    .{ -1, 1 },    .{ 0, 1e-300 },    .{ -2.5, 2.5 },      .{ 700, 720 },      .{ -800, -700 },
+    .{ -inf, 2 },  .{ -0.5, inf },    .{ -inf, inf },      .{ 0.25, 0.25 },    .{ 3.14159, 3.1416 },
+};
+
+/// How many points across a range the range test reads, its ends and the turns' peaks between.
+const wide_points = 513;
+
+/// The points the range test sets an input to: evenly across a finite range, both ends, 0 where
+/// it is inside, the sine's and cosine's extremes near the range, and for an unbounded end a run
+/// of ever larger values out to 1e300, since an input holds finite values only.
+fn wide_points_of(range: [2]f64, out: *[wide_points + 64]f64) []const f64 {
+    var count: usize = 0;
+    const low = if (std.math.isFinite(range[0])) range[0] else -1e300;
+    const high = if (std.math.isFinite(range[1])) range[1] else 1e300;
+    for (0..wide_points) |index| {
+        const weight = @as(f64, @floatFromInt(index)) / (wide_points - 1);
+        out[count] = if (index == wide_points - 1) high else low * (1 - weight) + high * weight;
+        count += 1;
+    }
+    // An input holds finite values only, so an infinite end is read as 1e300 and beyond.
+    out[count] = std.math.clamp(0, range[0], range[1]);
+    count += 1;
+    // The extremes of the sine and cosine within a few turns of the ends.
+    for ([_]f64{ low, high }) |end| {
+        if (@abs(end) > 1e9) continue;
+        const base = @floor(end / std.math.tau) * std.math.tau;
+        for (0..12) |k| {
+            const x = base + @as(f64, @floatFromInt(k)) * (std.math.pi / 4.0) - std.math.tau;
+            if (x >= range[0] and x <= range[1] and count < out.len) {
+                out[count] = x;
+                count += 1;
+            }
+        }
+    }
+    for ([_]f64{ 1e10, 1e100, 1e300 }) |far| {
+        if (count + 2 > out.len) break;
+        if (range[0] <= -far) {
+            out[count] = -far;
+            count += 1;
+        }
+        if (range[1] >= far) {
+            out[count] = far;
+            count += 1;
+        }
+    }
+    return out[0..count];
+}
+
+/// Whether a range rule is exact, or within a margin of what it reaches.
+fn exact(function: Function) bool {
+    return switch (function) {
+        .sqrt, .floor, .round, .pow => true,
+        else => false,
+    };
+}
+
+// Locks step 33's range rules (`range.zig`, section 2b) through nodes: for each function and each
+// of the ranges above, an input set to each point across it never leaves the node's range (sound),
+// and the least and largest values seen are its ends exactly for sqrt, floor, round, and pow, and
+// within 1e-12 of its scale for the others, where the input is bounded and, for those, narrower
+// than a turn. And the sine over [0.1, 1.2], inside one monotone
+// stretch, stays below 1, while over [1, 2], across its peak, it reaches 1.
+test "the ranges of the functions of a value are sound and tight" {
+    var slab: [4]f64 = undefined;
+    var buffer: [wide_points + 64]f64 = undefined;
+    for (step_33_functions) |function| for (wide_ranges) |range_ends| {
+        var nodes: [2]Node = undefined;
+        var builder = Builder.init(&nodes, .{ .slab_count_max = 4 });
+        const input = try builder.input(.{ .low = range_ends[0], .high = range_ends[1], .initial = std.math.clamp(0, range_ends[0], range_ends[1]) });
+        const applied = try builder.apply(function, input);
+        const program = builder.finish();
+        var ranges: [2]Range = undefined;
+        program.ranges(&ranges);
+        const range = ranges[applied.index];
+        var state = State.init(program, slab[0..program.slab_count]);
+        var seen: Seen = .{};
+        for (wide_points_of(range_ends, &buffer)) |x| {
+            state.set_input(input, x);
+            state.eval(.{ .flicks = 0 });
+            const value = state.value(applied);
+            errdefer std.debug.print("{any} of {e} over {any}: {e} outside [{e}, {e}]\n", .{
+                function, x, range_ends, value, range.low, range.high,
+            });
+            try testing.expect(!std.math.isNan(value));
+            try testing.expect(range.contains(value));
+            seen.add(value);
+        }
+        errdefer std.debug.print("{any} over {any}: range [{e}, {e}], seen [{e}, {e}]\n", .{
+            function, range_ends, range.low, range.high, seen.low, seen.high,
+        });
+        // An input cannot hold an infinity, so an unbounded range's ends cannot be reached.
+        const bounded = std.math.isFinite(range_ends[0]) and std.math.isFinite(range_ends[1]);
+        if (!bounded) continue;
+        if (exact(function)) {
+            try testing.expect(range.low == seen.low);
+            try testing.expect(range.high == seen.high);
+        } else if (!(range_ends[1] - range_ends[0] >= std.math.tau)) {
+            // Over a turn or more, the points need not land on a peak, which a sine still has.
+            const slack = 1e-12 * @max(1, @max(@abs(seen.low), @abs(seen.high)));
+            try testing.expect(seen.low - range.low <= slack);
+            try testing.expect(range.high - seen.high <= slack);
+        }
+    };
+    const inside = range_module.sine(.{ .low = 0.1, .high = 1.2 });
+    try testing.expect(inside.high < 0.95);
+    try testing.expect(inside.low > 0.09);
+    try testing.expectEqual(@as(f64, 1), range_module.sine(.{ .low = 1, .high = 2 }).high);
+}
+
+// Locks the worked ranges of `range.zig`, section 2b: pow(x, 2) over [-1, 1] is [0, 1] where
+// x * x is [-1, 1]; pow(x, 3) over [-2, 1] is [-8, 1]; sqrt over [-4, 9] is [0, 3]; floor and
+// round over [-0.5, 2.5] are [-1, 2] and [-1, 3]; exp and ln of an unbounded input are finite,
+// [0, e^709] and [ln 2^-1074, ln of the largest double], within their margins; and sin and cos
+// of a range wider than a turn, or unbounded, are [-1, 1].
+test "the functions of a value have worked ranges" {
+    const unit: Range = .{ .low = -1, .high = 1 };
+    try testing.expectEqual(Range{ .low = 0, .high = 1 }, range_module.power(unit, 2));
+    try testing.expectEqual(unit, range_module.multiply(unit, unit));
+    try testing.expectEqual(Range{ .low = -8, .high = 1 }, range_module.power(.{ .low = -2, .high = 1 }, 3));
+    const fns = struct {
+        fn floor(x: f64) f64 {
+            return @floor(x);
+        }
+    };
+    try testing.expectEqual(Range{ .low = 0, .high = 3 }, range_module.monotone(.{ .low = -4, .high = 9 }, elementary.square_root));
+    const halves: Range = .{ .low = -0.5, .high = 2.5 };
+    try testing.expectEqual(Range{ .low = -1, .high = 2 }, range_module.monotone(halves, fns.floor));
+    try testing.expectEqual(Range{ .low = -1, .high = 3 }, range_module.monotone(halves, elementary.round_half_away));
+    const exp_all = range_module.exponential(Range.unbounded);
+    try testing.expectEqual(@as(f64, 0), exp_all.low);
+    try testing.expectApproxEqRel(elementary.exponential(709), exp_all.high, 1e-14);
+    const ln_all = range_module.logarithm(Range.unbounded);
+    try testing.expectApproxEqRel(@as(f64, -744.4400719213812), ln_all.low, 1e-14);
+    try testing.expectApproxEqRel(@as(f64, 709.782712893384), ln_all.high, 1e-14);
+    try testing.expectEqual(unit, range_module.sine(.{ .low = 0, .high = 7 }));
+    try testing.expectEqual(unit, range_module.cosine(Range.unbounded));
+    try testing.expectEqual(unit, range_module.sine(.{ .low = -inf, .high = 0 }));
+}
+
+// Locks the class of section 17: a function of a value has its input's class, so floor of a wave
+// is pure and its program seekable with no steps, and floor of a chase is simulated.
+test "a function of a value has its input's class" {
+    var times: [1]Time = undefined;
+    var cues = Cues.init(&times);
+    _ = try cues.add(.{ .flicks = 0 });
+    var nodes: [4]Node = undefined;
+    var builder = Builder.init(&nodes, .{ .slab_count_max = 16, .cues = &cues });
+    const wave = try builder.wave(.{ .shape = .sine, .hz = 1 });
+    const stepped = try builder.apply(.floor, wave);
+    const chased = try builder.chase(.{ .target = wave, .from = 0, .time = .{ .flicks = 705_600_000 }, .overshoot = 0 });
+    const chase_floor = try builder.apply(.round, chased);
+    const program = builder.finish();
+    var classes: [4]graph_module.Class = undefined;
+    program.classes(&classes);
+    try testing.expectEqual(graph_module.Class.pure, classes[stepped.index]);
+    try testing.expectEqual(graph_module.Class.simulated, classes[chase_floor.index]);
 }

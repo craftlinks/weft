@@ -42,7 +42,8 @@ zig-out/bin/weft sample FILE --signal NAME               # one signal
 - **Which calls take lanes**: `describe` gives each call's `"lanes"`. In `lanes(n, …)`, `noise`,
   `follow`, `shift`, and `delay` have the region's lanes (`region`), and so do `wave`, `tween`,
   `spring`, `newtonian`, and `bounce` given a `stagger:` (`stagger`). Every other call, `chase`,
-  `crossing`, `map`, `oscillator`, `abs`, `min`, `max`, and the arithmetic among them, has the
+  `crossing`, `map`, `oscillator`, `min`, `max`, every function of a value (`abs`, `sin`, …),
+  and the arithmetic among them, has the
   most lanes of the signals it reads (`inputs`).
 
 ## 2. Write a File
@@ -78,6 +79,7 @@ use std                                  # the standard library: pass --use std=
 soft = snappy(moves)                     # a module: a macro with types
 far = abs(wave - 0.5) + max(rise, 0.25)  # abs, min, max: calls, per component like +
 held = clamp(sum, -1, 1)                 # std's clamp: min(max(sum, -1), 1)
+curve = sin(index * 6.28) + pow(wave, 2) # sin and cos in radians; also exp, ln, sqrt, floor, round
 module bob2(base, amount: 0.1) = base + amount * wave(sine, 2hz)
 ```
 
@@ -93,8 +95,12 @@ Rules that trip agents most often:
 - **`abs`, `min`, and `max` are calls**, not operators, and work as `+` does: per component on a
   vector or a colour, a number broadcast, the lanes of what they read. Their ranges are exact, so
   `abs` of a wave is reported as [0, 1]. `clamp(x, low, high)` is a module of `std`, so the file
-  says `use std`. Given only numbers they fold to a constant. There is no `floor`, `sqrt`, `exp`,
-  or `sin` of a value yet.
+  says `use std`. Given only numbers they fold to a constant.
+- **`sin`, `cos`, `exp`, `ln`, `sqrt`, `floor`, `round`, and `pow(x, n)`** work the same way.
+  `sin` and `cos` take radians. None can fail: `sqrt` of a negative is 0, `ln` at and below 0 is
+  about -744.44, and `exp` above 709 holds e^709. `round` takes a half away from zero. `pow`'s
+  `n` is a whole number literal from 2 to 8, and `pow(x, 2)` has a tighter range than `x * x`.
+  `quantize(x, step)` in `std` snaps to multiples of a fixed number `step`.
 - **A tween `after` a tween may leave out `from`**, and starts from that tween's `to`:
   `tween(to: 0, at: c1, over: 1s, after: rise)`. `after` must be a name bound to a tween;
   anything else needs `from`.
@@ -187,15 +193,22 @@ Add one only when no composition of the ones `describe` lists can express it, or
 composition's range or cost is much worse, and say why in the op's doc comment (`abs` is
 `max(x, -x)`, whose range over [-1, 1] would be [-1, 1]). Every op appears in the same places, in
 this order. Step 26 (`abs`, `min`, `max`) walked it in full; its diff is the worked example.
+Step 33 took the short path below for eight functions.
 
 **A function of one value is shorter.** If the op is pure, reads one signal, and works per
 component and per lane, it is a value of `graph.Function`: its arm in `Function.of` and in
 `function_range` (`src/core/graph.zig`), its range rule in `src/core/range.zig`, and one entry in
 `schema.zig` with `.op = .function` and `.function` set. `Op.apply`, `eval_node`, the checker's
 shape, lanes, and folding, and the back end already handle every function, so of the steps
-below it needs the range rule's test (1), the tests (3), the entry (4), and 7 to 10. A value whose bits could differ by target, such
-as `@min`, `@max`, `@sin`, or `@exp`, is computed by Weft's own code (`elementary.zig`,
-`graph.minimum`), never by the builtin.
+below it needs the range rule's test (1), the tests (3), the entry (4), and 7 to 10. A value
+whose bits could differ by target, such as `@min`, `@max`, `@sin`, `@exp`, or `@round`, is
+computed by Weft's own code (`elementary.zig`, `graph.minimum`), never by the builtin; `@sqrt`
+and `@floor` are IEEE operations and may be used. A function must be total: a value for every
+f64 a signal can hold, infinities included, with NaN passed through and no assert, and its
+range rule must hold for an unbounded input. A function with a whole-number parameter, as
+`pow` has, is a payload of the union and an `integer` parameter the checker bounds
+(`power_in_range`), and `Builder.apply` refuses it by name. A catalog graph named after a call
+reads as one in `test/lang.zig`, so step 33's are `fn_NAME`.
 
 1. **`src/core/graph.zig`**
    - the op's struct, with a doc comment for each field, and its source struct if the client's

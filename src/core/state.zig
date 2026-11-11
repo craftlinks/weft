@@ -31,6 +31,7 @@ const simulation = @import("simulation.zig");
 const time_module = @import("time.zig");
 const Time = time_module.Time;
 const graph = @import("graph.zig");
+const elementary = @import("elementary.zig");
 const BounceNode = graph.BounceNode;
 const Crossing = graph.Crossing;
 const CueSpan = graph.CueSpan;
@@ -1187,10 +1188,15 @@ fn pairwise_into(
 fn apply_into(out: []f64, input: []const f64, function: graph.Function) void {
     assert(input.len == out.len);
     assert(out.len > 0);
-    // The function is known in each arm, so the loop has no switch in it.
+    // The function is known in each arm, so the loop has no switch in it; a power's n is not, and
+    // it is a counted loop of products.
     switch (function) {
-        inline else => |known| for (out, input) |*value, x| {
-            value.* = known.of(x);
+        .pow => |n| for (out, input) |*value, x| {
+            value.* = elementary.power(x, n);
+        },
+        inline else => |_, tag| {
+            const known = @unionInit(graph.Function, @tagName(tag), {});
+            for (out, input) |*value, x| value.* = known.of(x);
         },
     }
 }

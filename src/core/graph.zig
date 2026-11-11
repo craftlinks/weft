@@ -205,13 +205,26 @@
 //! `apply` takes a `Function` of one value, and `minimum` and `maximum` the smaller and larger of
 //! two (step 26). Each is pure and works per component and per lane as `add` does: `apply` keeps
 //! its input's extent, and `minimum` and `maximum` take `add`'s shapes and lanes, a scalar or a
-//! lane broadcast. Each has a range rule in `range.zig`, sound for any inputs in their ranges and
-//! exact for independent ones, since abs, min, and max round nothing. A function is one enum
-//! value, its value in `Function.of`, and its range in `function_range`, so a new function adds
-//! a line to each and no op. Signed zero has one answer on every target, where `@min` and `@max`
-//! leave it to the instruction: |-0| is +0, the minimum of -0 and +0 either way round is -0, and
-//! the maximum is +0. Equal inputs give that value. NaN never reaches a signal, so neither order
-//! of a NaN is promised, though both are the same bits on every target.
+//! lane broadcast. Each has a range rule in `range.zig`, sound for any inputs in their ranges. A
+//! function is one value of the union `Function`, its value in `Function.of`, and its range in
+//! `function_range`, so a new function adds a line to each and no op. Signed zero has one answer
+//! on every target, where `@min` and `@max` leave it to the instruction: |-0| is +0, the minimum
+//! of -0 and +0 either way round is -0, and the maximum is +0. Equal inputs give that value.
+//!
+//! Step 33 adds `sin`, `cos`, `exp`, `ln`, `sqrt`, `floor`, `round`, and `pow` by a whole number
+//! from 2 to 8, the one function with a payload, which the builder refuses outside that by
+//! `InvalidPower`. Each is total (`elementary.zig`, section 4a): any value a signal holds gives a
+//! finite value or the infinity it was given, so `sqrt` of a negative is 0 and `ln` of 0 is
+//! held, and their range rules (`range.zig`, sections 2a and 2b) hold for any input, an unbounded
+//! one included. abs, min, max, sqrt, floor, round, and pow round nothing out of order, so their
+//! ranges are exact for independent inputs; exp, ln, sin, and cos are within a small margin.
+//!
+//! A function is pure, so its node has its input's class: `floor` of a wave is pure and
+//! seekable, and `floor` of a chase is simulated. Of a simulated input it is the function of the
+//! interpolated value (section 9), so a step of `floor` falls where the interpolation crosses a
+//! whole number, between the fixed steps. A NaN reaches a pure node only after an overflow
+//! upstream, such as `inf - inf`; every function passes it through, and min and max of one give
+//! the same bits on every target, though which is not promised.
 //!
 //! ## 13. TigerStyle Invariants
 //! - Capacities come from the caller, and the builder refuses what does not fit, by name.
@@ -233,6 +246,7 @@ const assert = std.debug.assert;
 const Cue = @import("cue.zig").Cue;
 const Cues = @import("cue.zig").Cues;
 const Ease = @import("ease.zig").Ease;
+const elementary = @import("elementary.zig");
 const event_module = @import("event.zig");
 pub const Collector = event_module.Collector;
 pub const Event = event_module.Event;
@@ -582,17 +596,52 @@ pub const Recorded = struct {
     high: f64,
 };
 
-/// A function of one value, applied per component and per lane (section 17).
-pub const Function = enum {
+/// A function of one value, applied per component and per lane (section 17). Each is total, and
+/// none is a composition of the others or of arithmetic, except as its doc says.
+pub const Function = union(enum) {
     /// |x|, with its sign bit cleared, so |-0| is +0. `maximum(x, -x)` has the same values, but
     /// interval arithmetic takes x and -x as independent, so its range over [-1, 1] would be
     /// [-1, 1]; this one's is [0, 1].
     abs,
+    /// The sine of x radians (`elementary.sine_radians`).
+    sin,
+    /// The cosine of x radians (`elementary.cosine_radians`).
+    cos,
+    /// e^x, held at e^709 above 709 (`elementary.exponential`).
+    exp,
+    /// The natural log of x, held at the log of 2^-1074 at and below 0 (`elementary.logarithm`).
+    ln,
+    /// The square root of x, and 0 at and below 0 (`elementary.square_root`).
+    sqrt,
+    /// The largest whole number at or below x: IEEE 754's `@floor`.
+    floor,
+    /// The nearest whole number, a half away from zero (`elementary.round_half_away`).
+    round,
+    /// x to a whole power from `elementary.power_min` to `power_max`, which the builder checks.
+    /// `pow(x, 2)` is `x * x` bit for bit, with an exact range that knows both factors are x, so
+    /// over [-1, 1] it is [0, 1] where the product's is [-1, 1].
+    pow: u8,
 
     /// The function's value at `x`, the same bits on every target.
     pub fn of(function: Function, x: f64) f64 {
         return switch (function) {
             .abs => @abs(x),
+            .sin => elementary.sine_radians(x),
+            .cos => elementary.cosine_radians(x),
+            .exp => elementary.exponential(x),
+            .ln => elementary.logarithm(x),
+            .sqrt => elementary.square_root(x),
+            .floor => @floor(x),
+            .round => elementary.round_half_away(x),
+            .pow => |n| elementary.power(x, n),
+        };
+    }
+
+    /// Whether the builder takes it: a power from 2 to 8.
+    pub fn valid(function: Function) bool {
+        return switch (function) {
+            .pow => |n| n >= elementary.power_min and n <= elementary.power_max,
+            else => true,
         };
     }
 };
@@ -920,6 +969,7 @@ pub const Program = struct {
                 },
                 .apply => |op| {
                     assert(op.input.index < index);
+                    assert(op.function.valid());
                     const input = program.nodes[op.input.index].extent;
                     assert(input.lanes == node.extent.lanes);
                     assert(input.components == node.extent.components);
@@ -1290,6 +1340,8 @@ pub const Builder = struct {
         InvalidParameter,
         /// An oscillator's phase outside [0, 1).
         InvalidPhase,
+        /// A `Function.pow` whose power is not a whole number from 2 to 8.
+        InvalidPower,
     };
 
     pub const Options = struct {
@@ -1385,6 +1437,7 @@ pub const Builder = struct {
     /// `function` of `of`, per component and per lane: the node has `of`'s extent (section 17).
     pub fn apply(builder: *Builder, function: Function, of: Id) Error!Id {
         try builder.check_known(of);
+        if (!function.valid()) return error.InvalidPower;
         const extent = builder.nodes[of.index].extent;
         return builder.push_shaped(.{ .apply = .{ .input = of, .function = function } }, extent);
     }
@@ -1897,11 +1950,23 @@ fn map_range_range(map: *const MapRange, input: Range) Range {
     return result.widen(@max(result.scale(), outputs * reach), range_module.margin_rounding);
 }
 
-/// The range of `function` over `input`, by the rules of `range.zig`, section 2a.
+/// The range of `function` over `input`, by the rules of `range.zig`, sections 2a and 2b.
 fn function_range(function: Function, input: Range) Range {
     return switch (function) {
         .abs => range_module.abs(input),
+        .sin => range_module.sine(input),
+        .cos => range_module.cosine(input),
+        .exp => range_module.exponential(input),
+        .ln => range_module.logarithm(input),
+        .sqrt => range_module.monotone(input, elementary.square_root),
+        .floor => range_module.monotone(input, floor_of),
+        .round => range_module.monotone(input, elementary.round_half_away),
+        .pow => |n| range_module.power(input, n),
     };
+}
+
+fn floor_of(x: f64) f64 {
+    return @floor(x);
 }
 
 /// The range of a tween: `from`, `to`, and the form at the eased progress's extremes, which the
