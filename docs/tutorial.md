@@ -916,11 +916,13 @@ The limits worth knowing before you design around Weft:
   scale send OKLab to the GPU and convert in the shader.
 - **Most parameters are constants.** Only those marked `live` take a signal. A tween's ends, a
   spring's goals, and a bounce's walls are fixed when the program is built.
-- **Division by a number only, no comparison, no `if`, no `min`/`max`, no `abs`.** `x / 4` is
-  `x * 0.25`, so a divisor is a number other than 0 that is fixed when the program is built, never
-  a signal, whose range could hold 0. The product is the quotient exactly when the divisor is a
-  power of two, and otherwise within one unit in the last place, the same on every target. A
-  `crossing` is the one way to make a gate; a `map` is the one way to rescale.
+- **Division by a number only, no comparison, no `if`.** `x / 4` is `x * 0.25`, so a divisor is
+  a number other than 0 that is fixed when the program is built, never a signal, whose range
+  could hold 0. The product is the quotient exactly when the divisor is a power of two, and
+  otherwise within one unit in the last place, the same on every target. A `crossing` is the one
+  way to make a gate; a `map` is the one way to rescale. Since 0.2, `abs(x)`, `min(a, b)`, and
+  `max(a, b)` exist, per component and per lane like `+`, with exact ranges, and `use std` gives
+  `clamp(x, low, high)`; there is still no `floor`, `sin` of a value, `sqrt`, or `exp`.
 - **No strings in a signal.** A value is one to four numbers. Since step 27 a string literal,
   `"text"`, exists for one use: a parameter of a client's noun (README, A Client's Nouns).
 - **A track holds a bounded number of writes** (`Limits.track_samples`, 1,024 by default).
@@ -948,6 +950,8 @@ target).
 | `'hz' takes a frequency` | A bare number | Write `2hz`, `500ms`, `1.5s` |
 | `not a whole number of flicks` | A time finer than the grid | Round to 5 places of a second |
 | `4 lanes and 5 lanes do not go together` | Two regions of different sizes | Make the counts equal |
+| ``there is no call `clamp` `` | `clamp` is a module of `std`, not a primitive | Add `use std`, and pass `--use std=src/lang/std.weft` to `weft` |
+| `` `min` is a primitive, not a module's name ``, or ``the module `clamp` is declared twice`` | A module of your own from before 0.2 named `abs`, `min`, or `max`, or `clamp` beside `use std` | Rename it, or delete it and use the call |
 | `error.Invalid` with no message | `compile(...) catch unreachable` | Render `compiled.errors()`; it names the `Limits` field to raise |
 | An assert in `value` | Reading after `events` with no `eval` between | Call `eval` first |
 | An assert in `value` | A node with lanes or components | Use `values` |

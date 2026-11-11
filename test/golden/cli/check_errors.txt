@@ -22,6 +22,6 @@ bad.weft:11:1: error: cues are in time order, and this one is before the cue abo
     cue early = 1s
     ^^^^^^^^^^^^^^
     hint: move it above the cues it comes before
-bad.weft:13:5: error: there is no call `min`
-    i = min(1, 2)
-        ^^^
+bad.weft:13:5: error: there is no call `print`
+    i = print(1, 2)
+        ^^^^^

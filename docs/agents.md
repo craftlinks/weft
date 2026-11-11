@@ -42,8 +42,8 @@ zig-out/bin/weft sample FILE --signal NAME               # one signal
 - **Which calls take lanes**: `describe` gives each call's `"lanes"`. In `lanes(n, …)`, `noise`,
   `follow`, `shift`, and `delay` have the region's lanes (`region`), and so do `wave`, `tween`,
   `spring`, `newtonian`, and `bounce` given a `stagger:` (`stagger`). Every other call, `chase`,
-  `crossing`, `map`, `oscillator` and the arithmetic among them, has the most lanes of the
-  signals it reads (`inputs`).
+  `crossing`, `map`, `oscillator`, `abs`, `min`, `max`, and the arithmetic among them, has the
+  most lanes of the signals it reads (`inputs`).
 
 ## 2. Write a File
 
@@ -76,6 +76,8 @@ loop = chase(1 + fb * -0.8, time: 0.5s)
 fb <- loop                               # a cycle goes through a delay, fed by name
 use std                                  # the standard library: pass --use std=src/lang/std.weft
 soft = snappy(moves)                     # a module: a macro with types
+far = abs(wave - 0.5) + max(rise, 0.25)  # abs, min, max: calls, per component like +
+held = clamp(sum, -1, 1)                 # std's clamp: min(max(sum, -1), 1)
 module bob2(base, amount: 0.1) = base + amount * wave(sine, 2hz)
 ```
 
@@ -88,6 +90,11 @@ Rules that trip agents most often:
 - **A divisor is a number**, fixed when the program is built: `lane / 1000`, `x / -4`, or a
   module's parameter bound to one. `x / 4` is `x * 0.25`, the same nodes. Dividing by a signal,
   a track, `lane`, a time, or 0 is an error: to scale by a signal, multiply by it.
+- **`abs`, `min`, and `max` are calls**, not operators, and work as `+` does: per component on a
+  vector or a colour, a number broadcast, the lanes of what they read. Their ranges are exact, so
+  `abs` of a wave is reported as [0, 1]. `clamp(x, low, high)` is a module of `std`, so the file
+  says `use std`. Given only numbers they fold to a constant. There is no `floor`, `sqrt`, `exp`,
+  or `sin` of a value yet.
 - **A tween `after` a tween may leave out `from`**, and starts from that tween's `to`:
   `tween(to: 0, at: c1, over: 1s, after: rise)`. `after` must be a name bound to a tween;
   anything else needs `from`.
@@ -176,8 +183,19 @@ n1 = say(b1, "Here is a parabola.")      # a string: double quotes, one line, no
 
 ## 4. Add a Primitive
 
-Add one only when no composition of the ones `describe` lists can express it, and say why in the
-op's doc comment. Every op appears in the same places, in this order:
+Add one only when no composition of the ones `describe` lists can express it, or when the
+composition's range or cost is much worse, and say why in the op's doc comment (`abs` is
+`max(x, -x)`, whose range over [-1, 1] would be [-1, 1]). Every op appears in the same places, in
+this order. Step 26 (`abs`, `min`, `max`) walked it in full; its diff is the worked example.
+
+**A function of one value is shorter.** If the op is pure, reads one signal, and works per
+component and per lane, it is a value of `graph.Function`: its arm in `Function.of` and in
+`function_range` (`src/core/graph.zig`), its range rule in `src/core/range.zig`, and one entry in
+`schema.zig` with `.op = .function` and `.function` set. `Op.apply`, `eval_node`, the checker's
+shape, lanes, and folding, and the back end already handle every function, so of the steps
+below it needs the range rule's test (1), the tests (3), the entry (4), and 7 to 10. A value whose bits could differ by target, such
+as `@min`, `@max`, `@sin`, or `@exp`, is computed by Weft's own code (`elementary.zig`,
+`graph.minimum`), never by the builtin.
 
 1. **`src/core/graph.zig`**
    - the op's struct, with a doc comment for each field, and its source struct if the client's
@@ -185,31 +203,62 @@ op's doc comment. Every op appears in the same places, in this order:
    - a field of `Op`, then `Op.cache_count` (slab after the output), `Op.simulated`, `Op.class`,
      and `Op.inputs`;
    - `Program.assert_valid` (what its node may refer to) and `Program.node_range` (a range its
-     values never leave, sound for any inputs in their ranges);
+     values never leave, sound for any inputs in their ranges), with the rule's arithmetic in
+     `src/core/range.zig` and a test of worked values there;
    - a `Builder` method that refuses every input it cannot evaluate, by a named `Error`, before it
      builds anything, and picks its extent: `push` for one value, `source_extent` for a seeded
-     source, `staggered_extent` for a timed one, `joined` for one that reads other nodes;
+     source, `staggered_extent` for a timed one, `joined` for one that reads other nodes, and
+     `binary_extent` for one that broadcasts as `add` does;
    - a section of the guide if the op brings a new idea.
 2. **`src/core/state.zig`**: its arm in `eval_node`; if simulated, in `update_node` and
    `reset_node`; if it fires events, in `State.events` (closed form) or `report_step` (on the
-   step). Add it to the `unreachable` lists the compiler names.
-3. **Tests**: a topic file in `src/core/graph_test/`, and a graph in `test/catalog.zig`, then
-   `zig build regress -- --bless` only after reading the new lines.
-4. **`src/lang/schema.zig`**: a value of `Op` and an entry: its parameters in the builder's
-   order and names, their kinds, defaults, and which are `positional`, `live`, or `shaped`.
-5. **`src/lang/check.zig`**: only if it takes a vector (`call_shape`) or behaves differently in a
-   lane region (`call_lanes`).
+   step). Add a pure op to the `unreachable` lists of `update_node` and `reset_node`, which the
+   compiler names.
+3. **Core tests**:
+   - a topic file in `src/core/graph_test/`, whose first line is `//! Tests of the graph:` (the
+     rules test checks it), imported in the `test` block at the end of `graph.zig`;
+   - the range rule sampled: inputs set across their ranges, every value inside the rule, and,
+     for a rule that claims to be exact, its ends reached;
+   - a case in `draw_node` of `graph_test/ranges.zig`, so 2,000 drawn graphs read it;
+   - a graph in `test/catalog.zig`, rendered after everything already there (a new enum and its
+     own loop at the end of `render`), so no existing golden line moves. Then
+     `zig build regress -- --bless`, which blesses only when native and wasm agree, and
+     `git diff test/golden/signals.txt` shows added lines only.
+4. **`src/lang/schema.zig`**: a value of `Op` and an entry, placed where `describe` should list
+   it: its parameters in the builder's order and names, their kinds, defaults, and which are
+   `positional`, `live`, or `shaped`. Add the `Op` to `Entry.lane_rule()`, which is exhaustive
+   and is `describe`'s `"lanes"`; a pure op reading signals is `.inputs`. Add it to
+   `event_value()` if it fires events.
+5. **`src/lang/check.zig`**:
+   - `call_shape`: a call is one number unless it has an arm, so an op with a `shaped`
+     parameter needs one, or a vector argument is refused or read as one number. Use `combine`
+     for `+`'s rule, or the argument's own shape for one input;
+   - `call_lanes` follows `lane_rule`, so it needs nothing for `.inputs`;
+   - folding: a pure op given only constants builds a node unless `folded` turns it into one.
+     Fold with the core's own function, so the bits are the node's. Say which in the guide.
 6. **`src/lang/graph.zig`**: its arm in `build_call`, and a message in `refuse` for each builder
    error a checked file can still reach.
-7. **Goldens**: `zig-out/bin/weft describe --use std=src/lang/std.weft >
-   test/golden/cli/describe.json`, then read the diff. Add the op's text to `test/lang.zig`, which
-   compiles the catalog's graphs as text.
-8. **Docs**: its section of the README, and `docs/agents.md` if agents will meet it.
+7. **The language's tests**: the catalog's new graph as text in `test/lang.zig`; a test file of
+   the op in `test/` with a guide at its top, wired in `build.zig`'s `test_roots`, with its
+   values, shapes, lanes, folding, and each error's code, message, hint, and span; and a seed
+   that calls it in `fuzz_seeds` of `src/lang/lang.zig`, since the fuzz test only mutates what
+   its seeds hold.
+8. **Goldens**: `zig-out/bin/weft describe --use std=src/lang/std.weft >
+   test/golden/cli/describe.json`. It is one line, so compare old and new by characters: only
+   insertions. A new call's name can also be one a test used as an unknown call
+   (`check_errors.txt`, `test/modules.zig`): change those examples to a name that will stay
+   unknown. A module added to `src/lang/std.weft` changes `check`'s limits line for every file
+   that uses `std` (`check_ok.txt`, `least` in `test/cli.zig`), since the limits count the
+   library's text.
+9. **The bench**: a value of `Kind` in `tools/bench.zig`, so the per-node case prints its cost.
+10. **Docs**: the README's op list (Graph), Language bullets, Ranges, Vectors, Costs, and Layout
+    where they apply; `docs/agents.md` sections 1 and 2; and the tutorial's limits (section 16)
+    and mistakes (section 17).
 
-Run every tier before calling it done:
+Run every tier, in Debug and in ReleaseFast, before calling it done:
 
 ```bash
-zig build test && zig fmt --check src test tools cli build.zig
-zig build regress && zig build regress -Doptimize=ReleaseFast
+zig build test && zig fmt --check src test tools cli build.zig play/*.zig && zig build
+zig build regress && zig build test -Doptimize=ReleaseFast && zig build regress -Doptimize=ReleaseFast
 (cd play && zig build test && zig build regress)
 ```

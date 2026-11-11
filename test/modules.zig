@@ -261,10 +261,10 @@ test "the checker's holes are closed, each with one error" {
             .span = "wave(sine, 2hz)",
         },
         .{
-            .source = "x = min(1, 2)\n",
+            .source = "x = print(1, 2)\n",
             .code = .unknown_call,
-            .message = "there is no call `min`",
-            .span = "min",
+            .message = "there is no call `print`",
+            .span = "print",
         },
         .{
             .source = "x = wave(sine, 1hz, phase: 0.25)\n",

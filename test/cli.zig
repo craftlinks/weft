@@ -75,7 +75,7 @@ test "check reports each error with its line and hint" {
         \\cue late = 2s
         \\cue early = 1s
         \\h = tween(from: 0, to: 1, at: early, over: 1s)
-        \\i = min(1, 2)
+        \\i = print(1, 2)
         \\
     ;
     try testing.expect(!try commands.check(&compiled, &writer, .{ .name = "bad.weft", .text = bad }, &.{}, &.{}));
@@ -192,7 +192,7 @@ const least_source =
 const least_libraries: []const weft.lang.Source = &.{.{ .name = "std", .text = weft.lang.std_library }};
 
 /// What `check` prints for `least_source`, as a `Limits`.
-const least: weft.lang.Limits = .{ .tokens = 97, .tree = 47, .names = 10, .nodes = 7, .slab = 25, .cues = 2, .goals = 1, .regions = 1, .tracks = 1, .modules = 5, .libraries = 1 };
+const least: weft.lang.Limits = .{ .tokens = 122, .tree = 54, .names = 10, .nodes = 7, .slab = 25, .cues = 2, .goals = 1, .regions = 1, .tracks = 1, .modules = 6, .libraries = 1 };
 
 /// Whether `least_source` compiles under `limits`, each in a `Compiled` of its own.
 fn compiles_with(comptime limits: weft.lang.Limits) bool {
@@ -215,7 +215,7 @@ test "check prints the least limits a file compiles with" {
         if (comptime std.mem.eql(u8, name, "track_samples") or std.mem.eql(u8, name, "errors")) continue;
         try testing.expectEqual(@field(least, name), @field(needs, name));
     }
-    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "limits: .{ .tokens = 97, .tree = 47,") != null);
+    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "limits: .{ .tokens = 122, .tree = 54,") != null);
     try testing.expect(std.mem.indexOf(u8, writer.buffered(), "a lane costs 2 of the slab\n") != null);
     try testing.expect(compiles_with(least));
     inline for (@typeInfo(weft.lang.Limits).@"struct".field_names) |name| {

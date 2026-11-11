@@ -791,6 +791,15 @@ fn eval_node(
             const left = operand_of(nodes, slab, op.left);
             multiply_into(out, node.extent, left, operand_of(nodes, slab, op.right));
         },
+        .minimum => |op| {
+            const left = operand_of(nodes, slab, op.left);
+            pairwise_into(out, node.extent, left, operand_of(nodes, slab, op.right), graph.minimum);
+        },
+        .maximum => |op| {
+            const left = operand_of(nodes, slab, op.left);
+            pairwise_into(out, node.extent, left, operand_of(nodes, slab, op.right), graph.maximum);
+        },
+        .apply => |op| apply_into(out, node_values(nodes, slab, op.input), op.function),
         .map_range => |*op| map_range_into(out, node_values(nodes, slab, op.input), op),
         .wave => |wave| if (node.extent.laned) {
             for (out, first..) |*value, lane| value.* = wave.sample(lane_time(time, wave.stagger, lane));
@@ -1035,6 +1044,7 @@ fn update_node(program: *const Program, slab: []f64, node: *const Node, index: u
         },
         .constant, .add, .multiply, .map_range, .wave, .tween, .noise, .motion => unreachable,
         .bounce, .cues, .crossing, .input, .recorded, .track, .pack, .pick, .lane, .spread => unreachable,
+        .minimum, .maximum, .apply => unreachable,
     }
     for (after) |value| assert(@abs(value) <= simulation.state_bound);
 }
@@ -1085,6 +1095,7 @@ fn reset_node(program: *const Program, slab: []f64, node: *const Node) void {
         },
         .constant, .add, .multiply, .map_range, .wave, .tween, .noise, .motion => unreachable,
         .bounce, .cues, .crossing, .input, .recorded, .track, .pack, .pick, .lane, .spread => unreachable,
+        .minimum, .maximum, .apply => unreachable,
     }
     @memcpy(before, after);
 }
@@ -1150,6 +1161,38 @@ fn multiply_into(out: []f64, extent: Extent, left: Operand, right: Operand) void
     for (0..extent.lanes) |lane| for (0..extent.components) |component| {
         out[lane * extent.components + component] = left.at(lane, component) * right.at(lane, component);
     };
+}
+
+/// `f(left, right)` per lane and component, an operand of one lane or one component broadcast, as
+/// `add_into` does.
+fn pairwise_into(
+    out: []f64,
+    extent: Extent,
+    left: Operand,
+    right: Operand,
+    comptime f: fn (f64, f64) f64,
+) void {
+    assert(out.len == extent.count());
+    if (left.values.len == out.len and right.values.len == out.len) {
+        for (out, left.values, right.values) |*value, a, b| value.* = f(a, b);
+        return;
+    }
+    for (0..extent.lanes) |lane| for (0..extent.components) |component| {
+        const a = left.at(lane, component);
+        out[lane * extent.components + component] = f(a, right.at(lane, component));
+    };
+}
+
+/// `function` of each value of `input`, whose extent is the output's (`graph.zig`, section 17).
+fn apply_into(out: []f64, input: []const f64, function: graph.Function) void {
+    assert(input.len == out.len);
+    assert(out.len > 0);
+    // The function is known in each arm, so the loop has no switch in it.
+    switch (function) {
+        inline else => |known| for (out, input) |*value, x| {
+            value.* = known.of(x);
+        },
+    }
 }
 
 fn map_range_into(out: []f64, input: []const f64, map: *const MapRange) void {
