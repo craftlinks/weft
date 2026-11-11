@@ -327,6 +327,45 @@ test "a limit's hint names a field of Limits" {
     try testing.expectEqualStrings("raise `Limits.names`", found.hint_text());
 }
 
+// Locks step 36's limit for a module, the same `schema.params_max` as an entry's: a module of
+// 24 parameters, each given by name from the last, is its body written out, 1 + 2 + ... + 24 in
+// the order of the parameters; one of 25 is refused at its name with the limit and the number.
+test "a module takes 24 parameters, and one of 25 is refused with the limit" {
+    try testing.expectEqual(@as(usize, 24), weft.lang.schema.params_max);
+    var module_text: [1024]u8 = undefined;
+    var hand_text: [1024]u8 = undefined;
+    var refused_text: [1024]u8 = undefined;
+    var module_writer: std.Io.Writer = .fixed(&module_text);
+    var hand_writer: std.Io.Writer = .fixed(&hand_text);
+    var refused_writer: std.Io.Writer = .fixed(&refused_text);
+    try module_writer.writeAll("module sum(p0");
+    try refused_writer.writeAll("module sum(p0");
+    for (1..24) |k| try module_writer.print(", p{d}", .{k});
+    for (1..25) |k| try refused_writer.print(", p{d}", .{k});
+    try module_writer.writeAll(") = p0");
+    try refused_writer.writeAll(") = p0\nout = 1\n");
+    for (1..24) |k| try module_writer.print(" + p{d}", .{k});
+    try module_writer.writeAll("\nout = sum(");
+    for (0..24) |k| {
+        if (k > 0) try module_writer.writeAll(", ");
+        try module_writer.print("p{d}: {d}", .{ 23 - k, 24 - k });
+    }
+    try module_writer.writeAll(")\n");
+    try hand_writer.writeAll("out = 1");
+    for (2..25) |k| try hand_writer.print(" + {d}", .{k});
+    try hand_writer.writeAll("\n");
+    try expect_same(module_writer.buffered(), hand_writer.buffered());
+
+    const refused = refused_writer.buffered();
+    try expect_one(&.{}, .{
+        .source = refused,
+        .code = .limit,
+        .message = "`sum` has more than 24 parameters",
+        .hint = "a module takes at most 24; split it",
+        .span = refused[0..std.mem.indexOfScalar(u8, refused, '\n').?],
+    });
+}
+
 // Locks the README's module with a declared range: the range analysis's rounding margin fits
 // inside the declared range, and a body that really leaves it is still refused.
 test "a declared range allows the analysis's rounding margin" {

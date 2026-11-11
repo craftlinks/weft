@@ -10,7 +10,8 @@
 //!   noun another noun names, and each signal's node, with its lanes and its shape;
 //! - a noun is not a signal, a string is not a number, and each mistake is one error that says
 //!   what to write instead;
-//! - a file with nouns formats to canonical text and back.
+//! - a file with nouns formats to canonical text and back;
+//! - an entry may take `schema.params_max` parameters, 24 since step 36, every one by name.
 //!
 //! ## 2. The Nouns
 //! Four entries shaped like an explainer's, and the score that uses them, are in `score.zig`,
@@ -159,4 +160,48 @@ test "a simulated signal inside a noun carries across an edit" {
     const y_old = Pair.old.node_of(Pair.old.noun("f").?.values[2]);
     const y_new = compiled.node_of(compiled.noun("f").?.values[2]);
     try testing.expectEqual(old_state.value(y_old), state.value(y_new));
+}
+
+/// A noun at the limit (step 36): `schema.params_max` number parameters, none positional, the
+/// last named `weight` so a misspelling of it has a near name to suggest.
+const wide = [_]schema.Entry{.{
+    .name = "wide",
+    .op = .noun,
+    .role = .signal,
+    .params = &wide_params,
+    .summary = "a noun with as many parameters as an entry may have",
+}};
+const wide_params = params: {
+    var params: [schema.params_max]schema.Param = undefined;
+    for (&params, 0..) |*param, at| param.* = .{
+        .name = if (at == params.len - 1) "weight" else std.fmt.comptimePrint("a{d}", .{at}),
+        .kind = .number,
+    };
+    break :params params;
+};
+
+// Locks step 36's edge: 24 parameters, given by name from the last to the first, check and
+// compile, and parameter k reads k + 1, so the slots above 16 are each their own; the call
+// formats to itself; a misspelt `weight`, the 24th, is suggested, and given twice is one error.
+test "an entry with 24 parameters, each given by name, checks, compiles, and formats" {
+    try testing.expectEqual(@as(usize, 24), schema.params_max);
+    var text: [512]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&text);
+    try writer.writeAll("w = wide(weight: 24");
+    for (1..schema.params_max) |k| try writer.print(", a{d}: {d}", .{ schema.params_max - 1 - k, schema.params_max - k });
+    try writer.writeAll(")\n");
+    const source = writer.buffered();
+
+    try compiled.compile_client(&wide, &.{}, source);
+    const w = compiled.noun("w").?;
+    try testing.expectEqual(@as(usize, 24), w.values.len);
+    for (w.values, 0..) |value, k| try testing.expectEqual(@as(f64, @floatFromInt(k + 1)), value.number);
+    try testing.expectEqualStrings(source, try compiled.syntax.format_into(&output));
+
+    try testing.expectError(error.Invalid, compiled.compile_client(&wide, &.{}, "w = wide(wieght: 1)\n"));
+    try testing.expectEqual(weft.lang.diagnostic.Code.unknown_parameter, compiled.errors()[0].code);
+    try testing.expectEqualStrings("did you mean `weight`?", compiled.errors()[0].hint_text());
+    try testing.expectError(error.Invalid, compiled.compile_client(&wide, &.{}, "w = wide(weight: 1, weight: 2)\n"));
+    try testing.expectEqual(weft.lang.diagnostic.Code.duplicate_argument, compiled.errors()[0].code);
+    try testing.expectEqual(@as(usize, 1), compiled.errors().len);
 }
