@@ -213,6 +213,7 @@ test/
   rules.zig           every file's guide, and no allocator, thread, lock, or I/O in the library
   cli.zig             the weft command's output against its goldens, and a client's nouns
   nouns.zig           a score: nouns that only describe beside a program, strings, and their errors
+  division.zig        a quotient by a number against the product with its reciprocal, and refusals
   golden/signals.txt  the committed samples
   golden/cli/         the weft command's committed output
 tools/
@@ -610,7 +611,11 @@ const goal = compiled.goal("spring");        // a path and its from, a chase's t
   at compile, so the table holds plain times and `Cues.move` moves one cue.
 - **A name is declared above its use**, so the node order is the text order. Calls and names never
   clash, so `tween = tween(...)` is fine. A cycle goes through a delay, fed below by `<-`.
-- **Arithmetic** is `+`, `-`, `*`, and parentheses. `a - b` is `a + b * -1`, exact, so no new op.
+- **Arithmetic** is `+`, `-`, `*`, `/`, and parentheses. `a - b` is `a + b * -1`, exact, so no
+  new op. `a / c` is `a * (1 / c)`, so no new op either: the divisor is a number fixed when the
+  program is built, not 0, and never a signal, whose range could hold 0. The product is the
+  quotient exactly when `c` is a power of two and within one ulp of it otherwise, the same bits on
+  every target; two numbers fold to the quotient itself.
 - **Seeds**: an explicit `seed:` wins; otherwise it is a hash of the declaration's name, so a new
   line never reshuffles another.
 - **Errors** give a line, a column, a reason, and a hint, as Zig prints its own:

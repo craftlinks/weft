@@ -65,7 +65,7 @@ spring = spring(moves, time: 0.5s, overshoot: 0.2)      # exact between goals
 chase = chase(noise, time: speed)        # simulated: follows a signal; a track sets its time
 hit = bounce(0..1, speed: 0.7, at: c0)   # its hits at the walls are events
 up = hit.velocity                        # a call's second output
-sum = wave * 0.5 + rise - 1              # arithmetic: + - * and parentheses
+sum = wave * 0.5 + rise - 1              # arithmetic: + - * / and parentheses
 place = vec2(noise, wave) * 0.1          # a vector; place.x is a number
 tint = srgb(0.9, 0.4, 0.2)               # a colour, kept as OKLab; tint.l is its lightness
 dots = lanes(100, noise(smooth, 1hz))    # 100 lanes, each its own noise
@@ -85,7 +85,9 @@ Rules that trip agents most often:
   range are fixed when the program is built. Only a parameter `describe` marks `live` takes a
   signal, and only a `signal` parameter takes an expression. To scale a tween by a signal, multiply
   the tween: `tween(from: 0, to: 1, …) * height`.
-- **There is no division.** Multiply by the reciprocal: `lane * 0.001`.
+- **A divisor is a number**, fixed when the program is built: `lane / 1000`, `x / -4`, or a
+  module's parameter bound to one. `x / 4` is `x * 0.25`, the same nodes. Dividing by a signal,
+  a track, `lane`, a time, or 0 is an error: to scale by a signal, multiply by it.
 - **A delay is a declaration of its own**, `fb = delay(0)`, fed once below with `fb <- …`.
 - **A loop with gain above 1 saturates** near 2^256 rather than crashing; values computed from it
   can still overflow, so a client calls `state.finite()` after `eval` on a program with a loop.

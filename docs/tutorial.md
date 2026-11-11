@@ -147,8 +147,8 @@ Exit codes: 0 for success, 1 when the file has errors, 2 for bad arguments.
 - One declaration a line: `name = expression`. `#` starts a comment.
 - **A name is declared above its use.** The file's order is the program's order.
 - Times carry units, `2s` or `500ms`; frequencies carry `hz`. A bare number is not a time.
-- Arithmetic is `+`, `-`, `*`, and parentheses. **There is no division**: multiply by the
-  reciprocal.
+- Arithmetic is `+`, `-`, `*`, `/`, and parentheses. **A divisor is a number**, fixed when the
+  program is built: `x / 4`, `lane / 16 - 3`. To scale by a signal, multiply by it.
 - Up to two leading arguments go by position; the rest are named.
 - A few words are reserved: `cue`, `track`, `seed`, `start`, `use`, `module`, `lane`.
 
@@ -489,7 +489,7 @@ To move a thousand dots you do not write a thousand signals. `lanes(n, body)` ev
 bars = lanes(16, tween(from: 0, to: 1, at: intro, over: 0.6s, ease: out, stagger: 50ms))
 own = lanes(16, map(noise(smooth, 0.25hz), -1..1, to: 0.2..1))
 height = bars * own                         # 16 lanes: each bar rises to a height of its own
-across = lanes(16, lane * 0.0625)           # each lane's index, here scaled to 0..1
+across = lanes(16, lane / 16)               # each lane's index, here scaled to 0..1
 ```
 
 What makes lanes differ from one another:
@@ -912,8 +912,11 @@ The limits worth knowing before you design around Weft:
   scale send OKLab to the GPU and convert in the shader.
 - **Most parameters are constants.** Only those marked `live` take a signal. A tween's ends, a
   spring's goals, and a bounce's walls are fixed when the program is built.
-- **No division, no comparison, no `if`, no `min`/`max`, no `abs`.** A `crossing` is the one way to
-  make a gate; a `map` is the one way to rescale.
+- **Division by a number only, no comparison, no `if`, no `min`/`max`, no `abs`.** `x / 4` is
+  `x * 0.25`, so a divisor is a number other than 0 that is fixed when the program is built, never
+  a signal, whose range could hold 0. The product is the quotient exactly when the divisor is a
+  power of two, and otherwise within one unit in the last place, the same on every target. A
+  `crossing` is the one way to make a gate; a `map` is the one way to rescale.
 - **No strings in a signal.** A value is one to four numbers. Since step 27 a string literal,
   `"text"`, exists for one use: a parameter of a client's noun (README, A Client's Nouns).
 - **A track holds a bounded number of writes** (`Limits.track_samples`, 1,024 by default).
@@ -934,7 +937,7 @@ target).
 | Symptom | Cause | Fix |
 |---|---|---|
 | `tween's 'from' is fixed when it is built` | A signal given to a number parameter | Multiply the tween by the signal instead |
-| `expected the end of the line, found /`, or inside a call ``expected `,` or `)`, found /`` | Division | Multiply by the reciprocal |
+| `a divisor is a number, fixed when the program is built` | Division by a signal, a track, or `lane` | Multiply by the signal, or by its reciprocal if you have one |
 | `cues are in time order, and this one is before the cue above it` | Cues declared out of time order | Reorder the cue lines; a series counts |
 | `'x' is used before it is declared` | A name below its use, **or the line that declares it has an error of its own** | Fix the first error first; for a loop, use a `delay` |
 | `` `start` is a keyword `` | A reserved word as a name | Rename it |
