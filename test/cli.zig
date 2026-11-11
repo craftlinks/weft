@@ -78,7 +78,7 @@ test "check reports each error with its line and hint" {
         \\i = min(1, 2)
         \\
     ;
-    try testing.expect(!try commands.check(&compiled, &writer, .{ .name = "bad.weft", .text = bad }, &.{}));
+    try testing.expect(!try commands.check(&compiled, &writer, .{ .name = "bad.weft", .text = bad }, &.{}, &.{}));
     try testing.expectEqualStrings(check_golden, writer.buffered());
 }
 
@@ -88,14 +88,14 @@ test "check reports each error with its line and hint" {
 test "check summarises a file that compiles" {
     var writer: std.Io.Writer = .fixed(&output);
     const text = sequence ++ "b = breathe(out, 0.1)\nf = follow([0..1], by: spring(time: 0.3s), seed: 2)\nuse std\n";
-    try testing.expect(try commands.check(&compiled, &writer, .{ .name = "ok.weft", .text = text }, std_library));
+    try testing.expect(try commands.check(&compiled, &writer, .{ .name = "ok.weft", .text = text }, std_library, &.{}));
     try testing.expectEqualStrings(check_ok_golden, writer.buffered());
 }
 
 // Locks the sample output: a spring's range and its value every 0.5 s over 2 s.
 test "sample writes each signal over the window, and its events" {
     var writer: std.Io.Writer = .fixed(&output);
-    try testing.expect(try commands.sample(testing.allocator, &compiled, &writer, .{ .name = "sequence.weft", .text = sequence }, &.{}, &.{"out"}, .{
+    try testing.expect(try commands.sample(testing.allocator, &compiled, &writer, .{ .name = "sequence.weft", .text = sequence }, &.{}, &.{}, &.{"out"}, .{
         .from = 0,
         .to = 1_411_200_000,
         .step = 352_800_000,
@@ -106,7 +106,7 @@ test "sample writes each signal over the window, and its events" {
 // Locks the refusals: a name that is not a signal, and the windows the sampler cannot run.
 test "sample refuses a name that is not a signal, and a window it cannot run" {
     var writer: std.Io.Writer = .fixed(&output);
-    try testing.expect(!try commands.sample(testing.allocator, &compiled, &writer, .{ .name = "sequence.weft", .text = sequence }, &.{}, &.{"moves"}, .{
+    try testing.expect(!try commands.sample(testing.allocator, &compiled, &writer, .{ .name = "sequence.weft", .text = sequence }, &.{}, &.{}, &.{"moves"}, .{
         .from = 0,
         .to = 705_600_000,
         .step = 70_560_000,
@@ -209,7 +209,7 @@ fn compiles_with(comptime limits: weft.lang.Limits) bool {
 test "check prints the least limits a file compiles with" {
     var buffer: [1024]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buffer);
-    try testing.expect(try commands.check(&compiled, &writer, .{ .name = "least.weft", .text = least_source }, least_libraries));
+    try testing.expect(try commands.check(&compiled, &writer, .{ .name = "least.weft", .text = least_source }, least_libraries, &.{}));
     const needs = compiled.needs();
     inline for (@typeInfo(weft.lang.Limits).@"struct".field_names) |name| {
         if (comptime std.mem.eql(u8, name, "track_samples") or std.mem.eql(u8, name, "errors")) continue;
@@ -240,7 +240,7 @@ test "sample keeps the events and lanes asked for" {
     ;
     var writer: std.Io.Writer = .fixed(&output);
     const window: commands.Window = .{ .from = 0, .to = 705_600_000, .step = 352_800_000 };
-    try testing.expect(try commands.sample(testing.allocator, &compiled, &writer, .{ .name = "filtered.weft", .text = text }, &.{}, &.{ "h", "w" }, window, .{
+    try testing.expect(try commands.sample(testing.allocator, &compiled, &writer, .{ .name = "filtered.weft", .text = text }, &.{}, &.{}, &.{ "h", "w" }, window, .{
         .events = &.{"h"},
         .lanes = .{ 1, 2 },
     }));
@@ -253,7 +253,95 @@ test "sample runs a region larger than a fixed slab" {
     const text = "cue c0 = 0s\nf = lanes(40000, follow([0..1], by: spring(time: 0.5s), seed: 2))\n";
     var writer: std.Io.Writer = .fixed(&output);
     const window: commands.Window = .{ .from = 0, .to = 70_560_000, .step = 70_560_000 };
-    try testing.expect(try commands.sample(testing.allocator, &compiled, &writer, .{ .name = "big.weft", .text = text }, &.{}, &.{"f"}, window, .{ .lanes = .{ 0, 1 } }));
+    try testing.expect(try commands.sample(testing.allocator, &compiled, &writer, .{ .name = "big.weft", .text = text }, &.{}, &.{}, &.{"f"}, window, .{ .lanes = .{ 0, 1 } }));
     try testing.expect(compiled.program.slab_count > 1 << 18);
     try testing.expect(std.mem.indexOf(u8, writer.buffered(), "\"lanes\":40000,\"lane_first\":0") != null);
+}
+
+/// The score of `nouns.zig` and its entries: a client's file, as its own command reads it.
+const score_file = @import("score.zig");
+
+// Locks step 32's `check` with a client's entries: the score compiles, its `ok:` line counts its
+// five nouns, and a file with no nouns prints the same bytes with the entries as without them.
+test "check takes a client's entries and counts its nouns" {
+    var writer: std.Io.Writer = .fixed(&output);
+    const source: commands.Source = .{ .name = "score.weft", .text = score_file.score };
+    try testing.expect(try commands.check(&compiled, &writer, source, &.{}, &score_file.nouns));
+    try testing.expectEqualStrings(
+        "ok: 11 nodes, a slab of 29, 2 cues, 0 goals, 0 regions, 1 tracks, 5 nouns, seekable, closed form\n" ++
+            "limits: .{ .tokens = 132, .tree = 65, .names = 10, .nodes = 11, .slab = 29, .cues = 2, .goals = 0, .regions = 0, .tracks = 1, .modules = 0, .libraries = 0 }\n" ++
+            "a lane costs 4 of the slab\n",
+        writer.buffered(),
+    );
+    // Without the entries the nouns are unknown calls, as before this step.
+    writer = .fixed(&output);
+    try testing.expect(!try commands.check(&compiled, &writer, source, &.{}, &.{}));
+    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "error: there is no call `axes`") != null);
+    // A file with no nouns: the entries change nothing, and there is no ", 0 nouns".
+    const text = sequence ++ "b = breathe(out, 0.1)\nf = follow([0..1], by: spring(time: 0.3s), seed: 2)\nuse std\n";
+    writer = .fixed(&output);
+    try testing.expect(try commands.check(&compiled, &writer, .{ .name = "ok.weft", .text = text }, std_library, &score_file.nouns));
+    try testing.expectEqualStrings(check_ok_golden, writer.buffered());
+}
+
+// Locks step 32's `sample` with a client's entries: every signal of the score in its order, and
+// no noun, cue, or track; a file whose only bindings are nouns samples to no signals; a noun
+// named with `--signal` is refused with what to do instead.
+test "sample takes a client's entries and lists only its signals" {
+    var writer: std.Io.Writer = .fixed(&output);
+    const window: commands.Window = .{ .from = 0, .to = 705_600_000, .step = 705_600_000 };
+    const source: commands.Source = .{ .name = "score.weft", .text = score_file.score };
+    try testing.expect(try commands.sample(testing.allocator, &compiled, &writer, source, &.{}, &score_file.nouns, &.{}, window, .{}));
+    const sampled = writer.buffered();
+    try testing.expect(std.mem.startsWith(u8, sampled, "{\"from\":0,\"to\":705600000,\"step\":705600000,\"signals\":[{\"name\":\"xs\",\"lanes\":5,"));
+    try testing.expect(std.mem.indexOf(u8, sampled, "\"values\":[[-2,-1,0,1,2],[-2,-1,0,1,2]]},{\"name\":\"reveal\",") != null);
+    try testing.expect(std.mem.endsWith(u8, sampled, "\"values\":[0,1]}],\"events\":[]}\n"));
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, sampled, "{\"name\":"));
+
+    writer = .fixed(&output);
+    const only_nouns: commands.Source = .{ .name = "nouns.weft", .text = "ax = axes(x: -3..3, y: -1..9)\nname = label(ax, text: \"axes\")\n" };
+    try testing.expect(try commands.sample(testing.allocator, &compiled, &writer, only_nouns, &.{}, &score_file.nouns, &.{}, window, .{}));
+    try testing.expectEqualStrings("{\"from\":0,\"to\":705600000,\"step\":705600000,\"signals\":[],\"events\":[]}\n", writer.buffered());
+
+    writer = .fixed(&output);
+    try testing.expect(!try commands.sample(testing.allocator, &compiled, &writer, source, &.{}, &score_file.nouns, &.{"ax"}, window, .{}));
+    try testing.expectEqualStrings("error: \"ax\" is a noun, `axes`, not a signal; bind a signal it reads on a line of its own to sample it\n", writer.buffered());
+}
+
+// Locks the bound on libraries: a third is an error that says how many fit, from `check` and
+// `sample` alike, where the library would otherwise assert.
+test "a third library is refused with an error" {
+    const three: []const weft.lang.Source = &.{
+        .{ .name = "std", .text = weft.lang.std_library },
+        .{ .name = "two", .text = weft.lang.std_library },
+        .{ .name = "three", .text = weft.lang.std_library },
+    };
+    var writer: std.Io.Writer = .fixed(&output);
+    try testing.expect(!try commands.check(&compiled, &writer, .{ .name = "ok.weft", .text = sequence }, three, &.{}));
+    try testing.expectEqualStrings("error: at most 2 libraries, given 3\n", writer.buffered());
+    writer = .fixed(&output);
+    const window: commands.Window = .{ .from = 0, .to = 0, .step = 1 };
+    try testing.expect(!try commands.sample(testing.allocator, &compiled, &writer, .{ .name = "ok.weft", .text = sequence }, three, &.{}, &.{}, window, .{}));
+    try testing.expectEqualStrings("error: at most 2 libraries, given 3\n", writer.buffered());
+}
+
+// Locks `cue_name` (step 32): a plain cue, a cue written after another (step 29), the first, the
+// third, and the last cue of a series with its place, and null one past the table.
+test "a cue's name from its index" {
+    const text =
+        \\cue c0 = 0s
+        \\cue b2 = 2s
+        \\cue hit = b2 + 500ms
+        \\cue bar = 3s..7s every 1s
+        \\
+    ;
+    var writer: std.Io.Writer = .fixed(&output);
+    try testing.expect(try commands.check(&compiled, &writer, .{ .name = "cues.weft", .text = text }, &.{}, &.{}));
+    const CueName = weft.lang.CueName;
+    try testing.expectEqualDeep(@as(?CueName, .{ .name = "c0" }), compiled.cue_name(0));
+    try testing.expectEqualDeep(@as(?CueName, .{ .name = "hit" }), compiled.cue_name(2));
+    try testing.expectEqualDeep(@as(?CueName, .{ .name = "bar", .element = 0 }), compiled.cue_name(3));
+    try testing.expectEqualDeep(@as(?CueName, .{ .name = "bar", .element = 2 }), compiled.cue_name(5));
+    try testing.expectEqualDeep(@as(?CueName, .{ .name = "bar", .element = 4 }), compiled.cue_name(7));
+    try testing.expectEqual(@as(?CueName, null), compiled.cue_name(8));
 }

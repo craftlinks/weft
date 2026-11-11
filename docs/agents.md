@@ -164,8 +164,11 @@ f = plot(ax, xs, y: a * xs * xs)         # a noun names a noun above it; its sig
 n1 = say(b1, "Here is a parabola.")      # a string: double quotes, one line, no escapes
 ```
 
-- The `weft` command does not know a client's nouns, so check such a file with the client's own
-  command. Its `describe` lists them under `nouns`.
+- The `weft` command does not know a client's nouns, so check and sample such a file with the
+  client's own command. Its `describe` lists them under `nouns`, its `check` counts them on the
+  `ok:` line, and its `sample` lists the file's signals and skips its nouns. A client builds
+  that command on the module `commands`, whose `describe`, `check`, and `sample` take its
+  entries; its own checks of its nouns come after `check`, as more diagnostics.
 - A noun is not a signal: `ax + 1` and `lanes(3, axes(…))` are errors. Bind every signal a noun
   reads on a line of its own first if you want to `sample` it.
 - To add nouns to a client, see the README's A Client's Nouns: an `Entry` with `op = .noun`, and

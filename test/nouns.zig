@@ -13,80 +13,23 @@
 //! - a file with nouns formats to canonical text and back.
 //!
 //! ## 2. The Nouns
-//! Four entries shaped like an explainer's: `axes` takes ranges, `plot` names an `axes` and takes
-//! two signals of many lanes and one of one, `say` takes a cue and a string, and `label` names any
-//! noun and has a string default.
+//! Four entries shaped like an explainer's, and the score that uses them, are in `score.zig`,
+//! which `cli.zig` shares for a client's command (step 32).
 
 const std = @import("std");
 const testing = std.testing;
 const weft = @import("weft");
 const schema = weft.lang.schema;
 
-const nouns = [_]schema.Entry{
-    .{
-        .name = "axes",
-        .op = .noun,
-        .role = .signal,
-        .params = &.{
-            .{ .name = "x", .kind = .number_range },
-            .{ .name = "y", .kind = .number_range },
-        },
-        .summary = "a frame of coordinates",
-    },
-    .{
-        .name = "plot",
-        .op = .noun,
-        .role = .signal,
-        .params = &.{
-            .{ .name = "on", .kind = .noun, .positional = true, .words = &.{"axes"} },
-            .{ .name = "x", .kind = .signal, .positional = true },
-            .{ .name = "y", .kind = .signal },
-            .{ .name = "draw", .kind = .signal, .default = .{ .number = 1 } },
-            .{ .name = "tint", .kind = .signal, .shaped = true, .default = .absent },
-        },
-        .summary = "a curve through the lanes of x and y",
-    },
-    .{
-        .name = "say",
-        .op = .noun,
-        .role = .signal,
-        .params = &.{
-            .{ .name = "at", .kind = .cue, .positional = true },
-            .{ .name = "text", .kind = .string, .positional = true },
-            .{ .name = "voice", .kind = .word, .default = .{ .word = 0 }, .words = &.{ "plain", "aside" } },
-        },
-        .summary = "a line of narration that starts at a cue",
-    },
-    .{
-        .name = "label",
-        .op = .noun,
-        .role = .signal,
-        .params = &.{
-            .{ .name = "of", .kind = .noun, .positional = true },
-            .{ .name = "text", .kind = .string, .default = .{ .text = "?" } },
-        },
-        .summary = "a name beside any noun",
-    },
-};
+const shared = @import("score.zig");
+const nouns = shared.nouns;
 
 const Compiled = weft.lang.Compiled(.{ .tokens = 512, .tree = 512, .names = 32, .nodes = 32, .slab = 512, .cues = 4, .libraries = 1, .modules = 8 });
 var compiled: Compiled = undefined;
 var slab: [512]f64 = undefined;
 var output: [4096]u8 = undefined;
 
-const score =
-    \\cue b1 = 0s
-    \\cue b2 = 2s
-    \\track a = 1 in 0..3
-    \\xs = lanes(5, lane - 2)
-    \\reveal = tween(from: 0, to: 1, at: b1, over: 1s)
-    \\ax = axes(x: -3..3, y: -1..9)
-    \\f = plot(ax, xs, y: a * xs * xs, draw: reveal, tint: srgb(1, 0.5, 0))
-    \\n1 = say(b1, "Here is a parabola: f(x) = a x^2.")
-    \\n2 = say(b2, "Its \frac{rise}{run} # is its slope.", voice: aside)
-    \\name = label(f)
-    \\
-;
+const score = shared.score;
 
 fn fails(source: []const u8, code: weft.lang.diagnostic.Code, message: []const u8) !void {
     try testing.expectError(error.Invalid, compiled.compile_client(&nouns, &.{}, source));

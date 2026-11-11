@@ -23,7 +23,17 @@
 //! samples as it did before vectors. Each event has its time in flicks, its source node, and its
 //! instance, the lane, then the name bound to its source, where one is, and its value (step 18).
 //!
-//! ## 4. TigerStyle Invariants
+//! ## 4. A Client's Command
+//! `describe`, `check`, and `sample` take a client's entries (step 32), so a client with nouns
+//! builds its own command on these functions; the `weft` command passes none, and its bytes do
+//! not change. `check` counts the nouns on its `ok:` line when there are any. `sample` lists
+//! signals only, as it skips cues and tracks: a noun is not a signal, and a signal a noun reads
+//! inline has no name, so a file binds it on a line of its own to sample it, and naming a noun
+//! says so. `check` stops after Weft's part: a client's own checks of its nouns run after the
+//! compile, add their diagnostics to `compiled.syntax.diagnostics`, and are rendered by the
+//! client. More libraries than `limits.libraries` is an error, not an assert.
+//!
+//! ## 5. TigerStyle Invariants
 //! - No allocation: every buffer is a file-scope variable, sized by the constants below.
 //! - Bounded: at most `samples_max` times, `signals_max` signals, and `events_max` events a run.
 
@@ -85,21 +95,33 @@ var ranges: [limits.nodes]weft.Range = undefined;
 var events: [events_max]weft.Event = undefined;
 
 /// `weft check`: the file's diagnostics, or a summary of its program. True when it compiles.
-pub fn check(compiled: *Compiled, writer: *std.Io.Writer, source: Source, libraries: []const lang.Source) !bool {
-    compiled.compile_with(libraries, source.text) catch {
+/// A client's command passes its entries as `clients` (section 4); the `weft` command none.
+pub fn check(
+    compiled: *Compiled,
+    writer: *std.Io.Writer,
+    source: Source,
+    libraries: []const lang.Source,
+    clients: []const schema.Entry,
+) !bool {
+    if (!try libraries_fit(writer, libraries)) return false;
+    compiled.compile_client(clients, libraries, source.text) catch {
         try render_errors(compiled, writer, source, libraries);
         return false;
     };
     const program = compiled.program;
     const report = program.report();
     // The counts of step 18, then every field a client's `Limits` must hold.
-    try writer.print("ok: {d} nodes, a slab of {d}, {d} cues, {d} goals, {d} regions, {d} tracks, {s}, {s}\n", .{
+    try writer.print("ok: {d} nodes, a slab of {d}, {d} cues, {d} goals, {d} regions, {d} tracks", .{
         program.nodes.len,
         program.slab_count,
         compiled.checked.cue_times.len,
         compiled.checked.goals.len,
         compiled.checked.regions.len,
         compiled.checked.tracks.len,
+    });
+    const noun_count = nouns_of(compiled);
+    if (noun_count > 0) try writer.print(", {d} nouns", .{noun_count});
+    try writer.print(", {s}, {s}\n", .{
         if (report.seekable) "seekable" else "live",
         if (report.stepped) "stepped" else "closed form",
     });
@@ -114,6 +136,20 @@ pub fn check(compiled: *Compiled, writer: *std.Io.Writer, source: Source, librar
     const lane_cost = slab_per_lane(program);
     if (lane_cost > 0) try writer.print("a lane costs {d} of the slab\n", .{lane_cost});
     return true;
+}
+
+/// How many nouns the file declares (section 4).
+fn nouns_of(compiled: *const Compiled) u32 {
+    var count: u32 = 0;
+    for (compiled.checked.declarations) |declaration| count += @intFromBool(declaration == .noun);
+    return count;
+}
+
+/// Refuses more libraries than `limits` holds, which the library would otherwise assert on.
+fn libraries_fit(writer: *std.Io.Writer, libraries: []const lang.Source) !bool {
+    if (libraries.len <= limits.libraries) return true;
+    try writer.print("error: at most {d} libraries, given {d}\n", .{ limits.libraries, libraries.len });
+    return false;
 }
 
 /// The f64 each lane of a region adds to the slab: each node of more than one lane's values and
@@ -288,6 +324,7 @@ pub fn sample(
     writer: *std.Io.Writer,
     source: Source,
     libraries: []const lang.Source,
+    clients: []const schema.Entry,
     names: []const []const u8,
     window: Window,
     filter: Filter,
@@ -296,7 +333,8 @@ pub fn sample(
     assert(names.len <= signals_max);
     assert(filter.events.len <= signals_max);
     if (filter.lanes) |lanes| assert(lanes[0] <= lanes[1]);
-    compiled.compile_with(libraries, source.text) catch {
+    if (!try libraries_fit(writer, libraries)) return false;
+    compiled.compile_client(clients, libraries, source.text) catch {
         try render_errors(compiled, writer, source, libraries);
         return false;
     };
@@ -304,11 +342,11 @@ pub fn sample(
     const list = if (names.len > 0) names else default_signals(compiled, &default_names);
     var ids: [signals_max]weft.Id = undefined;
     for (list, 0..) |name, at| {
-        ids[at] = compiled.signal(name) orelse return not_a_signal(writer, name);
+        ids[at] = compiled.signal(name) orelse return not_a_signal(compiled, writer, name);
     }
     var event_ids: [signals_max]weft.Id = undefined;
     for (filter.events, 0..) |name, at| {
-        event_ids[at] = compiled.signal(name) orelse return not_a_signal(writer, name);
+        event_ids[at] = compiled.signal(name) orelse return not_a_signal(compiled, writer, name);
     }
     const program = compiled.program;
     const slab = gpa.alloc(f64, @intCast(program.reader_slab_count())) catch {
@@ -377,9 +415,14 @@ pub fn sample(
     return true;
 }
 
-fn not_a_signal(writer: *std.Io.Writer, name: []const u8) !bool {
+/// The refusal of a name `sample` cannot read. A noun's says what to do instead (section 4).
+fn not_a_signal(compiled: *const Compiled, writer: *std.Io.Writer, name: []const u8) !bool {
     try writer.writeAll("error: ");
     try json_string(writer, name);
+    if (compiled.noun(name)) |found| {
+        try writer.print(" is a noun, `{s}`, not a signal; bind a signal it reads on a line of its own to sample it\n", .{found.entry.name});
+        return false;
+    }
     try writer.writeAll(" is not a signal of the file\n");
     return false;
 }
