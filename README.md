@@ -160,6 +160,13 @@ core gains `cue_by_lane` on `Tween`, `Bounce`, and `BounceNode`, false by defaul
 `graph.lane_cue`; `check.Value` gains `cue_by_lane`; `schema.Param` gains `by_lane`; and
 `describe` prints `"by_lane":true` on the two parameters that take one.
 
+**0.2.1** (steps 34 and 36) changes no promise and no value. A step passes over only the nodes a
+simulated node reads, so a file with a simulated signal steps and seeks faster, and a file with
+none is as it was: `graph.Node` gains `step_skip`, which `Builder.finish` fills and
+`Program.assert_valid` checks (step 34). `schema.params_max` is 24, where it was 16, so an entry
+or a module takes up to 24 parameters, and `check` asserts that a client's entries fit, where one
+over the limit used to index past the checker's arrays (step 36).
+
 ## Requirements
 
 | | |
