@@ -4,20 +4,20 @@
 # size: 1280x720 @120
 scenario       hash
 bouncers       191390d255d9aedd
-bouncers_300   708de4d6dd9233f9
-bouncers_590   2135385fc7557807
-bouncers_play  b5543272e83344f1
-knob           0d81e2258de9d489
-knob_600       4e7912e181048932
+bouncers_300   c2cf8e9febd570b6
+bouncers_590   15685e5925ee1cfe
+bouncers_play  e238922f2b133ada
+knob           c1b7b61ac72268cb
+knob_600       097e9ee053a214cc
 lanes          abb18fda48b5cdf1
 lanes_play     75a2990db8be5842
-play           621dfa8a554fe42a
+play           35d01adcf6d1187d
 play_590       69045c337b3086a4
-repoint        3249658ce9b5af8c
-scrub          4f01998debf6b2e7
-scrub_back     4f01998debf6b2e7
-shapes         171d1ad281a43485
-shapes_play    00b35977db4fd287
+repoint        5e1f9ba6fbe4269f
+scrub          d81639cb1c89cb9b
+scrub_back     d81639cb1c89cb9b
+shapes         b64589094cf9d4f1
+shapes_play    c6e57aeadfcf2009
 still          1140d082224616d1
 swarm          9d5da36921e31b07
 swarm_play     40f084b896dd4316
@@ -29,4 +29,4 @@ text_knob      d8b16faf90d86d90
 text_knob_60   9365830b497da1a2
 text_knob_600  88e7ca8ff6383d09
 vectors        c7ec433a9d225bfb
-vectors_play   5c92f013c67b6456
+vectors_play   8f3b91b18c930c50
