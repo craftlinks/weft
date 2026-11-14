@@ -207,6 +207,11 @@ n1 = say(b1, "Here is a parabola.")      # a string: double quotes, one line, no
   reads on a line of its own first if you want to `sample` it.
 - To add nouns to a client, see the README's A Client's Nouns: an `Entry` with `op = .noun`, and
   `compiled.nouns()` to read them.
+- To write a number back into the text, a knob, a slider, or a cue's time, do not walk the
+  syntax tree: `compiled.cue_form(index)` and `compiled.track_form(name)` (or
+  `Syntax.track_form` while the file has an error) give the bytes and say whether they are a
+  plain literal, and `weft.lang.write_time` writes a time exactly. Then compile the new text.
+  See the README's Writing a Number Back; Play's knobs (`track_literals`) are the worked case.
 
 ## 4. Add a Primitive
 

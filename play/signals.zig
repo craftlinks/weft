@@ -105,8 +105,10 @@
 //! places point into it, and returns false, with `errors` as plain `Problem`s, when it does not
 //! compile. Rows and knobs are found by name, so one the text no longer declares is null and the
 //! app shows it absent. The limits leave room for edits: 40 nodes, a slab of 160, and 16 cues.
-//! `track_literals` finds each knob's `track` line with the parser alone, so the text page's
-//! knobs stay bound while another line has an error the checker would refuse.
+//! `track_literals` finds each knob's `track` line with the parser alone, through Weft's
+//! `Syntax.track_form`, so the text page's knobs stay bound while another line has an error the
+//! checker would refuse, and a number Weft folds (`0..tau`, `2 * 0.25`) is never taken for a
+//! literal a knob can turn.
 //!
 //! ## 5. TigerStyle Invariants
 //! - Every capacity is a constant here, the compiler's limits, and the build asserts the program
@@ -275,38 +277,24 @@ pub const TrackLiterals = struct { value: [2]u32, lo: [2]u32, hi: [2]u32 };
 var binding_syntax: weft.lang.Syntax(limits) = undefined;
 
 /// Each knob's track line in `text`, found by its name, or null where the text does not parse,
-/// the track is gone, or one of its three numbers is not a plain number literal. Runs the
-/// parser only, so it finds them while the text has errors the checker would refuse.
+/// the track is gone, or one of its three numbers is not a plain number literal (Weft's
+/// `Syntax.track_form`). Runs the parser only, so it finds them while the text has errors the
+/// checker would refuse.
 pub fn track_literals(text: []const u8, out: *[knob_count]?TrackLiterals) void {
     out.* = @splat(null);
     if (text.len > text_max) return;
     _ = binding_syntax.parse_source(text);
-    const tree = &binding_syntax.tree;
-    if (!tree.complete) return;
-    for (tree.declarations) |index| {
-        const item = tree.item(index);
-        if (item.tag != .track) continue;
-        const name = tree.token_text(item.token);
-        const knob = for (knob_names, 0..) |known, at| {
-            if (std.mem.eql(u8, known, name)) break at;
-        } else continue;
-        const bounds = tree.item(item.b);
-        if (bounds.tag != .range) continue;
-        const value = number_literal(tree, item.a) orelse continue;
-        const lo = number_literal(tree, bounds.a) orelse continue;
-        const hi = number_literal(tree, bounds.b) orelse continue;
-        out[knob] = .{ .value = value, .lo = lo, .hi = hi };
+    for (knob_names, out) |name, *slot| {
+        const form = binding_syntax.track_form(name) orelse continue;
+        const value = form.value.plain() orelse continue;
+        const lo = form.low.plain() orelse continue;
+        const hi = form.high.plain() orelse continue;
+        slot.* = .{
+            .value = .{ value.start, value.end() },
+            .lo = .{ lo.start, lo.end() },
+            .hi = .{ hi.start, hi.end() },
+        };
     }
-}
-
-/// The bytes of a plain number literal, its sign included, or null for anything else.
-fn number_literal(tree: anytype, index: u32) ?[2]u32 {
-    const item = tree.item(index);
-    if (item.tag != .literal) return null;
-    if (tree.tokens[item.token].tag != .number) return null;
-    const first = tree.tokens[item.first];
-    const last = tree.tokens[item.last];
-    return .{ first.start, last.start + last.len };
 }
 
 /// The bouncers page's lanes: step 7's worked bounce, then six that hit 2 to 7 times a bar.
@@ -660,6 +648,27 @@ test "rows, goals, and knobs come from the text by name" {
     try testing.expectEqual(@as(f64, 0.25), glide.low);
     try testing.expectEqual(@as(f64, 4), glide.high);
     try testing.expectEqual(@as(f64, 1), glide.initial);
+}
+
+// Locks section 6's binding: a knob binds only a track whose three numbers are plain literals,
+// so `0.3 in 0.075..1.2` binds with its bytes, and `2 * 0.15`, `0..tau`, and `1e1` bind none,
+// while a line the checker refuses leaves the others bound.
+test "a knob binds a track's plain literals only" {
+    const text =
+        \\track pulse_hz = 0.3 in 0.075..1.2
+        \\track chase_s = 2 * 0.15 in 0.125..2
+        \\bad = nothing(1)
+        \\track sway_os = 0.2 in 0..tau
+        \\track glide_v = 1 in 0.25..1e1
+        \\
+    ;
+    var found: [knob_count]?TrackLiterals = undefined;
+    track_literals(text, &found);
+    const pulse = found[0].?;
+    try testing.expectEqualStrings("0.3", text[pulse.value[0]..pulse.value[1]]);
+    try testing.expectEqualStrings("0.075", text[pulse.lo[0]..pulse.lo[1]]);
+    try testing.expectEqualStrings("1.2", text[pulse.hi[0]..pulse.hi[1]]);
+    for (found[1..]) |knob| try testing.expectEqual(@as(?TrackLiterals, null), knob);
 }
 
 var syntax: weft.lang.Syntax(.{ .tokens = 1024, .tree = 512, .names = 64 }) = undefined;

@@ -27,6 +27,15 @@
 //! it, once at init. The other way, `cue_name` gives a cue's name from its index in the table, a
 //! value a noun or an event carries, so a client can print it (step 32).
 //!
+//! ## 3a. Where a Number Is Written
+//! A client that writes a number back into its text, a knob, a slider, a retime, finds it
+//! through the checker's own grammar (step 41), never a copy of it: `cue_form` gives what a
+//! cue's declaration is made of, `track_form` a track's three numbers as plain literals' bytes
+//! or what else they are, and `read_time` and `write_time` read and write a time literal
+//! exactly (`check.zig`, sections 3c, 4, and 4a). `Syntax.track_form` reads the tree alone, for
+//! a client that binds its numbers while another line has an error. Weft never edits the text:
+//! the client replaces its own bytes and compiles again, which checks the edit.
+//!
 //! ## 4. Modules and Libraries
 //! A module (step 13) is checked where it is used: the checker expands it into the arrays a
 //! hand-written graph would fill (`check.zig`, section 6), so the back end and the program never
@@ -128,6 +137,21 @@ pub const CueName = struct {
     element: ?u32 = null,
 };
 
+/// Where a client writes a number back (section 3a): how a cue's time and a track's numbers
+/// are written, and the reader and writer of a time literal, all the checker's own.
+pub const CueForm = check.CueForm;
+pub const CueTime = check.CueTime;
+pub const TimeLiteral = check.TimeLiteral;
+pub const TimeUnit = check.TimeUnit;
+pub const TimeRead = check.TimeRead;
+pub const TrackForm = check.TrackForm;
+pub const NumberForm = check.NumberForm;
+pub const Bytes = check.Bytes;
+pub const read_time = check.read_time;
+pub const write_time = check.write_time;
+pub const time_text_max = check.time_text_max;
+pub const number_form = check.number_form;
+
 /// The input of a `spread`, which gives one node's value to every lane, else the node itself.
 fn through_spread(nodes: []const graph.Node, id: graph.Id) graph.Id {
     assert(id.index < nodes.len);
@@ -187,6 +211,22 @@ pub fn Syntax(comptime limits: Limits) type {
             return syntax.diagnostics.items();
         }
 
+        /// The three numbers of the track `name` (section 3a), read from the tree alone, so a
+        /// client finds them while another line has an error the checker would refuse. The
+        /// first `track` line of that name, as the checker binds; null when there is none, when
+        /// its bounds are not a range, or when the parse stopped short of the whole file.
+        pub fn track_form(syntax: *const Self, name: []const u8) ?check.TrackForm {
+            const tree = &syntax.tree;
+            if (!tree.complete) return null;
+            for (tree.declarations) |index| {
+                const item = tree.item(index);
+                if (item.tag != .track) continue;
+                if (!std.mem.eql(u8, tree.token_text(item.token), name)) continue;
+                return check.track_form(tree, index);
+            }
+            return null;
+        }
+
         /// The parsed file in the canonical format, into `out`.
         pub fn format_into(syntax: *const Self, out: []u8) format.Error![]const u8 {
             assert(syntax.diagnostics.total() == 0);
@@ -208,6 +248,7 @@ pub fn Compiled(comptime limits: Limits) type {
         value_items: [2 * limits.tree]u32,
         exprs: [limits.tree]check.Expr,
         checked_cue_times: [limits.cues]i64,
+        checked_cue_forms: [limits.cues]check.CueForm,
         checked_goals: [limits.goals]check.Goal,
         checked_paths: [limits.goals]check.Run,
         checked_regions: [limits.regions]check.Region,
@@ -288,6 +329,7 @@ pub fn Compiled(comptime limits: Limits) type {
                 .value_items = &compiled.value_items,
                 .exprs = &compiled.exprs,
                 .cue_times = &compiled.checked_cue_times,
+                .cue_forms = &compiled.checked_cue_forms,
                 .goals = &compiled.checked_goals,
                 .paths = &compiled.checked_paths,
                 .regions = &compiled.checked_regions,
@@ -632,6 +674,37 @@ pub fn Compiled(comptime limits: Limits) type {
             unreachable;
         }
 
+        /// What the declaration of the cue at `cue_index` in the cue table is made of (section
+        /// 3a): a literal, an earlier cue, or both; alone, an item of a list, or a cue of a
+        /// series spaced `every` a step. Null for an index past the table.
+        pub fn cue_form(compiled: *const Self, cue_index: u32) ?check.CueForm {
+            assert(compiled.ok);
+            const checked = &compiled.checked;
+            assert(checked.cue_forms.len == checked.cue_times.len);
+            if (cue_index >= checked.cue_forms.len) return null;
+            const form = checked.cue_forms[cue_index];
+            if (form.written()) |time| switch (time) {
+                .cue => |base| assert(base < cue_index),
+                .after => |after| assert(after.base < cue_index),
+                .literal => {},
+            };
+            return form;
+        }
+
+        /// The three numbers of the track `name` (section 3a): each a plain literal's bytes, or
+        /// what else it is. Null for a name that is not a track.
+        pub fn track_form(compiled: *const Self, name: []const u8) ?check.TrackForm {
+            const index = compiled.binding(name, .track) orelse return null;
+            const item = compiled.checked.bindings[index].item;
+            // The checker took its bounds as a range.
+            const form = check.track_form(&compiled.syntax.tree, item).?;
+            // The checker folded each, so none is a form it refuses.
+            assert(form.value.kind != .other);
+            assert(form.low.kind != .other);
+            assert(form.high.kind != .other);
+            return form;
+        }
+
         /// Where the goal of the signal `name` comes from: a spring's or a Newtonian move's
         /// path, a chase's target, or none.
         pub fn goal(compiled: *const Self, name: []const u8) GoalSource {
@@ -879,6 +952,9 @@ const fuzz_seeds = [_][]const u8{
         "t = lanes(4, tween(from: 0, to: 1, at: beat[lane], over: 300ms, ease: out))\n" ++
         "b = lanes(4, bounce(0..1, speed: 4, at: beat[lane]))\nmodule letter(at) = tween(to: 2, at: at, over: 1s, after: t)\n" ++
         "u = lanes(4, letter(beat[lane]))\nn = cues(beat)\n",
+    // Where a number is written (step 41): every form of a cue, and a track's folded numbers.
+    "cue a = -250ms\ncue b = a\ncue c = b + 1.5s\ncue s = [2s, c + 1s, s0]\ncue s0 = 3s\n" ++
+        "cue bar = s[1] + 1s..s[1] + 5s every 2s\ntrack t = 2 * 0.25 in -pi..tau\ntrack u = 1e-1 in 0..1\n",
     // A loop that runs away within half a second, so the reader meets the bound (step 19).
     "cue c0 = 0s\nfb = delay(0)\nloop = chase(1 + fb * 1e100, time: 0.01s)\nfb <- loop\nx = loop * loop * loop\n",
 };
@@ -900,8 +976,12 @@ fn fuzz_one(input: []const u8) !void {
             state.eval(.{ .flicks = flicks });
             _ = state.finite();
         }
+        try fuzz_forms(small);
     } else |_| try testing.expect(small.errors().len > 0);
     if (!fuzz_syntax.parse_source(input) or !fuzz_syntax.tree.complete) return;
+    for (fuzz_syntax.tree.declarations) |index| {
+        if (fuzz_syntax.tree.item(index).tag == .track) _ = check.track_form(&fuzz_syntax.tree, index);
+    }
     const formatted = fuzz_syntax.format_into(&fuzz_out) catch |err| {
         try testing.expectEqual(error.CommentPlacement, err);
         return;
@@ -910,6 +990,32 @@ fn fuzz_one(input: []const u8) !void {
     try testing.expect(fuzz_syntax.parse_source(formatted));
     const again = try fuzz_syntax.format_into(&fuzz_again);
     try testing.expectEqualStrings(formatted, again);
+}
+
+/// A file that compiled: each cue's form sums to the cue's time, and each track's numbers are
+/// forms the checker folds (section 3a).
+fn fuzz_forms(compiled: anytype) !void {
+    const times = compiled.checked.cue_times;
+    for (times, 0..) |time, cue| {
+        const form = compiled.cue_form(@intCast(cue)).?;
+        const written = form.written() orelse {
+            const from = fuzz_sum(times, form.every.from);
+            try testing.expectEqual(time, from + form.every.step.signed() * form.every.element);
+            continue;
+        };
+        try testing.expectEqual(time, fuzz_sum(times, written));
+    }
+    for (compiled.checked.bindings) |binding| {
+        if (binding.kind == .track) _ = compiled.track_form(binding.name).?;
+    }
+}
+
+fn fuzz_sum(times: []const i64, time: check.CueTime) i64 {
+    return switch (time) {
+        .literal => |literal| literal.signed(),
+        .cue => |base| times[base],
+        .after => |after| times[after.base] + after.offset.signed(),
+    };
 }
 
 /// Inputs of each kind the fuzz test runs: random ones, and mutated ones.
