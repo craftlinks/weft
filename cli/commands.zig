@@ -13,16 +13,27 @@
 //! a number that is not finite (an unbounded range) as `null`, since JSON has no infinity.
 //!
 //! ## 3. Sampling
-//! `sample` reads each signal from a fresh reader at each time of the window, in order, and writes
-//! its values as it goes, so a simulated program steps forwards and never seeks back, and a
-//! signal of a thousand lanes needs no buffer. A reader cannot tell a fresh state from one that
-//! read the other signals too, so the values are the ones one reader gives. Events in the window
-//! come from one more fresh reader. A vector or a colour (step 16) has `"components"` and each
-//! value is an array of them, OKLab for a colour; a signal of many lanes (step 17) has `"lanes"`
-//! and each value is an array of its lanes. A number has none of these, so a file of numbers
-//! samples as it did before vectors. Each event has its time in flicks, its source node, and its
-//! instance, the lane, then the name of the signal it belongs to, where one is, and its value
-//! (step 18).
+//! `sample` walks one fresh reader through the times of the window, in order, so a simulated
+//! program steps forwards and never seeks back, and reads every named signal at each time
+//! (step 38). The JSON is written signal by signal, so a walk keeps its signals' values in
+//! `kept_values`, `values_max` f64 (512 KiB): its signals are taken in order, greedily, as many
+//! as fit there, and the next walk takes the rest. A signal that alone does not fit, such as
+//! a thousand lanes at a thousand times, has a walk of its own that writes its values as it
+//! reads them and keeps none, as every signal did before step 38. So every request runs, most in
+//! one walk, and the memory is bounded. A reader cannot tell a fresh state from one that read
+//! other signals, so the values are the ones a reader of one signal gives, which makes the walk
+//! a cache. The events are read along the first walk, in pieces: before the `eval` at each time,
+//! those since the last, then after the walk the last piece, up to the window's end. In order
+//! of time the pieces leave `events` as one query of the window would, and a stepped reader
+//! goes forwards only, where a read of the events after an `eval` would replay from the start.
+//! A file with no signal to sample reads its events on a reader of their own. A window that
+//! starts late still steps from the start, as a fresh reader has no checkpoint.
+//!
+//! A vector or a colour (step 16) has `"components"` and each value is an array of them, OKLab
+//! for a colour; a signal of many lanes (step 17) has `"lanes"` and each value is an array of its
+//! lanes. A number has none of these, so a file of numbers samples as it did before vectors.
+//! Each event has its time in flicks, its source node, and its instance, the lane, then the name
+//! of the signal it belongs to, where one is, and its value (step 18).
 //! With `--events`, the reader asks `events_of` for the nodes `Compiled.event_sources` gives each
 //! name, merged (step 23), so the buffer holds only those sources' events, and a region's bounce
 //! with no stagger or a vector's spring, whose binding's first node is a `spread` or a `pack`,
@@ -41,7 +52,8 @@
 //!
 //! ## 5. TigerStyle Invariants
 //! - No allocation: every buffer is a file-scope variable, sized by the constants below.
-//! - Bounded: at most `samples_max` times, `signals_max` signals, and `events_max` events a run.
+//! - Bounded: at most `samples_max` times, `signals_max` signals, and `events_max` events a run,
+//!   and at most `signals_max` walks of the window, one a signal when no two fit together.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -71,8 +83,19 @@ pub const Syntax = lang.Syntax(limits);
 pub const samples_max = 1024;
 pub const events_max = 1024;
 pub const signals_max = 16;
+/// The values, as f64, that one walk of `sample` keeps: every signal at every time with
+/// `components_max` values each, 512 KiB (section 3).
+pub const values_max = signals_max * samples_max * weft.graph.components_max;
 
 const flicks_per_second: f64 = @floatFromInt(weft.time.flicks_per_second);
+
+comptime {
+    // A walk keeps every signal at every time when each has four values or fewer, a vector, a
+    // colour, or four lanes, and the buffer stays 512 KiB of a client's static memory.
+    assert(values_max == signals_max * samples_max * weft.graph.components_max);
+    assert(values_max * @sizeOf(f64) == 512 << 10);
+    assert(events_max <= std.math.maxInt(u32));
+}
 
 /// A file's text and the name its diagnostics give it.
 pub const Source = struct { name: []const u8, text: []const u8 };
@@ -99,6 +122,8 @@ pub const Window = struct {
 var scratch: Syntax = undefined;
 var ranges: [limits.nodes]weft.Range = undefined;
 var events: [events_max]weft.Event = undefined;
+/// The values one walk keeps, signal after signal (section 3).
+var kept_values: [values_max]f64 = undefined;
 /// The name each node's events print with, by `name_sources` (section 3).
 var source_names: [limits.nodes]?[]const u8 = undefined;
 
@@ -372,53 +397,263 @@ pub fn sample(
     };
     defer gpa.free(slab);
     program.ranges(ranges[0..program.nodes.len]);
-    const count = window.count();
-
-    try writer.print("{{\"from\":{d},\"to\":{d},\"step\":{d},\"signals\":[", .{ window.from, window.to, window.step });
-    for (list, ids[0..list.len], 0..) |name, id, at| {
-        if (at > 0) try writer.writeAll(",");
-        try writer.writeAll("{\"name\":");
-        try json_string(writer, name);
+    var reads: [signals_max]Read = undefined;
+    for (ids[0..list.len], reads[0..list.len]) |id, *read| {
         const extent = program.nodes[id.index].extent;
-        const kept = kept_lanes(extent.lanes, filter.lanes);
-        if (extent.lanes > 1) try writer.print(",\"lanes\":{d}", .{extent.lanes});
-        if (extent.lanes > 1 and filter.lanes != null) try writer.print(",\"lane_first\":{d}", .{kept[0]});
-        assert(kept[1] > kept[0] or (extent.lanes > 1 and filter.lanes != null));
-        if (extent.components > 1) try writer.print(",\"components\":{d}", .{extent.components});
-        const range = ranges[id.index];
-        try writer.writeAll(",\"range\":[");
-        try json_number(writer, range.low);
-        try writer.writeAll(",");
-        try json_number(writer, range.high);
-        try writer.print("],\"bounded\":{},\"values\":[", .{std.math.isFinite(range.low) and std.math.isFinite(range.high)});
-        // Each signal reads the window from a fresh state, which a read cannot tell apart from one
-        // that read the others too, so no lane array needs keeping.
+        read.* = .{
+            .id = id,
+            .lanes = extent.lanes,
+            .kept = kept_lanes(extent.lanes, filter.lanes),
+            .components = extent.components,
+        };
+    }
+    var gather: Gather = .{
+        .sources = if (filter.events.len == 0) null else event_ids[0..event_count],
+        .read = window.from,
+        .found = 0,
+    };
+    try writer.print("{{\"from\":{d},\"to\":{d},\"step\":{d},\"signals\":[", .{ window.from, window.to, window.step });
+    try write_signals(writer, program, slab, list, reads[0..list.len], window, filter.lanes, &gather);
+    assert(gather.read == window.to);
+    try writer.writeAll("],\"events\":[");
+    name_sources(compiled);
+    try write_events(writer, program, events[0..gather.found], filter.lanes);
+    try writer.writeAll("]}\n");
+    return true;
+}
+
+/// Every signal of `reads`, in its walks (section 3), the first of which reads the events into
+/// `gather`; with no signal, the events on a reader of their own.
+fn write_signals(
+    writer: *std.Io.Writer,
+    program: weft.Program,
+    slab: []f64,
+    names: []const []const u8,
+    reads: []const Read,
+    window: Window,
+    lanes: ?[2]u32,
+    gather: *Gather,
+) !void {
+    assert(names.len == reads.len);
+    assert(gather.read == window.from);
+    var at: usize = 0;
+    while (at < reads.len) {
+        // Each walk is a fresh reader from the window's start, and the first reads the events.
         var state = weft.State.init(program, slab);
+        const first: ?*Gather = if (at == 0) gather else null;
+        const end = batch_end(reads, at, window.count());
+        if (end == at) {
+            try write_head(writer, names[at], reads[at], lanes, at > 0);
+            try walk_streamed(writer, reads[at], window, first, &state);
+            at += 1;
+        } else {
+            walk_kept(reads[at..end], window, first, &state);
+            try write_kept(writer, names[at..end], reads[at..end], window, lanes, at > 0);
+            at = end;
+        }
+        if (first) |events_reader| events_reader.read_to(&state, window.to);
+    }
+    assert(at == reads.len);
+    if (reads.len == 0) {
+        var state = weft.State.init(program, slab);
+        gather.read_to(&state, window.to);
+    }
+    assert(gather.read == window.to);
+}
+
+/// What a walk reads of one signal: its node, its lanes, the lanes it prints as `[first, end)`,
+/// and the components of each lane.
+const Read = struct {
+    id: weft.Id,
+    lanes: u32,
+    kept: [2]u32,
+    components: u32,
+
+    /// The values one time of the signal keeps.
+    fn size(read: Read) u64 {
+        assert(read.kept[0] <= read.kept[1]);
+        assert(read.components >= 1 and read.components <= weft.graph.components_max);
+        return @as(u64, read.kept[1] - read.kept[0]) * read.components;
+    }
+
+    /// The values it prints of a read of its node, lane after lane and each lane's components.
+    fn kept_of(read: Read, values: []const f64) []const f64 {
+        assert(values.len == @as(u64, read.lanes) * read.components);
+        assert(read.kept[1] <= read.lanes);
+        return values[read.kept[0] * read.components .. read.kept[1] * read.components];
+    }
+};
+
+/// The window's events, read along the first walk in pieces (section 3): before the `eval` at
+/// each time t, the events of `[read, t)`, so a simulated reader only steps forwards, and after
+/// the walk the last piece, up to `to`. The pieces are in order of time, so `events` ends up as
+/// one query of the window would leave it: the earliest `events_max`, in the same order.
+const Gather = struct {
+    /// The sources `--events` keeps, or null for every source.
+    sources: ?[]const weft.Id,
+    /// The events of `[window.from, read)` are in `events[0..found]`.
+    read: i64,
+    found: u32,
+
+    fn read_to(gather: *Gather, state: *weft.State, to: i64) void {
+        assert(to >= gather.read);
+        assert(gather.found <= events_max);
+        defer gather.read = to;
+        if (to == gather.read) return;
+        // Full: every later event would only be counted, and `sample` prints the kept ones only.
+        if (gather.found == events_max) return;
+        const out = events[gather.found..];
+        const t0: weft.Time = .{ .flicks = gather.read };
+        const t1: weft.Time = .{ .flicks = to };
+        const found = if (gather.sources) |list|
+            state.events_of(list, t0, t1, out)
+        else
+            state.events(t0, t1, out);
+        assert(found.count <= out.len);
+        gather.found += found.count;
+    }
+};
+
+/// The time of the window at `index`.
+fn window_time(window: Window, index: usize) i64 {
+    assert(index < window.count());
+    const time = window.from + @as(i64, @intCast(index)) * window.step;
+    assert(time <= window.to);
+    return time;
+}
+
+/// The end of the batch of `reads` from `at` whose values fit in `kept_values` at `count` times,
+/// taken greedily in order, or `at` when the read at `at` alone does not fit, which then streams.
+fn batch_end(reads: []const Read, at: usize, count: usize) usize {
+    assert(at < reads.len);
+    assert(count >= 1 and count <= samples_max);
+    var size: u64 = 0;
+    var end = at;
+    while (end < reads.len) : (end += 1) {
+        const more = reads[end].size() * count;
+        if (size + more > values_max) break;
+        size += more;
+    }
+    assert(size <= values_max);
+    return end;
+}
+
+/// One walk of a fresh reader over the window that keeps the values of `reads` at each time,
+/// each signal's run of `kept_values` after the one before, time after time within it.
+fn walk_kept(reads: []const Read, window: Window, gather: ?*Gather, state: *weft.State) void {
+    assert(reads.len >= 1);
+    const count = window.count();
+    for (0..count) |index| {
+        const time = window_time(window, index);
+        // The events before the time first: an `eval` there would leave them behind the reader.
+        if (gather) |events_reader| events_reader.read_to(state, time);
+        state.eval(.{ .flicks = time });
+        var base: u64 = 0;
+        for (reads) |read| {
+            const size = read.size();
+            const into = kept_values[@intCast(base + index * size)..][0..@intCast(size)];
+            @memcpy(into, read.kept_of(state.values(read.id)));
+            base += size * count;
+        }
+        assert(base <= values_max);
+    }
+}
+
+/// The signals a `walk_kept` read, one after another, from `kept_values`.
+fn write_kept(
+    writer: *std.Io.Writer,
+    names: []const []const u8,
+    reads: []const Read,
+    window: Window,
+    lanes: ?[2]u32,
+    after_another: bool,
+) !void {
+    assert(names.len == reads.len);
+    const count = window.count();
+    var base: u64 = 0;
+    for (names, reads, 0..) |name, read, at| {
+        try write_head(writer, name, read, lanes, after_another or at > 0);
+        const size = read.size();
         for (0..count) |index| {
             if (index > 0) try writer.writeAll(",");
-            state.eval(.{ .flicks = window.from + @as(i64, @intCast(index)) * window.step });
-            const read = state.values(id);
-            if (extent.lanes > 1) try writer.writeAll("[");
-            for (kept[0]..kept[1]) |lane| {
-                if (lane > kept[0]) try writer.writeAll(",");
-                try json_value(writer, read[lane * extent.components ..][0..extent.components]);
-            }
-            if (extent.lanes > 1) try writer.writeAll("]");
+            const values = kept_values[@intCast(base + index * size)..][0..@intCast(size)];
+            try write_time(writer, read, values);
         }
         try writer.writeAll("]}");
+        base += size * count;
     }
-    try writer.writeAll("],\"events\":[");
-    var state = weft.State.init(program, slab);
-    const t0: weft.Time = .{ .flicks = window.from };
-    const t1: weft.Time = .{ .flicks = window.to };
-    const found = if (filter.events.len == 0)
-        state.events(t0, t1, &events)
-    else
-        state.events_of(event_ids[0..event_count], t0, t1, &events);
-    name_sources(compiled);
+    assert(base <= values_max);
+}
+
+/// One walk of a fresh reader over the window for a signal too large for `kept_values`, writing
+/// each time's values as it reads them, so it needs no buffer at all.
+fn walk_streamed(
+    writer: *std.Io.Writer,
+    read: Read,
+    window: Window,
+    gather: ?*Gather,
+    state: *weft.State,
+) !void {
+    const count = window.count();
+    assert(read.size() * count > values_max);
+    for (0..count) |index| {
+        const time = window_time(window, index);
+        if (gather) |events_reader| events_reader.read_to(state, time);
+        state.eval(.{ .flicks = time });
+        if (index > 0) try writer.writeAll(",");
+        try write_time(writer, read, read.kept_of(state.values(read.id)));
+    }
+    try writer.writeAll("]}");
+}
+
+/// A signal's name, lanes, components, and range, up to the opening of its values.
+fn write_head(
+    writer: *std.Io.Writer,
+    name: []const u8,
+    read: Read,
+    lanes: ?[2]u32,
+    after_another: bool,
+) !void {
+    assert(read.kept[1] > read.kept[0] or (read.lanes > 1 and lanes != null));
+    if (after_another) try writer.writeAll(",");
+    try writer.writeAll("{\"name\":");
+    try json_string(writer, name);
+    if (read.lanes > 1) try writer.print(",\"lanes\":{d}", .{read.lanes});
+    if (read.lanes > 1 and lanes != null) try writer.print(",\"lane_first\":{d}", .{read.kept[0]});
+    if (read.components > 1) try writer.print(",\"components\":{d}", .{read.components});
+    const range = ranges[read.id.index];
+    try writer.writeAll(",\"range\":[");
+    try json_number(writer, range.low);
+    try writer.writeAll(",");
+    try json_number(writer, range.high);
+    try writer.print("],\"bounded\":{},\"values\":[", .{std.math.isFinite(range.low) and std.math.isFinite(range.high)});
+}
+
+/// One time of a signal: its kept lanes, an array of them when the node has more than one.
+fn write_time(writer: *std.Io.Writer, read: Read, values: []const f64) !void {
+    assert(values.len == read.size());
+    const components: usize = read.components;
+    if (read.lanes > 1) try writer.writeAll("[");
+    var lane: usize = 0;
+    while (lane * components < values.len) : (lane += 1) {
+        if (lane > 0) try writer.writeAll(",");
+        try json_value(writer, values[lane * components ..][0..components]);
+    }
+    if (read.lanes > 1) try writer.writeAll("]");
+}
+
+/// The events kept, each with the name of its source where it has one (section 3).
+fn write_events(
+    writer: *std.Io.Writer,
+    program: weft.Program,
+    found: []const weft.Event,
+    lanes: ?[2]u32,
+) !void {
+    assert(found.len <= events_max);
     var written: u32 = 0;
-    for (events[0..found.count]) |event| {
-        if (!event_kept(program, event, filter.lanes)) continue;
+    for (found) |event| {
+        assert(event.source.index < program.nodes.len);
+        if (!event_kept(program, event, lanes)) continue;
         if (written > 0) try writer.writeAll(",");
         written += 1;
         try writer.print("{{\"t\":{d},\"source\":{d},\"instance\":{d}", .{
@@ -434,8 +669,7 @@ pub fn sample(
         try json_number(writer, event.value);
         try writer.writeAll("}");
     }
-    try writer.writeAll("]}\n");
-    return true;
+    assert(written <= found.len);
 }
 
 /// The refusal of a name `sample` cannot read. A noun's says what to do instead (section 4).

@@ -321,6 +321,99 @@ test "sample runs a region larger than a fixed slab" {
     try testing.expect(std.mem.indexOf(u8, writer.buffered(), "\"lanes\":40000,\"lane_first\":0") != null);
 }
 
+/// Room for the outputs of step 38's tests, whose signals overflow `commands.values_max`.
+var wide_output: [4][2 << 20]u8 = undefined;
+
+/// The signals of a `sample` output: what lies between `"signals":[` and `],"events":[`.
+fn signals_of(sampled: []const u8) []const u8 {
+    const start = std.mem.indexOf(u8, sampled, "\"signals\":[").? + "\"signals\":[".len;
+    return sampled[start..std.mem.indexOf(u8, sampled, "],\"events\":[").?];
+}
+
+/// The events of a `sample` output, from `"events":[` to the end.
+fn events_of(sampled: []const u8) []const u8 {
+    return sampled[std.mem.indexOf(u8, sampled, "\"events\":[").?..];
+}
+
+// Locks step 38's walks, at 1024 times: `small` (1024 values) and `mid` (40 lanes, 40,960) fit
+// in one walk's 65,536 values and share it, `wide` (40,960 more) takes a walk of its own, `big`
+// (80 lanes, 81,920) fits in none and streams, and `b` (1,024) is the last walk. The bytes are
+// the five signals sampled one at a time, spliced, and the events, read along the first walk
+// and its last piece past the window's last time, are each lone run's: a follower's and a
+// bounce's, 397 of them in 102.35 s, as the command before step 38 gave them.
+test "sample reads its signals in one walk where they fit, in batches where not, and streams the rest" {
+    const text =
+        \\cue c0 = 0s
+        \\f = follow([-1..1], by: spring(time: 0.3s), pause: 0s..200ms, seed: 2)
+        \\small = chase(f, time: 0.2s)
+        \\ramp = tween(from: 0, to: 1000, at: c0, over: 100s)
+        \\mid = lanes(40, floor(ramp) + lane)
+        \\wide = lanes(40, floor(ramp) - lane)
+        \\big = lanes(80, floor(ramp) * lane)
+        \\b = bounce(0..1, speed: 2, at: c0)
+        \\
+    ;
+    const names = [_][]const u8{ "small", "mid", "wide", "big", "b" };
+    const window: commands.Window = .{ .from = 0, .to = 1023 * 70_560_000 + 35_280_000, .step = 70_560_000 };
+    try testing.expectEqual(@as(usize, 1024), window.count());
+    try testing.expectEqual(@as(usize, 65_536), commands.values_max);
+    var writer: std.Io.Writer = .fixed(&wide_output[0]);
+    const source: commands.Source = .{ .name = "walks.weft", .text = text };
+    try testing.expect(try commands.sample(testing.allocator, &compiled, &writer, source, &.{}, &.{}, &names, window, .{}));
+    const together = writer.buffered();
+    // The same signals one at a time, spliced.
+    var spliced: std.Io.Writer = .fixed(&wide_output[1]);
+    try spliced.print("{{\"from\":0,\"to\":{d},\"step\":70560000,\"signals\":[", .{window.to});
+    var events_alone: []const u8 = "";
+    for (names, 0..) |name, at| {
+        var alone: std.Io.Writer = .fixed(&wide_output[2 + at % 2]);
+        try testing.expect(try commands.sample(testing.allocator, &compiled, &alone, source, &.{}, &.{}, &.{name}, window, .{}));
+        if (at > 0) try spliced.writeAll(",");
+        try spliced.writeAll(signals_of(alone.buffered()));
+        if (at > 0) try testing.expectEqualStrings(events_alone, events_of(alone.buffered()));
+        events_alone = events_of(alone.buffered());
+    }
+    try spliced.writeAll("],");
+    try spliced.writeAll(events_alone);
+    try testing.expectEqualStrings(spliced.buffered(), together);
+    try testing.expectEqual(@as(usize, 397), std.mem.count(u8, events_of(together), "{\"t\":"));
+}
+
+// Locks that step 38's events, read in pieces along the walk, are what one query of the window
+// gives, whatever the step: a bounce of speed 2 hits at 0.5 s and at 1 s in [0, 1.25 s), each
+// once, the second in the last piece, past the last time; 64 lanes of a fast bounce overflow the
+// 1024 kept, which are the earliest; and a crossing of a follower, which steps, keeps its own
+// with `--events`.
+test "sample's events are the window's, whatever its step" {
+    const text =
+        \\cue c0 = 0s
+        \\b = bounce(0..1, speed: 2, at: c0)
+        \\f = follow([-1..1], by: spring(time: 0.3s), pause: 0s..200ms, seed: 2)
+        \\x = crossing(f, level: 0)
+        \\h = lanes(64, bounce(0..1, speed: 20, at: c0, stagger: 10ms))
+        \\
+    ;
+    const source: commands.Source = .{ .name = "pieces.weft", .text = text };
+    const to = 1_446_480_000; // 2.05 s
+    const cases = [_]struct { to: i64, events: []const []const u8, count: usize }{
+        .{ .to = 882_000_000, .events = &.{"b"}, .count = 2 },
+        .{ .to = to, .events = &.{}, .count = commands.events_max },
+        .{ .to = to, .events = &.{"x"}, .count = 0 },
+    };
+    for (cases) |case| {
+        var one: std.Io.Writer = .fixed(&wide_output[0]);
+        const whole: commands.Window = .{ .from = 0, .to = case.to, .step = case.to };
+        try testing.expect(try commands.sample(testing.allocator, &compiled, &one, source, &.{}, &.{}, &.{"f"}, whole, .{ .events = case.events }));
+        var pieces: std.Io.Writer = .fixed(&wide_output[1]);
+        const fine: commands.Window = .{ .from = 0, .to = case.to, .step = 352_800_000 };
+        try testing.expect(try commands.sample(testing.allocator, &compiled, &pieces, source, &.{}, &.{}, &.{"f"}, fine, .{ .events = case.events }));
+        try testing.expectEqualStrings(events_of(one.buffered()), events_of(pieces.buffered()));
+        if (case.count > 0) {
+            try testing.expectEqual(case.count, std.mem.count(u8, events_of(one.buffered()), "{\"t\":"));
+        }
+    }
+}
+
 /// The score of `nouns.zig` and its entries: a client's file, as its own command reads it.
 const score_file = @import("score.zig");
 
