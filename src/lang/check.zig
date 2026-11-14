@@ -40,8 +40,34 @@
 //! would hold, so `max(1, 2)` builds one node, and a module such as `std`'s `clamp` given numbers
 //! builds none of its own. The call's record stays in `calls`, which a back end never reaches
 //! from an expression. A power that overflows folds to an infinity, which the back end refuses
-//! as it refuses `1e300 * 1e300`. `pow`'s `n` is a whole number literal from 2 to 8, checked
-//! here, so a signal, 1, 9, 2.5, or -2 is refused at it.
+//! as it refuses `1e300 * 1e300`. `pow`'s `n` is a whole number from 2 to 8, fixed when the
+//! program is built (section 3b) and checked here, so a signal, 1, 9, 2.5, or -2 is refused at it.
+//!
+//! ## 3b. Numbers Where a Number Is Due
+//! `pi` and `tau` (step 40) are names for `std.math.pi` and `std.math.tau` (`schema.zig`,
+//! section 3f). Where a signal goes, each is a constant, as its digits are. Where a number fixed
+//! when the program is built is due, `fixed_number` is the one function every such place calls:
+//! a tween's ends, a path's goals, a motion's `from`, a range's ends, a track's initial value, a
+//! lane count, `pow`'s `n`, a cubic ease's points, the components of a vector or a colour written
+//! in numbers, and a number parameter that a signal may also set, `overshoot`, `speed`, which is
+//! then fixed as a literal is. There an expression folds when it is made only of number
+//! literals, `pi`, `tau`, parentheses, unary minus, and `+ - * /`, through a module's parameter
+//! bound to one: `to: 2 * pi`, `x: -tau..tau`, `lanes(2 * 48, …)`. Anything else is refused with
+//! the message a non-literal had before: a call, `max(1, 2)` or `sin(pi)`, a name of the file,
+//! `lane`, or a time. Each operation is the f64 one of section 3, left to right as written,
+//! through `arithmetic`, the function the signal's own folding calls, so a number folded here
+//! has the bits a constant folded there has: `2 * pi` is `tau` exactly, and `tau / 3` is the
+//! quotient, not a product with 1 / 3. A divisor of 0, or one whose reciprocal is not finite, is
+//! refused with a divisor's message (`nonzero_divisor`), and a result that is not finite, such as
+//! `1e300 * 1e300`, as a literal past f64 is. A seed, a time, and a frequency are not numbers and
+//! take only their literals.
+//!
+//! A file's own declaration of `pi` or `tau`, of any kind and on any line, shadows the number in
+//! the whole file, so the name is that declaration, used below it, as any name is; a module's
+//! parameter of the name shadows it in the module's body. A module body never sees the file's
+//! names, so there the number is the language's unless a parameter takes the name. A module's
+//! default may fold too, from numbers and the two names, so long as neither is one of its
+//! parameters, since a default that read a parameter would stand for itself (section 6).
 //!
 //! ## 4. Times
 //! A time literal is a whole number of flicks, worked out in integers from its digits: seconds
@@ -71,8 +97,8 @@
 //! module.
 //! - A body sees its parameters, the primitives, and the modules, never the file's names, so a
 //!   library cannot pick up a client's cue by accident.
-//! - A default is a literal, checked in the module's own frame, so a parameter never stands for
-//!   itself.
+//! - A default is a literal, or a number that folds from numbers, `pi`, and `tau` (section 3b),
+//!   checked in the module's own frame, so a parameter never stands for itself.
 //! - A parameter used as a signal is one signal: its first use is checked and kept in the frame,
 //!   and every later use is that expression, which the back end builds once. So `x + x` is
 //!   twice one noise, not two noises with two seeds.
@@ -687,7 +713,7 @@ const Checker = struct {
             },
             .cue_series => try checker.cue_series(index),
             .track => {
-                const initial = try checker.literal_number(it.a, "a track's initial value");
+                const initial = try checker.fixed_number(it.a, "a track's initial value");
                 const bounds = try checker.number_range(it.b);
                 if (!(bounds[0] <= initial and initial <= bounds[1])) {
                     const diagnostic = checker.fail(it.a, .out_of_range, "the initial value {d} is outside the bounds {d}..{d}", .{ initial, bounds[0], bounds[1] });
@@ -967,10 +993,11 @@ const Checker = struct {
                     error_module.hint(diagnostic, "a signal here is a name, a call, arithmetic, or a plain number", .{});
                     return error.Checked;
                 }
-                return checker.constant(try checker.literal_number(index, "a number"), index);
+                return checker.constant(try checker.fixed_number(index, "a number"), index);
             },
             .name => {
                 if (std.mem.eql(u8, checker.text(index), "lane")) return checker.lane_index(index);
+                if (checker.known_number(index)) |number| return checker.constant(number, index);
                 return checker.signal_name(index, 0);
             },
             .call => {
@@ -1000,7 +1027,7 @@ const Checker = struct {
                 const left = try checker.signal(it.a);
                 const right = try checker.signal(it.b);
                 if (checker.is_constant(left)) |a| if (checker.is_constant(right)) |b| {
-                    return checker.constant(if (it.tag == .add) a + b else a * b, index);
+                    return checker.constant(arithmetic(it.tag, a, b), index);
                 };
                 const tag: Expr.Tag = if (it.tag == .add) .add else .multiply;
                 const shape = try checker.combine(index, left, right, tag == .multiply);
@@ -1011,7 +1038,9 @@ const Checker = struct {
                 const left = try checker.signal(it.a);
                 const right = try checker.signal(it.b);
                 if (checker.is_constant(right)) |b| {
-                    if (checker.is_constant(left)) |a| return checker.constant(a - b, index);
+                    if (checker.is_constant(left)) |a| {
+                        return checker.constant(arithmetic(.subtract, a, b), index);
+                    }
                     const negative = try checker.constant(-b, it.b);
                     return checker.push_expr(.{ .tag = .add, .a = left, .b = negative, .item = index, .shape = checker.shape_of(left), .lanes = checker.lanes_of(left) });
                 }
@@ -1024,7 +1053,9 @@ const Checker = struct {
             .divide => {
                 const left = try checker.signal(it.a);
                 const by = try checker.divisor(it.b);
-                if (checker.is_constant(left)) |a| return checker.constant(a / by, index);
+                if (checker.is_constant(left)) |a| {
+                    return checker.constant(arithmetic(.divide, a, by), index);
+                }
                 const reciprocal = try checker.constant(1 / by, it.b);
                 return checker.push_expr(.{ .tag = .multiply, .a = left, .b = reciprocal, .item = index, .shape = checker.shape_of(left), .lanes = checker.lanes_of(left) });
             },
@@ -1087,6 +1118,14 @@ const Checker = struct {
             error_module.hint(diagnostic, "to scale by a signal, multiply by one", .{});
             return error.Checked;
         };
+        return checker.nonzero_divisor(index, number);
+    }
+
+    /// `number`, the divisor at `index`, when it is one (section 3): not 0, and with a finite
+    /// reciprocal. A signal's quotient and a number folded where one is due both ask here.
+    fn nonzero_divisor(checker: *Checker, index: u32, number: f64) Fail!f64 {
+        assert(index < checker.tree.items.len);
+        assert(!std.math.isNan(number));
         if (number == 0) {
             const diagnostic = checker.fail(index, .out_of_range, "there is no division by 0", .{});
             error_module.hint(diagnostic, "a divisor is a number other than 0", .{});
@@ -1245,6 +1284,12 @@ const Checker = struct {
     }
 
     fn unknown_name(checker: *Checker, index: u32, name: []const u8) Fail {
+        // `pi` and `tau` reach here only where a number is no answer: a cue, a noun, a path.
+        if (checker.item(index).tag == .name) if (checker.known_number(index)) |_| {
+            const diagnostic = checker.fail(index, .wrong_type, "`{s}` is a number, and not a name this file declares", .{name});
+            error_module.hint(diagnostic, "a number goes where a number or a signal is due", .{});
+            return error.Checked;
+        };
         if (checker.in_module()) {
             const module = checker.memory.modules[checker.memory.frames[checker.frame].module.?];
             const diagnostic = checker.fail(index, .not_a_parameter, "`{s}` is not a parameter of {s}", .{ name, module.name });
@@ -1503,6 +1548,7 @@ const Checker = struct {
         for (params) |param| {
             const default = tree.item(param).a;
             if (default == 0 or tree.item(default - 1).tag == .literal) continue;
+            if (default_folds(tree, default - 1, params, 0)) continue;
             const diagnostic = checker.fail(report, .wrong_type, "the default of `{s}` in {s} is not a literal", .{ tree.text(param), name });
             error_module.hint(diagnostic, "a default is a number, a time, or a frequency, such as `0.25s`", .{});
             return error.Checked;
@@ -1951,7 +1997,7 @@ const Checker = struct {
     }
 
     /// A vector or a colour written as numbers (section 8), or null for anything else: a call of
-    /// `vec2`, `vec3`, `oklab`, or `srgb` whose arguments are all number literals.
+    /// `vec2`, `vec3`, `oklab`, or `srgb` whose arguments are all numbers that fold (section 3b).
     fn constant_vector(checker: *Checker, index: u32) Fail!?Vector {
         if (checker.bound(index)) |arg| {
             const saved = checker.frame;
@@ -1965,12 +2011,15 @@ const Checker = struct {
         if (entry.op != .pack and entry.op != .srgb) return null;
         const children = checker.tree.children(index);
         if (children.len != entry.params.len) return null;
-        for (children) |child| if (checker.item(child).tag != .literal) return null;
+        for (children) |child| {
+            // A literal of another kind stays in, so it is refused as a component, as before.
+            if (checker.item(child).tag != .literal and !checker.folds(child)) return null;
+        }
         var vector: Vector = .{ .values = @splat(0), .shape = .{
             .components = @intCast(entry.params.len),
             .colour = entry.op == .srgb or std.mem.eql(u8, entry.name, "oklab"),
         } };
-        for (children, 0..) |child, at| vector.values[at] = try checker.literal_number(child, "a component");
+        for (children, 0..) |child, at| vector.values[at] = try checker.fixed_number(child, "a component");
         if (entry.op == .srgb) {
             for (vector.values[0..3]) |channel| if (!(channel >= 0 and channel <= 1)) {
                 const diagnostic = checker.fail(index, .out_of_range, "an sRGB channel is in [0, 1]", .{});
@@ -2044,7 +2093,11 @@ const Checker = struct {
         const it = checker.item(index);
         switch (param.kind) {
             .number => {
-                if (it.tag == .literal) return .{ .number = try checker.literal_number(index, "a number") };
+                // A number that folds is fixed as its literal is, even where a signal may set it
+                // (section 3b), so `2 * pi` builds what `6.283185307179586` builds.
+                if (it.tag == .literal or checker.folds(index)) {
+                    return .{ .number = try checker.fixed_number(index, "a number") };
+                }
                 if (param.shaped) if (try checker.constant_vector(index)) |vector| return .{ .vector = vector };
                 if (!param.live) return checker.not_live(entry, param, index);
                 const expr = try checker.signal(index);
@@ -2052,7 +2105,7 @@ const Checker = struct {
                 return .{ .signal = expr };
             },
             .integer => {
-                const number = try checker.literal_number(index, "a whole number");
+                const number = try checker.fixed_number(index, "a whole number");
                 if (entry.op == .function) try checker.power_in_range(index, number);
                 if (!(number >= 0 and number <= 0x1p32 and @floor(number) == number)) {
                     _ = checker.fail(index, .out_of_range, "`{s}` is a whole number from 0 to 2^32", .{param.name});
@@ -2132,7 +2185,7 @@ const Checker = struct {
                     return error.Checked;
                 }
                 var points: [4]f64 = undefined;
-                for (&points, children) |*point, child| point.* = try checker.literal_number(child, "a control point");
+                for (&points, children) |*point, child| point.* = try checker.fixed_number(child, "a control point");
                 return .{ .cubic = points };
             },
             .word => {
@@ -2331,7 +2384,7 @@ const Checker = struct {
                 values[at] = vector.values;
                 goal_shape = vector.shape;
             } else {
-                values[at][0] = try checker.literal_number(it.b, "a goal's value");
+                values[at][0] = try checker.fixed_number(it.b, "a goal's value");
             }
             if (shape) |first| if (!first.eql(goal_shape)) {
                 _ = checker.fail(it.b, .wrong_shape, "this goal is {s}, and the path's first goal {s}", .{ goal_shape.noun(), first.noun() });
@@ -2413,18 +2466,23 @@ const Checker = struct {
             error_module.hint(diagnostic, "for example `0..1`", .{});
             return error.Checked;
         }
-        const low = try checker.literal_number(it.a, "a range's end");
-        const high = try checker.literal_number(it.b, "a range's end");
+        const low = try checker.fixed_number(it.a, "a range's end");
+        const high = try checker.fixed_number(it.b, "a range's end");
         return .{ low, high };
     }
 
-    fn literal_number(checker: *Checker, index: u32, what: []const u8) Fail!f64 {
+    /// The number at `index` where one fixed when the program is built is due (section 3b): a
+    /// literal, `pi`, `tau`, or their arithmetic, folded; anything else is refused as `what`.
+    fn fixed_number(checker: *Checker, index: u32, what: []const u8) Fail!f64 {
+        assert(index < checker.tree.items.len);
+        assert(what.len > 0);
         if (checker.bound(index)) |arg| {
             const saved = checker.frame;
             checker.focus(arg.frame);
             defer checker.focus(saved);
-            return checker.literal_number(arg.item, what);
+            return checker.fixed_number(arg.item, what);
         }
+        if (checker.folds(index)) return checker.fold(index);
         const it = checker.item(index);
         const token = checker.tree.tokens[it.token];
         if (it.tag == .name) {
@@ -2439,13 +2497,92 @@ const Checker = struct {
                 else => {},
             };
         }
-        if (it.tag != .literal or token.tag != .number) {
-            const diagnostic = checker.fail(index, .wrong_type, "expected {s}, found {s}", .{ what, if (it.tag == .literal) literal_kind(token.tag) else item_kind(it.tag) });
-            if (it.tag == .literal and token.tag != .string) error_module.hint(diagnostic, "drop the unit", .{});
+        assert(!(it.tag == .literal and token.tag == .number));
+        const diagnostic = checker.fail(index, .wrong_type, "expected {s}, found {s}", .{ what, if (it.tag == .literal) literal_kind(token.tag) else item_kind(it.tag) });
+        if (it.tag == .literal and token.tag != .string) error_module.hint(diagnostic, "drop the unit", .{});
+        return error.Checked;
+    }
+
+    /// Whether `index` folds to a number (section 3b): number literals, `pi` and `tau` where no
+    /// name shadows them, parentheses, unary minus, and `+ - * /`, through bound parameters. It
+    /// reports nothing, so a caller that finds no fold gives the message it always gave.
+    fn folds(checker: *Checker, index: u32) bool {
+        assert(index < checker.tree.items.len);
+        assert(checker.frame < checker.frame_count);
+        if (checker.bound(index)) |arg| {
+            const saved = checker.frame;
+            checker.focus(arg.frame);
+            defer checker.focus(saved);
+            return checker.folds(arg.item);
+        }
+        const it = checker.item(index);
+        return switch (it.tag) {
+            .literal => checker.tree.tokens[it.token].tag == .number,
+            .name => checker.known_number(index) != null,
+            .paren, .negate => checker.folds(it.a),
+            .add, .subtract, .multiply, .divide => checker.folds(it.a) and checker.folds(it.b),
+            else => false,
+        };
+    }
+
+    /// The number `index` folds to, which `folds` has said it does (section 3b). A divisor of 0
+    /// and a result that is not finite are refused here.
+    fn fold(checker: *Checker, index: u32) Fail!f64 {
+        assert(index < checker.tree.items.len);
+        assert(checker.frame < checker.frame_count);
+        if (checker.bound(index)) |arg| {
+            const saved = checker.frame;
+            checker.focus(arg.frame);
+            defer checker.focus(saved);
+            return checker.fold(arg.item);
+        }
+        const it = checker.item(index);
+        const number: f64 = switch (it.tag) {
+            .literal => literal: {
+                assert(checker.tree.tokens[it.token].tag == .number);
+                const digits_text = checker.text(index);
+                const digits = parse_float(digits_text) orelse return checker.bad_number(index);
+                break :literal if (it.a == 1) -digits else digits;
+            },
+            .name => checker.known_number(index).?,
+            .paren => try checker.fold(it.a),
+            .negate => -(try checker.fold(it.a)),
+            .add, .subtract, .multiply => operands: {
+                const a = try checker.fold(it.a);
+                const b = try checker.fold(it.b);
+                break :operands arithmetic(it.tag, a, b);
+            },
+            .divide => divide: {
+                const a = try checker.fold(it.a);
+                const by = try checker.nonzero_divisor(it.b, try checker.fold(it.b));
+                break :divide arithmetic(.divide, a, by);
+            },
+            else => unreachable,
+        };
+        if (!std.math.isFinite(number)) {
+            const span = checker.span_of(index);
+            const written = checker.located(index).tree.source[span[0]..][0..span[1]];
+            const diagnostic = checker.fail(index, .out_of_range, "`{s}` is past what a number holds", .{written});
+            error_module.hint(diagnostic, "a number is finite; keep it within about 1.8e308", .{});
             return error.Checked;
         }
-        const number = parse_float(checker.text(index)) orelse return checker.bad_number(index);
-        return if (it.a == 1) -number else number;
+        return number;
+    }
+
+    /// The value of `pi` or `tau` at `index`, a name, unless a parameter or a declaration of the
+    /// file takes the name there (section 3b).
+    fn known_number(checker: *const Checker, index: u32) ?f64 {
+        const it = checker.item(index);
+        assert(it.tag == .name);
+        const name = checker.text(index);
+        const number = schema.number_named(name) orelse return null;
+        if (checker.bound_slot(index) != null) return null;
+        // A module's body never sees the file's names (section 6), so only a parameter shadows.
+        if (checker.in_module()) return number;
+        if (checker.find(name) != null) return null;
+        if (declares_name(checker.root, name)) return null;
+        assert(std.math.isFinite(number));
+        return number;
     }
 
     fn bad_number(checker: *Checker, index: u32) Fail {
@@ -2599,6 +2736,63 @@ fn item_kind(tag: parse_module.Tag) []const u8 {
         .element => "a cue of a series",
         else => "a declaration",
     };
+}
+
+/// Two numbers folded by `tag`, an operator, in f64 (sections 3 and 3b): the one place both a
+/// signal's constants and a number where one is due are combined, so they have the same bits.
+/// A divisor has been checked already (`nonzero_divisor`).
+fn arithmetic(tag: parse_module.Tag, a: f64, b: f64) f64 {
+    if (tag == .divide) assert(b != 0);
+    return switch (tag) {
+        .add => a + b,
+        .subtract => a - b,
+        .multiply => a * b,
+        .divide => a / b,
+        else => unreachable,
+    };
+}
+
+/// Whether the file `tree` declares `name`, a cue, a series, a track, or a binding, on any line,
+/// so the name is its own in the whole file (section 3b).
+fn declares_name(tree: *const Tree, name: []const u8) bool {
+    assert(name.len > 0);
+    for (tree.declarations) |index| {
+        const it = tree.item(index);
+        switch (it.tag) {
+            .cue, .cue_series, .track, .bind => {},
+            else => continue,
+        }
+        if (std.mem.eql(u8, tree.token_text(it.token), name)) return true;
+    }
+    return false;
+}
+
+/// Whether a module's default, `index` in `tree`, folds to a number on its own (section 3b):
+/// numbers, `pi`, and `tau` with arithmetic, where neither name is one of the module's `params`,
+/// since a default that read a parameter would stand for itself. `depth` bounds the walk as
+/// the parser bounds the nesting.
+fn default_folds(tree: *const Tree, index: u32, params: []const u32, depth: u32) bool {
+    assert(index < tree.items.len);
+    assert(depth <= parse_module.depth_max * 2);
+    if (depth == parse_module.depth_max * 2) return false;
+    const it = tree.item(index);
+    switch (it.tag) {
+        .literal => return tree.tokens[it.token].tag == .number,
+        .name => {
+            const name = tree.text(index);
+            if (schema.number_named(name) == null) return false;
+            for (params) |param| {
+                if (std.mem.eql(u8, tree.token_text(tree.item(param).token), name)) return false;
+            }
+            return true;
+        },
+        .paren, .negate => return default_folds(tree, it.a, params, depth + 1),
+        .add, .subtract, .multiply, .divide => {
+            if (!default_folds(tree, it.a, params, depth + 1)) return false;
+            return default_folds(tree, it.b, params, depth + 1);
+        },
+        else => return false,
+    }
 }
 
 /// Whether `tree` declares a module called `name`.

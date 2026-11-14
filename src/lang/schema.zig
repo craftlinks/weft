@@ -46,7 +46,8 @@
 //! `graph.Function`, and the checker and the back end have one arm for all of them. Step 33's
 //! `sin`, `cos`, `exp`, `ln`, `sqrt`, `floor`, and `round` are such entries, and so is
 //! `pow(input, n)`, whose `function` is `.{ .pow = 0 }` and whose power is its `n` argument, a
-//! whole number literal from 2 to 8 that the checker requires (`Entry.function_of`).
+//! whole number from 2 to 8, fixed when the program is built, that the checker requires
+//! (`Entry.function_of`).
 //!
 //! ## 3d. A Sentence a Parameter
 //! Each parameter's `doc` says what it means in one plain sentence, which `describe` prints
@@ -68,10 +69,21 @@
 //! though its `after` is a signal, as a tween with none is. A mover builds no node of its own,
 //! since it is its follower's law, nor do a client's signal and a noun, so theirs is null.
 //!
+//! ## 3f. Numbers the Language Knows
+//! `pi` and `tau` (step 40) are names for two numbers, `std.math.pi` and `std.math.tau`, in a
+//! table of their own, `numbers`, beside the calls: the checker reads a value from it, and
+//! `describe` prints it with its sentence, held to section 3d's rule. A name is a number wherever
+//! a number literal is, and folds with the arithmetic around it (`check.zig`, section 3b), so
+//! the nodes are the ones the number written out builds. A file's own binding, or a module's
+//! parameter, of the same name shadows it. The table is these two and stays small: a constant
+//! a file needs is a literal, or a binding where a signal goes.
+//!
 //! ## 4. TigerStyle Invariants
 //! - The table is comptime and checked: positional parameters come first, names are unique in an
 //!   entry, a default suits its kind, and an entry has at most `params_max` parameters.
-//! - Every parameter of the table has its sentence, which a test checks (section 3d).
+//! - Every parameter of the table has its sentence, which a test checks (section 3d), and so
+//!   does every number of `numbers`.
+//! - A number's name is no call's name, so a suggestion never offers both, and its value is finite.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -84,9 +96,10 @@ const range = @import("../core/range.zig");
 pub const params_max = 24;
 
 pub const Kind = enum {
-    /// A number literal.
+    /// A number fixed when the program is built: a literal, `pi`, `tau`, or their arithmetic
+    /// (`check.zig`, section 3b).
     number,
-    /// A whole number literal, at least zero.
+    /// A whole number fixed when the program is built, at least zero, as `number` is written.
     integer,
     /// A time literal, in whole flicks.
     time,
@@ -580,6 +593,38 @@ comptime {
     assert(std.mem.eql(u8, pick_words[1], "random"));
 }
 
+/// A number the language knows by name (section 3f).
+pub const Number = struct {
+    name: []const u8,
+    value: f64,
+    /// One sentence, as a parameter's (section 3d).
+    doc: []const u8,
+};
+
+/// Every number the language knows by name, in the order `describe` prints them (section 3f).
+pub const numbers = [_]Number{
+    .{ .name = "pi", .value = std.math.pi, .doc = "half a turn in radians, a circle's circumference over its diameter" },
+    .{ .name = "tau", .value = std.math.tau, .doc = "a whole turn in radians, 2 pi, one period of `sin` and `cos`" },
+};
+
+comptime {
+    assert(numbers.len == 2);
+    assert(numbers[1].value == 2 * numbers[0].value);
+    for (numbers) |known| {
+        assert(std.math.isFinite(known.value));
+        for (entries) |entry| assert(!std.mem.eql(u8, entry.name, known.name));
+    }
+}
+
+/// The value of the number the language knows as `name`, or null for any other name.
+pub fn number_named(name: []const u8) ?f64 {
+    assert(name.len > 0);
+    for (numbers) |known| {
+        if (std.mem.eql(u8, known.name, name)) return known.value;
+    }
+    return null;
+}
+
 /// The entry called `name` in `role`.
 pub fn find(name: []const u8, role: Role) ?*const Entry {
     for (&entries) |*entry| {
@@ -661,6 +706,18 @@ test "every parameter of the table has its sentence" {
     try testing.expect(!doc_valid("one sentence."));
     try testing.expect(!doc_valid("One sentence"));
     try testing.expect(doc_valid("in [0, 1), so 0.5 is half"));
+}
+
+// Locks section 3f: `pi` and `tau` are the two f64 of `std.math`, bit for bit, `tau` is twice
+// `pi` exactly, each has its sentence, and no other name is a number.
+test "the language knows pi and tau as numbers" {
+    try testing.expectEqual(@as(?f64, 3.141592653589793), number_named("pi"));
+    try testing.expectEqual(@as(?f64, 6.283185307179586), number_named("tau"));
+    try testing.expectEqual(@as(?f64, std.math.tau), number_named("tau"));
+    try testing.expectEqual(null, number_named("e"));
+    try testing.expectEqual(null, number_named("lane"));
+    try testing.expectEqual(null, number_named("Pi"));
+    for (numbers) |known| try testing.expect(doc_valid(known.doc));
 }
 
 // Locks section 3e: each call's class is its own nodes', from the core's `Op.class`. A spring

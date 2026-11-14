@@ -25,8 +25,11 @@ zig-out/bin/weft sample FILE --signal NAME               # one signal
 - **`describe`** lists every primitive: its parameters in order, which may go by position, each
   one's kind (`number`, `time`, `frequency`, `signal`, `cue`, `path`, …), its default, whether a
   signal may set it (`live`), whether it takes a vector or a colour (`shaped`), and a sentence on
-  what it means (`doc`). Then every module of the standard library, with its body. Read it
-  before writing a call.
+  what it means (`doc`). Then `numbers`, the two names the language knows, `pi` and `tau`, and
+  every module of the standard library, with its body. Read it before writing a call.
+- **`pi` and `tau`** are numbers wherever a number literal is, and build what their digits
+  build. A file's own declaration or a module's parameter of the name shadows it, so a file that
+  binds `tau` reads its binding, a signal, and `to: tau` there is refused as a signal is.
 - **What a seek costs**: `describe` gives each call's `"class"`, the class of the nodes it builds
   itself: `pure` (a function of t), `exact` (a fold over its goals, as a `spring`), `simulated`
   (stepped at 1/480 s from the start cue, as a `chase`), or `live` (an `input`). A call whose own
@@ -89,15 +92,17 @@ use std                                  # the standard library: pass --use std=
 soft = snappy(moves)                     # a module: a macro with types
 far = abs(wave - 0.5) + max(rise, 0.25)  # abs, min, max: calls, per component like +
 held = clamp(sum, -1, 1)                 # std's clamp: min(max(sum, -1), 1)
-curve = sin(index * 6.28) + pow(wave, 2) # sin and cos in radians; also exp, ln, sqrt, floor, round
+curve = sin(index * tau) + pow(wave, 2)  # sin and cos in radians; also exp, ln, sqrt, floor, round
 module bob2(base, amount: 0.1) = base + amount * wave(sine, 2hz)
 ```
 
 Rules that trip agents most often:
 
-- **Number parameters take literals.** A tween's `from` and `to`, a spring's goals, a bounce's
-  range are fixed when the program is built. Only a parameter `describe` marks `live` takes a
-  signal, and only a `signal` parameter takes an expression. To scale a tween by a signal, multiply
+- **Number parameters take numbers fixed when the program is built.** A tween's `from` and
+  `to`, a spring's goals, a bounce's range: a literal, `pi`, `tau`, or their `+ - * /`, such as
+  `to: 2 * pi` or `0..tau`. No call and no name of the file folds there, so `to: sin(pi)` and a
+  binding are refused. Only a parameter `describe` marks `live` takes a signal, and only a
+  `signal` parameter takes any expression. To scale a tween by a signal, multiply
   the tween: `tween(from: 0, to: 1, …) * height`.
 - **A divisor is a number**, fixed when the program is built: `lane / 1000`, `x / -4`, or a
   module's parameter bound to one. `x / 4` is `x * 0.25`, the same nodes. Dividing by a signal,
@@ -109,7 +114,7 @@ Rules that trip agents most often:
 - **`sin`, `cos`, `exp`, `ln`, `sqrt`, `floor`, `round`, and `pow(x, n)`** work the same way.
   `sin` and `cos` take radians. None can fail: `sqrt` of a negative is 0, `ln` at and below 0 is
   about -744.44, and `exp` above 709 holds e^709. `round` takes a half away from zero. `pow`'s
-  `n` is a whole number literal from 2 to 8, and `pow(x, 2)` has a tighter range than `x * x`.
+  `n` is a whole number from 2 to 8, fixed when the program is built, and `pow(x, 2)` has a tighter range than `x * x`.
   `quantize(x, step)` in `std` snaps to multiples of a fixed number `step`.
 - **A tween `after` a tween may leave out `from`**, and starts from that tween's `to`:
   `tween(to: 0, at: c1, over: 1s, after: rise)`. `after` must be a name bound to a tween;

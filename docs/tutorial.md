@@ -123,8 +123,8 @@ times are **seconds**; times in the output are **flicks** (705,600,000 a second)
 bound the signal never leaves, worked out without sampling (section 13).
 
 **`describe`** lists every call the language has, with its parameters, defaults, and kinds, a
-sentence on what each parameter means, and each call's class, which says what a seek costs
-(section 16):
+sentence on what each parameter means, each call's class, which says what a seek costs
+(section 16), and the two numbers the language knows by name, `pi` and `tau`:
 
 ```bash
 zig-out/bin/weft describe --use std=src/lang/std.weft
@@ -151,6 +151,9 @@ Exit codes: 0 for success, 1 when the file has errors, 2 for bad arguments.
 - Times carry units, `2s` or `500ms`; frequencies carry `hz`. A bare number is not a time.
 - Arithmetic is `+`, `-`, `*`, `/`, and parentheses. **A divisor is a number**, fixed when the
   program is built: `x / 4`, `lane / 16 - 3`. To scale by a signal, multiply by it.
+- `pi` and `tau` are numbers the language knows, usable wherever a number literal is, so
+  `to: 2 * pi`, `0..tau`, and `lane * tau / 96` all check. A file's own `tau = …`, or a module's
+  parameter named `tau`, is that name instead.
 - Up to two leading arguments go by position; the rest are named.
 - A few words are reserved: `cue`, `track`, `seed`, `start`, `use`, `module`, `lane`.
 
@@ -928,7 +931,8 @@ The limits worth knowing before you design around Weft:
 - **`colour.to_srgb` costs 0.1 to 0.4 µs a call**, which is 30 ms for 100,000 colours. At that
   scale send OKLab to the GPU and convert in the shader.
 - **Most parameters are constants.** Only those marked `live` take a signal. A tween's ends, a
-  spring's goals, and a bounce's walls are fixed when the program is built.
+  spring's goals, and a bounce's walls are fixed when the program is built: a literal, `pi`,
+  `tau`, or their `+ - * /`, and no call or binding.
 - **Division by a number only, no comparison, no `if`.** `x / 4` is `x * 0.25`, so a divisor is
   a number other than 0 that is fixed when the program is built, never a signal, whose range
   could hold 0. The product is the quotient exactly when the divisor is a power of two, and

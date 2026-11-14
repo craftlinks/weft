@@ -667,6 +667,14 @@ const goal = compiled.goal("spring");        // a path and its from, a chase's t
   program is built, not 0, and never a signal, whose range could hold 0. The product is the
   quotient exactly when `c` is a power of two and within one ulp of it otherwise, the same bits on
   every target; two numbers fold to the quotient itself.
+- **`pi` and `tau`** (step 40) are names for `std.math.pi` and `std.math.tau`, usable wherever a
+  number literal is, and they build the nodes their digits build. Where a number fixed when the
+  program is built is due, a tween's `to`, a range's end, a path's goal, a lane count, numbers
+  fold: number literals, `pi`, `tau`, parentheses, unary minus, and `+ - * /`, in f64 as a
+  signal's constants fold, so `to: 2 * pi` is `tau` bit for bit and `x: -tau..tau` checks.
+  Anything else there, a call or a name of the file, is refused as before, and a divisor of 0
+  as a divisor is. A file's own declaration of either name, or a module's parameter of it,
+  shadows the number, so a file that binds `tau = 6.283185307179586` builds what it built.
 - **`abs(x)`, `min(a, b)`, and `max(a, b)`** are pure calls, per component and per lane as `+`
   is: a vector or a colour goes in whole, a number is broadcast, and the call has the lanes of
   what it reads. Their ranges are exact, so `abs` of a signal over [-1, 1] is [0, 1], and
@@ -955,7 +963,9 @@ $ weft sample play/signals.weft --to 1 --step 0.5 --signal wave
   nodes that reads a signal and so has the class of what it reads, and `null` for a mover, a
   client's signal, or a noun, which build no node of their own. Each parameter has its `"doc"`,
   one sentence on what it means, which a test requires of every parameter of Weft's table; a
-  client's parameter without one prints `null`.
+  client's parameter without one prints `null`. Since step 40 `"numbers"`, after the primitives,
+  lists the numbers the language knows by name, `pi` and `tau`, each with its `"value"` and
+  `"doc"`.
 - **At most two `--use`**; a third is an error that says so, as it is from `commands.check` and
   `commands.sample`, which a client's command calls with its own entries (A Client's Nouns).
 - **JSON** has its keys in a fixed order and no whitespace, and a value that is not finite, such
