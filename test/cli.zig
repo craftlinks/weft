@@ -16,6 +16,12 @@
 //! A fake client registers `dot`, which the checker accepts beside the primitives and Weft's back
 //! end refuses; the client then finds its calls in `checked`, with their values, as a real
 //! client's back end would.
+//!
+//! ## 4. A Client's Limits
+//! A client of its own `Limits`, more cues than the command's and fewer nodes and libraries,
+//! checks and samples through `commands.For` (step 37): once compiled, its `summary` and
+//! `sample_compiled` print what `check` and `sample` would, and its limit errors name its own
+//! numbers.
 
 const std = @import("std");
 const testing = std.testing;
@@ -500,4 +506,112 @@ test "a cue's name from its index" {
     try testing.expectEqualDeep(@as(?CueName, .{ .name = "bar", .element = 2 }), compiled.cue_name(5));
     try testing.expectEqualDeep(@as(?CueName, .{ .name = "bar", .element = 4 }), compiled.cue_name(7));
     try testing.expectEqual(@as(?CueName, null), compiled.cue_name(8));
+}
+
+/// A client's own limits (step 37): more cues than the command's 512, fewer nodes than its 1024,
+/// and one library where it holds two.
+const client_limits: weft.lang.Limits = .{
+    .tokens = 1024,
+    .tree = 1024,
+    .names = 64,
+    .nodes = 8,
+    .slab = 4096,
+    .cues = 1024,
+    .goals = 16,
+    .regions = 4,
+    .tracks = 2,
+    .track_samples = 64,
+    .modules = 16,
+    .libraries = 1,
+};
+const client_command = commands.For(client_limits);
+var client_compiled: weft.lang.Compiled(client_limits) = undefined;
+
+/// A file of 601 cues, past the command's 512, and three nodes, within the client's 8.
+const many_cues =
+    \\cue bar = 0s..600s every 1s
+    \\b = bounce(0..1, speed: 0.5, at: bar[599])
+    \\bars = cues(bar)
+    \\
+;
+
+/// Nine nodes, one past the client's 8: a wave and eight sums.
+const nine_nodes = "a = wave(sine, 1hz)\nb = a + 1\nc = b + 1\nd = c + 1\ne = d + 1\nf = e + 1\n" ++
+    "g = f + 1\nh = g + 1\ni = h + 1\n";
+
+// Locks step 37: a client whose limits hold more cues than the command's and fewer nodes compiles
+// its file once and checks and samples that `Compiled`. The command refuses 601 cues at its 512;
+// the client's `summary` gives the 601 cues and `.cues = 601`, the bytes its `check` prints, and
+// `sample_compiled` gives `bars` stepping 599, 600, 601, 601 at 598 s to 601 s, and the cues at
+// 598, 599, and 600 s, the bytes its `sample` prints after compiling again.
+test "a client checks and samples its own Compiled, at its own limits" {
+    const source: commands.Source = .{ .name = "cues.weft", .text = many_cues };
+    var writer: std.Io.Writer = .fixed(&output);
+    try testing.expect(!try commands.check(&compiled, &writer, source, &.{}, &.{}));
+    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "error: the file needs more than 512 cues") != null);
+
+    // One compile, as a client's own load makes it, then its lines and its JSON.
+    try client_compiled.compile_client(&.{}, &.{}, many_cues);
+    writer = .fixed(&output);
+    try client_command.summary(&client_compiled, &writer);
+    const summarised = "ok: 3 nodes, a slab of 3, 601 cues, 0 goals, 0 regions, 0 tracks, seekable, closed form\n" ++
+        "limits: .{ .tokens = 37, .tree = 17, .names = 3, .nodes = 3, .slab = 3, .cues = 601, .goals = 0, .regions = 0, .tracks = 0, .modules = 0, .libraries = 0 }\n";
+    try testing.expectEqualStrings(summarised, writer.buffered());
+    const second = 705_600_000;
+    const window: commands.Window = .{ .from = 598 * second, .to = 601 * second, .step = second };
+    var sampled: std.Io.Writer = .fixed(&wide_output[0]);
+    try testing.expect(try client_command.sample_compiled(testing.allocator, &client_compiled, &sampled, &.{"bars"}, window, .{}));
+    try testing.expectEqualStrings("{\"from\":421948800000,\"to\":424065600000,\"step\":705600000,\"signals\":[" ++
+        "{\"name\":\"bars\",\"range\":[0,601],\"bounded\":true,\"values\":[599,600,601,601]}],\"events\":[" ++
+        "{\"t\":421948800000,\"source\":2,\"instance\":0,\"name\":\"bars\",\"value\":598}," ++
+        "{\"t\":422654400000,\"source\":2,\"instance\":0,\"name\":\"bars\",\"value\":599}," ++
+        "{\"t\":423360000000,\"source\":2,\"instance\":0,\"name\":\"bars\",\"value\":600}]}\n", sampled.buffered());
+
+    // `check` and `sample`, which compile, print the same bytes.
+    writer = .fixed(&output);
+    try testing.expect(try client_command.check(&client_compiled, &writer, source, &.{}, &.{}));
+    try testing.expectEqualStrings(summarised, writer.buffered());
+    var again: std.Io.Writer = .fixed(&wide_output[1]);
+    try testing.expect(try client_command.sample(testing.allocator, &client_compiled, &again, source, &.{}, &.{}, &.{"bars"}, window, .{}));
+    try testing.expectEqualStrings(sampled.buffered(), again.buffered());
+}
+
+// Locks step 37's limit errors: each names the client's number, not the command's. Nine nodes
+// are past the client's 8, which the command holds; two libraries are past its one.
+test "a client's limit errors name the client's limits" {
+    const nine: commands.Source = .{ .name = "nine.weft", .text = nine_nodes };
+    var writer: std.Io.Writer = .fixed(&output);
+    try testing.expect(try commands.check(&compiled, &writer, nine, &.{}, &.{}));
+    writer = .fixed(&output);
+    try testing.expect(!try client_command.check(&client_compiled, &writer, nine, &.{}, &.{}));
+    try testing.expectEqualStrings("nine.weft:5:5: error: the program needs more than 8 nodes\n" ++
+        "    e = d + 1\n        ^^^^^\n    hint: raise `Limits.nodes`\n", writer.buffered());
+
+    const two: []const weft.lang.Source = &.{
+        .{ .name = "std", .text = weft.lang.std_library },
+        .{ .name = "two", .text = weft.lang.std_library },
+    };
+    const source: commands.Source = .{ .name = "ok.weft", .text = sequence };
+    writer = .fixed(&output);
+    try testing.expect(!try client_command.check(&client_compiled, &writer, source, two, &.{}));
+    try testing.expectEqualStrings("error: at most 1 libraries, given 2\n", writer.buffered());
+    writer = .fixed(&output);
+    const window: commands.Window = .{ .from = 0, .to = 0, .step = 1 };
+    try testing.expect(!try client_command.sample(testing.allocator, &client_compiled, &writer, source, two, &.{}, &.{}, window, .{}));
+    try testing.expectEqualStrings("error: at most 1 libraries, given 2\n", writer.buffered());
+}
+
+// Locks that a file within both limits prints the same bytes from the client's calls as from the
+// command's: the sample golden, the spring of `sequence`.
+test "a client's calls print the command's bytes on a file both hold" {
+    const source: commands.Source = .{ .name = "sequence.weft", .text = sequence };
+    const window: commands.Window = .{ .from = 0, .to = 1_411_200_000, .step = 352_800_000 };
+    var writer: std.Io.Writer = .fixed(&output);
+    try testing.expect(try client_command.sample(testing.allocator, &client_compiled, &writer, source, &.{}, &.{}, &.{"out"}, window, .{}));
+    try testing.expectEqualStrings(sample_golden, writer.buffered());
+    var weft_lines: std.Io.Writer = .fixed(&wide_output[0]);
+    try testing.expect(try commands.check(&compiled, &weft_lines, source, &.{}, &.{}));
+    var client_lines: std.Io.Writer = .fixed(&wide_output[1]);
+    try testing.expect(try client_command.check(&client_compiled, &client_lines, source, &.{}, &.{}));
+    try testing.expectEqualStrings(weft_lines.buffered(), client_lines.buffered());
 }
