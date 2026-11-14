@@ -882,10 +882,23 @@ while (each.next()) |noun| {
 - **A client's own command** is a few lines on the module `commands` (`cli/commands.zig`):
   `describe`, `check`, and `sample` take the client's entries, and the `weft` command passes
   none. `check` counts the nouns on its `ok:` line; `sample` lists signals only, so a signal a
-  noun reads inline is sampled by binding it on a line of its own. A client's own checks of its
-  nouns (a shape, a position) run after `check` returns: they add to
-  `compiled.syntax.diagnostics` and the client renders them. `commands.limits` holds two
+  noun reads inline is sampled by binding it on a line of its own. `commands.limits` holds two
   libraries, `std` and one of the client's.
+- **A client with checks of its own** (a shape, a position) compiles into its own
+  `lang.Compiled(its limits)`, runs its checks, and then calls `commands.For(its limits)` on that
+  `Compiled` (step 37), so each file compiles once and at the client's limits, larger or smaller
+  than the command's:
+
+  ```zig
+  const command = commands.For(scene_limits);           // check's and sample's buffers, sized
+  try compiled.compile_client(&nouns, libraries, source);
+  // ... the client's own checks, which add to compiled.syntax.diagnostics
+  try command.summary(&compiled, writer);              // check's ok:, limits:, and lane lines
+  _ = try command.sample_compiled(gpa, &compiled, writer, names, window, .{});  // sample's JSON
+  ```
+
+  `For(…).check` and `For(…).sample` compile as `commands.check` and `commands.sample` do, which
+  are `For(commands.limits)`'s. A limit error names the client's number.
 
 ## The weft Command
 

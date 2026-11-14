@@ -48,10 +48,21 @@
 //! inline has no name, so a file binds it on a line of its own to sample it, and naming a noun
 //! says so. `check` stops after Weft's part: a client's own checks of its nouns run after the
 //! compile, add their diagnostics to `compiled.syntax.diagnostics`, and are rendered by the
-//! client. More libraries than `limits.libraries` is an error, not an assert.
+//! client.
+//!
+//! A client compiles into its own `lang.Compiled(its limits)`, so `For(client_limits)` (step 37)
+//! holds `check`, `summary`, `sample`, and `sample_compiled` for that type, with the buffers its
+//! limits size; this file's `check` and the rest are `For(limits)`'s, so the `weft` command is
+//! the same code at the same sizes. A client with checks of its own has compiled already, so it
+//! calls `summary` for `check`'s lines and `sample_compiled` for `sample`'s JSON on the
+//! `Compiled` it holds, which compiles each file once, at the client's limits: a full array is
+//! an error naming the client's number, and a field larger than the command's holds. More
+//! libraries than the client's `libraries` is an error, not an assert. `sample_compiled` reads
+//! the tables as the `Compiled` holds them, a track's writes included.
 //!
 //! ## 5. TigerStyle Invariants
-//! - No allocation: every buffer is a file-scope variable, sized by the constants below.
+//! - No allocation: every buffer is a file-scope variable, sized by the constants below, or one
+//!   of a `For`, sized by its client's `nodes`.
 //! - Bounded: at most `samples_max` times, `signals_max` signals, and `events_max` events a run,
 //!   and at most `signals_max` walks of the window, one a signal when no two fit together.
 
@@ -119,69 +130,277 @@ pub const Window = struct {
     }
 };
 
+/// What `describe` and `parse` parse into: they take no `Compiled`, so Weft's own limits.
 var scratch: Syntax = undefined;
-var ranges: [limits.nodes]weft.Range = undefined;
+/// The window's events, and the values one walk keeps (section 3). Neither depends on a
+/// client's limits, so every `For` shares them: a command makes one call at a time.
 var events: [events_max]weft.Event = undefined;
-/// The values one walk keeps, signal after signal (section 3).
 var kept_values: [values_max]f64 = undefined;
-/// The name each node's events print with, by `name_sources` (section 3).
-var source_names: [limits.nodes]?[]const u8 = undefined;
 
-/// `weft check`: the file's diagnostics, or a summary of its program. True when it compiles.
-/// A client's command passes its entries as `clients` (section 4); the `weft` command none.
-pub fn check(
-    compiled: *Compiled,
-    writer: *std.Io.Writer,
-    source: Source,
-    libraries: []const lang.Source,
-    clients: []const schema.Entry,
-) !bool {
-    if (!try libraries_fit(writer, libraries)) return false;
-    compiled.compile_client(clients, libraries, source.text) catch {
-        try render_errors(compiled, writer, source, libraries);
-        return false;
-    };
-    const program = compiled.program;
-    const report = program.report();
-    // The counts of step 18, then every field a client's `Limits` must hold.
-    try writer.print("ok: {d} nodes, a slab of {d}, {d} cues, {d} goals, {d} regions, {d} tracks", .{
-        program.nodes.len,
-        program.slab_count,
-        compiled.checked.cue_times.len,
-        compiled.checked.goals.len,
-        compiled.checked.regions.len,
-        compiled.checked.tracks.len,
-    });
-    const noun_count = nouns_of(compiled);
-    if (noun_count > 0) try writer.print(", {d} nouns", .{noun_count});
-    try writer.print(", {s}, {s}\n", .{
-        if (report.seekable) "seekable" else "live",
-        if (report.stepped) "stepped" else "closed form",
-    });
-    // The least `Limits` the file compiles with, to paste (step 22).
-    const needs = compiled.needs();
-    try writer.writeAll("limits: .{");
-    inline for (@typeInfo(lang.Limits).@"struct".field_names, 0..) |name, at| {
-        if (comptime std.mem.eql(u8, name, "track_samples") or std.mem.eql(u8, name, "errors")) continue;
-        try writer.print("{s} .{s} = {d}", .{ if (at == 0) "" else ",", name, @field(needs, name) });
+/// `check`, `summary`, `sample`, and `sample_compiled` on a client's own
+/// `lang.Compiled(client_limits)` (section 4), with the buffers its limits size. The `weft`
+/// command's are `For(limits)`'s, which this file exports as `check`, `summary`, `sample`, and
+/// `sample_compiled`.
+pub fn For(comptime client_limits: lang.Limits) type {
+    comptime {
+        assert(client_limits.nodes >= 1);
+        assert(client_limits.nodes <= std.math.maxInt(u32));
     }
-    try writer.writeAll(" }\n");
-    const lane_cost = slab_per_lane(program);
-    if (lane_cost > 0) try writer.print("a lane costs {d} of the slab\n", .{lane_cost});
-    return true;
+    return struct {
+        /// The client's own `Compiled`, the type it already holds: `lang.Compiled(client_limits)`.
+        const ClientCompiled = lang.Compiled(client_limits);
+        // The names this file exports for `For(limits)` are its own too, so calls within it
+        // say which they mean.
+        const Self = @This();
+
+        /// Each node's range, for the heads of `sample`'s signals.
+        var ranges: [client_limits.nodes]weft.Range = undefined;
+        /// The name each node's events print with, by `name_sources` (section 3).
+        var source_names: [client_limits.nodes]?[]const u8 = undefined;
+
+        /// `weft check`: the file's diagnostics, or its `summary`. True when it compiles. A
+        /// client's command passes its entries as `clients` (section 4); the `weft` command none.
+        pub fn check(
+            compiled: *ClientCompiled,
+            writer: *std.Io.Writer,
+            source: Source,
+            libraries: []const lang.Source,
+            clients: []const schema.Entry,
+        ) !bool {
+            if (!try libraries_fit(writer, libraries, client_limits.libraries)) return false;
+            compiled.compile_client(clients, libraries, source.text) catch {
+                try render_errors(compiled, writer, source, libraries);
+                return false;
+            };
+            try Self.summary(compiled, writer);
+            return true;
+        }
+
+        /// What `check` prints of a file that compiled: the `ok:` line, the least `Limits`, and
+        /// what a lane costs, from a `Compiled` the client already holds, so a client with checks
+        /// of its own compiles once (section 4).
+        pub fn summary(compiled: *const ClientCompiled, writer: *std.Io.Writer) !void {
+            assert(compiled.ok);
+            const program = compiled.program;
+            assert(program.nodes.len <= client_limits.nodes);
+            const report = program.report();
+            // The counts of step 18, then every field a client's `Limits` must hold.
+            const counts = "ok: {d} nodes, a slab of {d}, {d} cues, {d} goals, {d} regions, {d} tracks";
+            try writer.print(counts, .{
+                program.nodes.len,
+                program.slab_count,
+                compiled.checked.cue_times.len,
+                compiled.checked.goals.len,
+                compiled.checked.regions.len,
+                compiled.checked.tracks.len,
+            });
+            const noun_count = nouns_of(compiled);
+            if (noun_count > 0) try writer.print(", {d} nouns", .{noun_count});
+            try writer.print(", {s}, {s}\n", .{
+                if (report.seekable) "seekable" else "live",
+                if (report.stepped) "stepped" else "closed form",
+            });
+            // The least `Limits` the file compiles with, to paste (step 22).
+            const needs = compiled.needs();
+            try writer.writeAll("limits: .{");
+            inline for (@typeInfo(lang.Limits).@"struct".field_names, 0..) |name, at| {
+                const chosen = comptime std.mem.eql(u8, name, "track_samples") or
+                    std.mem.eql(u8, name, "errors");
+                if (chosen) continue;
+                const comma = if (at == 0) "" else ",";
+                try writer.print("{s} .{s} = {d}", .{ comma, name, @field(needs, name) });
+            }
+            try writer.writeAll(" }\n");
+            const lane_cost = slab_per_lane(program);
+            if (lane_cost > 0) try writer.print("a lane costs {d} of the slab\n", .{lane_cost});
+        }
+
+        /// How many nouns the file declares (section 4).
+        fn nouns_of(compiled: *const ClientCompiled) u32 {
+            var count: u32 = 0;
+            for (compiled.checked.declarations) |declaration| {
+                count += @intFromBool(declaration == .noun);
+            }
+            assert(count <= compiled.checked.declarations.len);
+            return count;
+        }
+
+        /// The diagnostics of a failed compile, against the text they are about: a library's own
+        /// when a library failed to parse.
+        fn render_errors(
+            compiled: *const ClientCompiled,
+            writer: *std.Io.Writer,
+            source: Source,
+            libraries: []const lang.Source,
+        ) !void {
+            const failed: Source = if (compiled.failed_library) |at|
+                .{ .name = libraries[at].name, .text = libraries[at].text }
+            else
+                source;
+            for (compiled.errors()) |found| try found.render(failed.text, failed.name, writer);
+        }
+
+        /// `weft sample`: each named signal's range and its value at each time of `window`,
+        /// then the events in the window, as JSON (section 3), after compiling `source` with the
+        /// client's entries. False, with a message, when the file or a name is wrong.
+        pub fn sample(
+            gpa: std.mem.Allocator,
+            compiled: *ClientCompiled,
+            writer: *std.Io.Writer,
+            source: Source,
+            libraries: []const lang.Source,
+            clients: []const schema.Entry,
+            names: []const []const u8,
+            window: Window,
+            filter: Filter,
+        ) !bool {
+            assert(window.valid());
+            assert(names.len <= signals_max);
+            if (!try libraries_fit(writer, libraries, client_limits.libraries)) return false;
+            compiled.compile_client(clients, libraries, source.text) catch {
+                try render_errors(compiled, writer, source, libraries);
+                return false;
+            };
+            return Self.sample_compiled(gpa, compiled, writer, names, window, filter);
+        }
+
+        /// `sample` of a `Compiled` the client already holds, compiled with its entries, so a
+        /// client with checks of its own compiles once (section 4). With no names, every
+        /// top-level signal in text order, up to `signals_max`. False, with a message, when a
+        /// name is wrong or the slab does not fit in memory.
+        pub fn sample_compiled(
+            gpa: std.mem.Allocator,
+            compiled: *const ClientCompiled,
+            writer: *std.Io.Writer,
+            names: []const []const u8,
+            window: Window,
+            filter: Filter,
+        ) !bool {
+            assert(compiled.ok);
+            assert(window.valid());
+            assert(names.len <= signals_max);
+            assert(filter.events.len <= signals_max);
+            if (filter.lanes) |lanes| assert(lanes[0] <= lanes[1]);
+            var default_names: [signals_max][]const u8 = undefined;
+            const list = if (names.len > 0) names else default_signals(compiled, &default_names);
+            var ids: [signals_max]weft.Id = undefined;
+            for (list, 0..) |name, at| {
+                ids[at] = compiled.signal(name) orelse return not_a_signal(compiled, writer, name);
+            }
+            // The nodes that fire the named signals' events, merged, ascending, for `events_of`.
+            var event_ids: [signals_max * weft.graph.components_max]weft.Id = undefined;
+            var event_count: usize = 0;
+            for (filter.events) |name| {
+                if (compiled.signal(name) == null) return not_a_signal(compiled, writer, name);
+                var found: [weft.graph.components_max]weft.Id = undefined;
+                for (compiled.event_sources(name, &found)) |id| {
+                    event_count = insert_source(event_ids[0 .. event_count + 1], event_count, id);
+                }
+            }
+            const program = compiled.program;
+            assert(program.nodes.len <= client_limits.nodes);
+            const slab_count = program.reader_slab_count();
+            const slab = gpa.alloc(f64, @intCast(slab_count)) catch {
+                const refusal = "error: a slab of {d} values does not fit in memory\n";
+                try writer.print(refusal, .{slab_count});
+                return false;
+            };
+            defer gpa.free(slab);
+            program.ranges(ranges[0..program.nodes.len]);
+            var reads: [signals_max]Read = undefined;
+            for (ids[0..list.len], reads[0..list.len]) |id, *read| {
+                const extent = program.nodes[id.index].extent;
+                read.* = .{
+                    .id = id,
+                    .lanes = extent.lanes,
+                    .kept = kept_lanes(extent.lanes, filter.lanes),
+                    .components = extent.components,
+                    .range = ranges[id.index],
+                };
+            }
+            var gather: Gather = .{
+                .sources = if (filter.events.len == 0) null else event_ids[0..event_count],
+                .read = window.from,
+                .found = 0,
+            };
+            const head = "{{\"from\":{d},\"to\":{d},\"step\":{d},\"signals\":[";
+            try writer.print(head, .{ window.from, window.to, window.step });
+            const lanes = filter.lanes;
+            try write_signals(writer, program, slab, list, reads[0..list.len], window, lanes, &gather);
+            assert(gather.read == window.to);
+            try writer.writeAll("],\"events\":[");
+            name_sources(compiled);
+            const names_of_sources = source_names[0..program.nodes.len];
+            try write_events(writer, program, events[0..gather.found], names_of_sources, lanes);
+            try writer.writeAll("]}\n");
+            return true;
+        }
+
+        /// The refusal of a name `sample` cannot read. A noun's says what to do instead
+        /// (section 4).
+        fn not_a_signal(
+            compiled: *const ClientCompiled,
+            writer: *std.Io.Writer,
+            name: []const u8,
+        ) !bool {
+            try writer.writeAll("error: ");
+            try json_string(writer, name);
+            if (compiled.noun(name)) |found| {
+                const instead = " is a noun, `{s}`, not a signal; bind a signal it reads on a line" ++
+                    " of its own to sample it\n";
+                try writer.print(instead, .{found.entry.name});
+                return false;
+            }
+            try writer.writeAll(" is not a signal of the file\n");
+            return false;
+        }
+
+        /// Names each node that fires events by the first signal, in the file's order, whose
+        /// `Compiled.event_sources` hold it (step 23), so a region's bounce with no stagger and a
+        /// vector's spring print their binding's name. The first declared wins where two share a
+        /// source, as `b = a` shares `a`'s: it is the name the source was made under.
+        fn name_sources(compiled: *const ClientCompiled) void {
+            const count = compiled.program.nodes.len;
+            assert(count <= client_limits.nodes);
+            @memset(source_names[0..count], null);
+            for (compiled.checked.bindings) |binding| {
+                if (binding.kind != .signal) continue;
+                var found: [weft.graph.components_max]weft.Id = undefined;
+                for (compiled.event_sources(binding.name, &found)) |id| {
+                    if (source_names[id.index] == null) source_names[id.index] = binding.name;
+                }
+            }
+        }
+
+        /// The top-level signals of the file, in text order.
+        fn default_signals(
+            compiled: *const ClientCompiled,
+            buffer: *[signals_max][]const u8,
+        ) []const []const u8 {
+            var count: usize = 0;
+            for (compiled.checked.bindings) |binding| {
+                if (binding.kind != .signal or count == signals_max) continue;
+                buffer[count] = binding.name;
+                count += 1;
+            }
+            return buffer[0..count];
+        }
+    };
 }
 
-/// How many nouns the file declares (section 4).
-fn nouns_of(compiled: *const Compiled) u32 {
-    var count: u32 = 0;
-    for (compiled.checked.declarations) |declaration| count += @intFromBool(declaration == .noun);
-    return count;
-}
+const weft_command = For(limits);
+pub const check = weft_command.check;
+pub const summary = weft_command.summary;
+pub const sample = weft_command.sample;
+pub const sample_compiled = weft_command.sample_compiled;
 
-/// Refuses more libraries than `limits` holds, which the library would otherwise assert on.
-fn libraries_fit(writer: *std.Io.Writer, libraries: []const lang.Source) !bool {
-    if (libraries.len <= limits.libraries) return true;
-    try writer.print("error: at most {d} libraries, given {d}\n", .{ limits.libraries, libraries.len });
+/// Refuses more libraries than `libraries_max`, a client's `Limits.libraries`, which the library
+/// would otherwise assert on. The error names the client's number.
+fn libraries_fit(writer: *std.Io.Writer, libraries: []const lang.Source, libraries_max: u32) !bool {
+    if (libraries.len <= libraries_max) return true;
+    assert(libraries.len > libraries_max);
+    const refusal = "error: at most {d} libraries, given {d}\n";
+    try writer.print(refusal, .{ libraries_max, libraries.len });
     return false;
 }
 
@@ -195,16 +414,6 @@ fn slab_per_lane(program: weft.Program) u64 {
         total += (region + node.extent.lanes - 1) / node.extent.lanes;
     }
     return total;
-}
-
-/// The diagnostics of a failed compile, against the text they are about: a library's own when
-/// a library failed to parse.
-fn render_errors(compiled: *const Compiled, writer: *std.Io.Writer, source: Source, libraries: []const lang.Source) !void {
-    const failed: Source = if (compiled.failed_library) |at|
-        .{ .name = libraries[at].name, .text = libraries[at].text }
-    else
-        source;
-    for (compiled.errors()) |found| try found.render(failed.text, failed.name, writer);
 }
 
 /// `weft describe`: the primitives, the modules of each library, and a client's nouns, as JSON.
@@ -344,83 +553,12 @@ pub fn parse(writer: *std.Io.Writer, source: Source) !bool {
     return true;
 }
 
-/// `weft sample`: each named signal's range and its value at each time of `window`, then the
-/// events in the window, as JSON (section 3). With no names, every top-level signal in text
-/// order, up to `signals_max`. False, with a message, when the file or a name is wrong.
 /// What `sample` keeps: the events of the sources bound to `events`, all when it is empty, and
 /// lanes `lanes[0]` to `lanes[1]`, both included, all when it is null (step 22).
 pub const Filter = struct {
     events: []const []const u8 = &.{},
     lanes: ?[2]u32 = null,
 };
-
-pub fn sample(
-    gpa: std.mem.Allocator,
-    compiled: *Compiled,
-    writer: *std.Io.Writer,
-    source: Source,
-    libraries: []const lang.Source,
-    clients: []const schema.Entry,
-    names: []const []const u8,
-    window: Window,
-    filter: Filter,
-) !bool {
-    assert(window.valid());
-    assert(names.len <= signals_max);
-    assert(filter.events.len <= signals_max);
-    if (filter.lanes) |lanes| assert(lanes[0] <= lanes[1]);
-    if (!try libraries_fit(writer, libraries)) return false;
-    compiled.compile_client(clients, libraries, source.text) catch {
-        try render_errors(compiled, writer, source, libraries);
-        return false;
-    };
-    var default_names: [signals_max][]const u8 = undefined;
-    const list = if (names.len > 0) names else default_signals(compiled, &default_names);
-    var ids: [signals_max]weft.Id = undefined;
-    for (list, 0..) |name, at| {
-        ids[at] = compiled.signal(name) orelse return not_a_signal(compiled, writer, name);
-    }
-    // The nodes that fire the named signals' events, merged, ascending, for `events_of`.
-    var event_ids: [signals_max * weft.graph.components_max]weft.Id = undefined;
-    var event_count: usize = 0;
-    for (filter.events) |name| {
-        if (compiled.signal(name) == null) return not_a_signal(compiled, writer, name);
-        var found: [weft.graph.components_max]weft.Id = undefined;
-        for (compiled.event_sources(name, &found)) |id| {
-            event_count = insert_source(event_ids[0 .. event_count + 1], event_count, id);
-        }
-    }
-    const program = compiled.program;
-    const slab = gpa.alloc(f64, @intCast(program.reader_slab_count())) catch {
-        try writer.print("error: a slab of {d} values does not fit in memory\n", .{program.reader_slab_count()});
-        return false;
-    };
-    defer gpa.free(slab);
-    program.ranges(ranges[0..program.nodes.len]);
-    var reads: [signals_max]Read = undefined;
-    for (ids[0..list.len], reads[0..list.len]) |id, *read| {
-        const extent = program.nodes[id.index].extent;
-        read.* = .{
-            .id = id,
-            .lanes = extent.lanes,
-            .kept = kept_lanes(extent.lanes, filter.lanes),
-            .components = extent.components,
-        };
-    }
-    var gather: Gather = .{
-        .sources = if (filter.events.len == 0) null else event_ids[0..event_count],
-        .read = window.from,
-        .found = 0,
-    };
-    try writer.print("{{\"from\":{d},\"to\":{d},\"step\":{d},\"signals\":[", .{ window.from, window.to, window.step });
-    try write_signals(writer, program, slab, list, reads[0..list.len], window, filter.lanes, &gather);
-    assert(gather.read == window.to);
-    try writer.writeAll("],\"events\":[");
-    name_sources(compiled);
-    try write_events(writer, program, events[0..gather.found], filter.lanes);
-    try writer.writeAll("]}\n");
-    return true;
-}
 
 /// Every signal of `reads`, in its walks (section 3), the first of which reads the events into
 /// `gather`; with no signal, the events on a reader of their own.
@@ -468,6 +606,8 @@ const Read = struct {
     lanes: u32,
     kept: [2]u32,
     components: u32,
+    /// The node's range, which the signal's head prints.
+    range: weft.Range,
 
     /// The values one time of the signal keeps.
     fn size(read: Read) u64 {
@@ -621,7 +761,7 @@ fn write_head(
     if (read.lanes > 1) try writer.print(",\"lanes\":{d}", .{read.lanes});
     if (read.lanes > 1 and lanes != null) try writer.print(",\"lane_first\":{d}", .{read.kept[0]});
     if (read.components > 1) try writer.print(",\"components\":{d}", .{read.components});
-    const range = ranges[read.id.index];
+    const range = read.range;
     try writer.writeAll(",\"range\":[");
     try json_number(writer, range.low);
     try writer.writeAll(",");
@@ -642,14 +782,17 @@ fn write_time(writer: *std.Io.Writer, read: Read, values: []const f64) !void {
     if (read.lanes > 1) try writer.writeAll("]");
 }
 
-/// The events kept, each with the name of its source where it has one (section 3).
+/// The events kept, each with the name of its source where it has one, from `names`, a name or
+/// null for each node (section 3).
 fn write_events(
     writer: *std.Io.Writer,
     program: weft.Program,
     found: []const weft.Event,
+    names: []const ?[]const u8,
     lanes: ?[2]u32,
 ) !void {
     assert(found.len <= events_max);
+    assert(names.len == program.nodes.len);
     var written: u32 = 0;
     for (found) |event| {
         assert(event.source.index < program.nodes.len);
@@ -661,7 +804,7 @@ fn write_events(
             event.source.index,
             event.instance,
         });
-        if (source_names[event.source.index]) |name| {
+        if (names[event.source.index]) |name| {
             try writer.writeAll(",\"name\":");
             try json_string(writer, name);
         }
@@ -670,18 +813,6 @@ fn write_events(
         try writer.writeAll("}");
     }
     assert(written <= found.len);
-}
-
-/// The refusal of a name `sample` cannot read. A noun's says what to do instead (section 4).
-fn not_a_signal(compiled: *const Compiled, writer: *std.Io.Writer, name: []const u8) !bool {
-    try writer.writeAll("error: ");
-    try json_string(writer, name);
-    if (compiled.noun(name)) |found| {
-        try writer.print(" is a noun, `{s}`, not a signal; bind a signal it reads on a line of its own to sample it\n", .{found.entry.name});
-        return false;
-    }
-    try writer.writeAll(" is not a signal of the file\n");
-    return false;
 }
 
 /// The lanes of a node of `lanes` that `sample` prints, as `[first, end)`. `--lanes` picks among
@@ -712,34 +843,6 @@ fn insert_source(sources: []weft.Id, count: usize, id: weft.Id) usize {
     std.mem.copyBackwards(weft.Id, sources[at + 1 ..], sources[at..count]);
     sources[at] = id;
     return count + 1;
-}
-
-/// Names each node that fires events by the first signal, in the file's order, whose
-/// `Compiled.event_sources` hold it (step 23), so a region's bounce with no stagger and a
-/// vector's spring print their binding's name. The first declared wins where two share a source,
-/// as `b = a` shares `a`'s: it is the name the source was made under.
-fn name_sources(compiled: *const Compiled) void {
-    const count = compiled.program.nodes.len;
-    assert(count <= limits.nodes);
-    @memset(source_names[0..count], null);
-    for (compiled.checked.bindings) |binding| {
-        if (binding.kind != .signal) continue;
-        var found: [weft.graph.components_max]weft.Id = undefined;
-        for (compiled.event_sources(binding.name, &found)) |id| {
-            if (source_names[id.index] == null) source_names[id.index] = binding.name;
-        }
-    }
-}
-
-/// The top-level signals of the file, in text order.
-fn default_signals(compiled: *const Compiled, buffer: *[signals_max][]const u8) []const []const u8 {
-    var count: usize = 0;
-    for (compiled.checked.bindings) |binding| {
-        if (binding.kind != .signal or count == signals_max) continue;
-        buffer[count] = binding.name;
-        count += 1;
-    }
-    return buffer[0..count];
 }
 
 /// One lane's value: a number, or an array of its components.
