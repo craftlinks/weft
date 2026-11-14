@@ -24,6 +24,8 @@
 //!          staggered bounce over n lanes: an eval, then the events  100,000 lanes
 //! beside   three chases beside 32 waves summed and 1,000 lanes     cold at 90 s, and per
 //!          that no chase reads (step 34)                           frame at 60 Hz for 10 s
+//! springs  a spring over 1,000 lanes, staggered by 2 ms, then by   per frame, at 60 Hz for
+//!          lane at uneven cues (step 39): an eval, then the events 10 s
 //! node    64 nodes of one op playing forwards at 60 Hz             per node, per frame
 //! seek     Play's file read at 600 s, then at 300.99 s              the read at 300.99 s
 //! recomp   Play's file with a pure line edited at 600 s: compile,   per recompile
@@ -96,6 +98,8 @@ pub fn main(init: std.process.Init) !void {
     lanes(io, 1_000);
     lanes(io, 100_000);
     beside(io);
+    springs(io, false);
+    springs(io, true);
     per_node(io);
     seek(io);
     recompile(io);
@@ -497,6 +501,73 @@ fn lanes(io: std.Io, count: u32) void {
     const eval_label = std.fmt.bufPrint(&label_buffer, "lanes   {d} lanes, eval per frame", .{count}) catch unreachable;
     report(eval_label, best_eval, frames, total);
     const events_label = std.fmt.bufPrint(&label_buffer, "lanes   {d} lanes, events per frame", .{count}) catch unreachable;
+    report(events_label, best_events, frames, found_total);
+}
+
+/// The springs case: a lane's cue each, and one goal, a lane's value and the cursor.
+const springs_lanes = 1_000;
+var springs_cue_times: [springs_lanes]weft.Time = undefined;
+var springs_cues: weft.Cues = undefined;
+var springs_goal_entries: [1]weft.Goal = undefined;
+var springs_slab: [springs_lanes + weft.motion.cursor_count]f64 = undefined;
+
+/// Case 8a: a spring of 1,000 lanes toward one goal, every lane 2 ms after the one before by
+/// `stagger`, or, `by_lane`, each at its own cue, 2 ms apart and 1 ms more every third lane
+/// (step 39), read at 60 Hz for 10 s from 0: each frame an eval and a sum over every lane, then
+/// the frame's goals reached in another reader.
+fn springs(io: std.Io, by_lane: bool) void {
+    const ms: i64 = @divExact(flicks_per_second, 1000);
+    springs_cues = weft.Cues.init(&springs_cue_times);
+    for (0..springs_lanes) |lane| {
+        const at: i64 = @intCast(lane);
+        const uneven: i64 = if (by_lane) @mod(at, 3) else 0;
+        _ = springs_cues.add(.{ .flicks = (100 + 2 * at + uneven) * ms }) catch |err| fail(err);
+    }
+    var goals = weft.Goals.init(&springs_goal_entries);
+    const path = goals.add(&.{.{ .cue = .{ .index = 0 }, .value = 1, .cue_by_lane = by_lane }}) catch |err| fail(err);
+    var builder = weft.Builder.init(&nodes, .{
+        .slab_count_max = springs_slab.len,
+        .cues = &springs_cues,
+        .goals = goals.table(),
+    });
+    builder.lanes = springs_lanes;
+    const stagger: weft.Time = .{ .flicks = if (by_lane) 0 else 2 * ms };
+    const spring = builder.spring(.{ .from = 0, .goals = path, .time = .{ .flicks = 450 * ms }, .overshoot = 0.3, .stagger = stagger }) catch |err| fail(err);
+    const program = builder.finish();
+    assert(program.slab_count == springs_slab.len);
+    const rate = weft.Rate.from_hz(60).?;
+    const frames = 600;
+    var best_eval: i96 = std.math.maxInt(i96);
+    var best_events: i96 = std.math.maxInt(i96);
+    var total: f64 = 0;
+    var found_total: f64 = 0;
+    for (0..repeats) |_| {
+        var state = weft.State.init(program, &springs_slab);
+        var spent: i96 = 0;
+        for (0..frames) |frame| {
+            const start = now(io);
+            state.eval(weft.Time.from_ticks(@intCast(frame), rate).?);
+            for (state.values(spring)) |value| total += value;
+            spent += now(io) - start;
+        }
+        best_eval = @min(best_eval, spent);
+        var reader = weft.State.init(program, &springs_slab);
+        spent = 0;
+        for (0..frames) |frame| {
+            const t0 = weft.Time.from_ticks(@intCast(frame), rate).?;
+            const t1 = weft.Time.from_ticks(@intCast(frame + 1), rate).?;
+            const start = now(io);
+            const found = reader.events(t0, t1, &lanes_events);
+            spent += now(io) - start;
+            found_total += @floatFromInt(found.count + found.dropped);
+        }
+        best_events = @min(best_events, spent);
+    }
+    const name = if (by_lane) "by lane" else "staggered";
+    var label_buffer: [64]u8 = undefined;
+    const eval_label = std.fmt.bufPrint(&label_buffer, "springs 1000 {s}, eval per frame", .{name}) catch unreachable;
+    report(eval_label, best_eval, frames, total);
+    const events_label = std.fmt.bufPrint(&label_buffer, "springs 1000 {s}, events per frame", .{name}) catch unreachable;
     report(events_label, best_events, frames, found_total);
 }
 

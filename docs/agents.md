@@ -85,6 +85,7 @@ dots = lanes(100, noise(smooth, 1hz))    # 100 lanes, each its own noise
 fall = lanes(100, tween(from: 1, to: 0, at: c0, over: 1s, stagger: 10ms))   # one after another
 index = lanes(100, lane * 0.01)          # each lane's index
 pop = lanes(3, tween(from: 0, to: 1, at: word[lane], over: 300ms))   # lane i at cue word[i]
+ring = lanes(3, spring([word[lane]: 1], time: 450ms, overshoot: 0.3)) # a spring by lane, one goal
 fb = delay(0)
 loop = chase(1 + fb * -0.8, time: 0.5s)
 fb <- loop                               # a cycle goes through a delay, fed by name
@@ -124,9 +125,11 @@ Rules that trip agents most often:
   can still overflow, so a client calls `state.finite()` after `eval` on a program with a loop.
 - **Lanes meet where their counts are equal or one side has one lane.** A name bound outside a
   region is shared by every lane. `lane` and `stagger:` belong inside `lanes(n, …)`.
-- **A cue for each lane** is `series[lane]`, only as the `at` of a `tween` or a `bounce`, with
-  a cue for every lane and no `stagger:`. The index is `lane` itself; for any other pattern
-  write the series as a list.
+- **A cue for each lane** is `series[lane]`, only as the `at` of a `tween` or a `bounce`, or as
+  the cue of the only goal of a `spring` or a `newtonian` written in the call
+  (`spring([s[lane]: 1], …)`), with a cue for every lane and no `stagger:`. A path of two goals
+  with one by lane, and a path by lane declared on its own line, are refused. The index is
+  `lane` itself; for any other pattern write the series as a list.
 - **Spring and Newtonian goals are at cues**, not times: declare the cues first.
 - **A simulated signal** (chase, follow, shift, delay, crossing, oscillator) runs from the start
   cue, the first cue unless `start c` names another, so the file needs a cue.

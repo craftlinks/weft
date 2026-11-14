@@ -627,11 +627,14 @@ fn program_hash(program: weft.Program, tracks: *const weft.Tracks) u64 {
 // 12 hashes, 0xdea1386a4be8a783 and 0x69071b1bdb435f6a. Step 28's `cue_by_lane` field moved them
 // the same way: with ", .cue_by_lane = false" cut, both were 0x8ebcd160a135c39d and
 // 0x8def344e14662829 again. Step 34's `step_skip` field moved them the same way: with
-// ", .step_skip = n" cut, both were 0x0fa761f8b9ab026a and 0x6ffd7f6225076541 again.
+// ", .step_skip = n" cut, both were 0x0fa761f8b9ab026a and 0x6ffd7f6225076541 again. Step 39's
+// `cue_by_lane` field on a goal moved the first only, by its goals' printing: with
+// ", .cue_by_lane = false" cut from each goal's text, it was 0xa9f41f282456a456 again; the
+// bouncers have no goals.
 test "the text compiles to the programs it replaced" {
     try testing.expect(built.build(source));
     built_bouncers.build();
-    try testing.expectEqual(@as(u64, 0xa9f41f282456a456), program_hash(built.program, built.tracks));
+    try testing.expectEqual(@as(u64, 0x36c001c6e535471e), program_hash(built.program, built.tracks));
     const bouncer_tracks = &built_bouncers.compiled.tables.tracks;
     try testing.expectEqual(@as(u64, 0xb7df9067be7ef729), program_hash(built_bouncers.program, bouncer_tracks));
 }

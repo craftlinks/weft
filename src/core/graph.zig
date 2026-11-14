@@ -228,6 +228,16 @@
 //! moved moves one lane. The field is a bool rather than a stride because the language writes
 //! only cue g for lane g; a stride would replace it in `lane_cue` alone.
 //!
+//! A spring or a Newtonian move may choose the cue of its goal by lane the same way (step 39):
+//! `Goal.cue_by_lane` on the only goal of its path, so lane g heads for the goal from cue
+//! `lane_cue(cue, g)`. It takes the region's lanes and is refused outside one, past the table, or
+//! in a path of more than one goal, each as a tween's is, the last as `LaneMismatch`. With one
+//! goal, lane g is lane 0's motion moved `cue(lane_cue(cue, g)) - cue(cue)` later, as a stagger
+//! moves it `g * stagger` later, so the pass and the events read lane 0's path at the moved time
+//! (`state.zig`'s `motion_lane_offset`) and `motion.zig` never reads the flag. The flag is on the
+//! goal, where a later path of several goals by lane would put it, and fills padding, so no node
+//! grows; the shared cursor stays exact, since one goal has nothing to fold.
+//!
 //! ## 17. Functions of a Value
 //! `apply` takes a `Function` of one value, and `minimum` and `maximum` the smaller and larger of
 //! two (step 26). Each is pure and works per component and per lane as `add` does: `apply` keeps
@@ -943,6 +953,11 @@ pub const Node = struct {
 comptime {
     // A follower is the largest op. The array is read in order, so this costs prefetch, not misses.
     assert(@sizeOf(Node) <= 128);
+    // Step 39's flag went in a goal's padding: none of these grew.
+    assert(@sizeOf(Node) == 120);
+    assert(@sizeOf(Op) == 96);
+    assert(@sizeOf(Motion) == 56);
+    assert(@sizeOf(Goal) == 16);
     assert(@sizeOf(Id) == @sizeOf(u32));
     assert(@alignOf(Node) == @alignOf(f64));
 }
@@ -1057,6 +1072,8 @@ pub const Program = struct {
                     assert(op.goals.first + op.goals.count <= program.goals.len);
                     const path = program.goals[op.goals.first..][0..op.goals.count];
                     for (path) |goal| assert(goal.cue.index < program.cues.count);
+                    if (path.len > 1) for (path) |goal| assert(!goal.cue_by_lane);
+                    if (path[0].cue_by_lane) assert_cue_by_lane(program, node, path[0].cue);
                 },
                 .bounce => |op| {
                     assert(op.start.index < program.cues.count);
@@ -1587,7 +1604,7 @@ pub const Builder = struct {
     pub fn spring(builder: *Builder, source: motion.Spring) Error!Id {
         try builder.check_goals(source.goals, source.from);
         const law = try spring_law(source.time, source.overshoot);
-        const extent = try builder.staggered_extent(source.stagger);
+        const extent = try builder.motion_extent(source.goals, source.stagger);
         return builder.push_shaped(.{ .motion = .{
             .from = source.from,
             .goals = source.goals,
@@ -1600,7 +1617,7 @@ pub const Builder = struct {
     pub fn newtonian(builder: *Builder, source: motion.Newtonian) Error!Id {
         try builder.check_goals(source.goals, source.from);
         const limits = try newtonian_limits(source.speed, source.accel, source.decel);
-        const extent = try builder.staggered_extent(source.stagger);
+        const extent = try builder.motion_extent(source.goals, source.stagger);
         return builder.push_shaped(.{ .motion = .{
             .from = source.from,
             .goals = source.goals,
@@ -1898,8 +1915,9 @@ pub const Builder = struct {
         return builder.region_extent() catch unreachable;
     }
 
-    /// The extent of a cued source, a tween or a bounce: with a cue by lane, the region's lanes,
-    /// refused outside a region, and each lane's cue in the table; otherwise as staggered.
+    /// The extent of a cued source, a tween, a bounce, or a motion toward one goal: with a cue by
+    /// lane, the region's lanes, refused outside a region, and each lane's cue in the table;
+    /// otherwise as staggered.
     fn cued_extent(builder: *const Builder, start: Cue, cue_by_lane: bool, stagger: Time) Error!Extent {
         if (!cue_by_lane) return builder.staggered_extent(stagger);
         const extent = try builder.region_extent();
@@ -1907,6 +1925,19 @@ pub const Builder = struct {
         const last = @as(u64, start.index) + builder.lane_first + extent.lanes - 1;
         if (last >= builder.cue_table.count) return error.UnknownCue;
         return extent;
+    }
+
+    /// The extent of a motion toward `path`, which `check_goals` found valid: as a cued source's
+    /// when its one goal's cue is by lane (section 16), refusing a goal by lane in a longer path;
+    /// otherwise as staggered.
+    fn motion_extent(builder: *const Builder, path: motion.Path, stagger: Time) Error!Extent {
+        assert(path.count > 0);
+        assert(path.first + path.count <= builder.goals.len);
+        const goals = builder.goals[path.first..][0..path.count];
+        if (goals.len > 1) {
+            for (goals) |goal| if (goal.cue_by_lane) return error.LaneMismatch;
+        }
+        return builder.cued_extent(goals[0].cue, goals[0].cue_by_lane, stagger);
     }
 
     /// A staggered source's extent: one lane when it is not staggered, the region's otherwise,

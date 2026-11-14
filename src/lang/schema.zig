@@ -165,7 +165,8 @@ pub const Param = struct {
     default: Default = .required,
     words: []const []const u8 = &.{},
     /// A cue that may be chosen by lane, `series[lane]` inside a region (step 28): the `at` of a
-    /// `tween` and a `bounce` only, which start lane g at the series' cue g.
+    /// `tween` and a `bounce`, which start lane g at the series' cue g, and the `goals` of a
+    /// `spring` and a `newtonian` (step 39), whose path's only goal may be at such a cue.
     by_lane: bool = false,
     /// What the parameter means, one sentence, which `describe` prints (section 3d). Every
     /// parameter of `entries` has one; a client's entry may leave it empty.
@@ -392,7 +393,7 @@ const zero_pause: Default = .{ .time_range = .{ 0, 0 } };
 const stagger_doc = "how much later each lane starts, inside `lanes(n, …)`";
 const seed_doc = "a whole number that picks the draw, hashed with the file's `seed`; by default from the declaration's name";
 const shape_doc = "the shape of one cycle, each in [-1, 1]";
-const goals_doc = "the values it heads for, each from its cue, as `[cue: value, …]` or a path's name";
+const goals_doc = "the values it heads for, each from its cue, as `[cue: value, …]` or a path's name; a lone goal's cue may be `series[lane]`";
 const goal_from_doc = "the value before the first goal, at rest";
 const start_from_doc = "the value at the start cue, at rest";
 const spring_time_doc = "the period of the spring's undamped swing, so omega is 2 pi over it";
@@ -424,14 +425,14 @@ pub const entries = [_]Entry{
         .{ .name = "stagger", .kind = .time, .default = .{ .time = 0 }, .doc = stagger_doc },
     } },
     .{ .name = "spring", .op = .spring, .role = .signal, .summary = "a spring toward goals at cues", .params = &.{
-        .{ .name = "goals", .kind = .path, .positional = true, .shaped = true, .doc = goals_doc },
+        .{ .name = "goals", .kind = .path, .positional = true, .shaped = true, .by_lane = true, .doc = goals_doc },
         .{ .name = "from", .kind = .number, .shaped = true, .default = .{ .number = 0 }, .doc = goal_from_doc },
         .{ .name = "time", .kind = .time, .doc = spring_time_doc },
         .{ .name = "overshoot", .kind = .number, .default = .{ .number = 0 }, .doc = overshoot_doc },
         .{ .name = "stagger", .kind = .time, .default = .{ .time = 0 }, .doc = "how much later each lane heads for its goals, inside `lanes(n, …)`" },
     } },
     .{ .name = "newtonian", .op = .newtonian, .role = .signal, .summary = "a Newtonian move toward goals at cues", .params = &.{
-        .{ .name = "goals", .kind = .path, .positional = true, .shaped = true, .doc = goals_doc },
+        .{ .name = "goals", .kind = .path, .positional = true, .shaped = true, .by_lane = true, .doc = goals_doc },
         .{ .name = "from", .kind = .number, .shaped = true, .default = .{ .number = 0 }, .doc = goal_from_doc },
         .{ .name = "speed", .kind = .number, .doc = speed_doc },
         .{ .name = "accel", .kind = .number, .doc = accel_doc },
@@ -585,7 +586,11 @@ comptime {
                 .after => assert(param_a.kind == .number and param_a.shaped and entry.op == .tween),
                 .required => {},
             }
-            if (param_a.by_lane) assert(param_a.kind == .cue and (entry.op == .tween or entry.op == .bounce));
+            if (param_a.by_lane) switch (param_a.kind) {
+                .cue => assert(entry.op == .tween or entry.op == .bounce),
+                .path => assert(entry.op == .spring or entry.op == .newtonian),
+                else => unreachable,
+            };
             for (entry.params[index_a + 1 ..]) |param_b| assert(!std.mem.eql(u8, param_a.name, param_b.name));
         }
     }

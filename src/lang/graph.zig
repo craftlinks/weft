@@ -755,7 +755,7 @@ pub fn build(
             var entries: [64]motion.Goal = undefined;
             const chunk = @min(entries.len, goals.len - copied);
             for (entries[0..chunk], goals[copied..][0..chunk]) |*entry, goal| {
-                entry.* = .{ .cue = .{ .index = goal.cue }, .value = goal.value };
+                entry.* = .{ .cue = .{ .index = goal.cue }, .value = goal.value, .cue_by_lane = goal.cue_by_lane };
             }
             const added = tables.goals.add(entries[0..chunk]) catch unreachable;
             if (copied == 0) path.first = added.first;

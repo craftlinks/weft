@@ -8,6 +8,11 @@
 //! cue a motion holds `from`, at rest. From each cue it heads for that cue's goal, starting from
 //! wherever the previous goal left it, at that velocity. So a new goal mid-move keeps the momentum.
 //!
+//! A goal may have its cue chosen by lane (step 39, `Goal.cue_by_lane`): lane g of a graph's lane
+//! region reads the cue g after it (`graph.zig`, section 16). Only a path of that one goal may, so
+//! lane g is lane 0's motion moved as much later as its cue is, and this file never reads the
+//! flag: a graph reads lane g at the time lane 0 would be at.
+//!
 //! ## 2. Exact Between Goal Changes
 //! Between two cues a motion has a closed form, so the value at any time is computed, not stepped,
 //! and it is the same at any frame rate. To reach a time, `sample` folds over the goal changes
@@ -69,7 +74,17 @@ const Time = time_module.Time;
 pub const Goal = struct {
     cue: Cue,
     value: f64,
+    /// Lane g of a graph's lane region heads for the goal from the cue g after `cue` (step 39,
+    /// `graph.lane_cue`), so the cue is a series' first. A graph takes it only as a path's one
+    /// goal (section 1). It sits in what was padding, so a goal stays 16 bytes.
+    cue_by_lane: bool = false,
 };
+
+comptime {
+    // The flag fills padding: a goal table costs what it did before step 39.
+    assert(@sizeOf(Goal) == 16);
+    assert(@alignOf(Goal) == @alignOf(f64));
+}
 
 /// A run of goals in a `Goals` table.
 pub const Path = struct {

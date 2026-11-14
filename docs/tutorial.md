@@ -519,7 +519,9 @@ Two lane counts meet only when equal, or when one side has one lane. An event ca
 lanes. So a chain where each link follows the one before is one declaration a link, and a flock
 cannot be written. What a lane can differ by is what the list above gives it: `lane` in
 arithmetic, a seed, and a uniform `stagger:`. A number parameter stays one number for every lane,
-so `bounce(…, speed: 1 + lane * 0.5)` is refused, and so is a cue chosen by lane, `beat[lane]`.
+so `bounce(…, speed: 1 + lane * 0.5)` is refused. A cue may vary by lane since steps 28 and 39:
+`beat[lane]` is lane *i* at the series' cue *i*, as the `at:` of a `tween` or a `bounce`, or as the
+only goal of a `spring` or a `newtonian`, `spring([beat[lane]: 1], time: 450ms)`.
 
 ### Modules: your own vocabulary
 
@@ -920,8 +922,8 @@ The limits worth knowing before you design around Weft:
   the file compiles with, every field, ready to paste, so size a `Compiled` from that line. A
   library is parsed under the same limits as the file, and the line accounts for it.
 - **Lane counts are fixed at compile.** Data that changes size means a recompile.
-- **Lanes cannot read each other**, and a number parameter or a cue cannot vary by lane
-  (section 11). A region is a line, with no rows and columns, and the client cannot hand it a
+- **Lanes cannot read each other**, and a number parameter cannot vary by lane, nor a cue but
+  as `series[lane]` (section 11). A region is a line, with no rows and columns, and the client cannot hand it a
   table of per-lane values.
 - **The `weft` command takes a slab of any size**: `sample` allocates its reader's slab, so a
   file with a large region is checked and sampled at its own lane count. Its limit is 1,024
