@@ -691,7 +691,8 @@ fn events_cues(program: *const Program, span: CueSpan, id: Id, report: *Found) v
 /// The goals of one lane of a motion reached in the range, each with the goal as the value. Only
 /// goals whose stretch, from their cue to the next goal's, meets the range can be reached in it,
 /// and the fold to the first of them starts from the cursor when it can, as `motion.zig`
-/// explains. Lane g reads its range `g * stagger` earlier, and moves its events that much later.
+/// explains. Lane g reads its range `motion_lane_offset` earlier, and moves its events that much
+/// later.
 fn events_motion(
     program: *const Program,
     slab: []const f64,
@@ -703,12 +704,12 @@ fn events_motion(
 ) void {
     const path = program.goals[op.goals.first..][0..op.goals.count];
     const cues = program.cues;
-    const shift = negated(op.stagger);
-    // The range as the unstaggered motion sees it.
+    const offset = motion_lane_offset(program, op, lane);
+    // The range as lane 0's motion sees it.
     var shifted: Found = .{
         .collector = report_all.collector,
-        .t0 = lane_time(report_all.t0, op.stagger, lane),
-        .t1 = lane_time(report_all.t1, op.stagger, lane),
+        .t0 = .{ .flicks = report_all.t0.flicks -% offset },
+        .t1 = .{ .flicks = report_all.t1.flicks -% offset },
     };
     const report = &shifted;
     // The first goal whose stretch ends after t0, and the goals after it whose cue is before t1.
@@ -732,7 +733,7 @@ fn events_motion(
             report.t0,
             report.t1,
         );
-        if (reached) |time| report_all.add(lane_time(time, shift, lane), id, lane, path[index].value);
+        if (reached) |time| report_all.add(.{ .flicks = time.flicks +% offset }, id, lane, path[index].value);
         if (index + 1 == path.len) break;
         const seconds = motion.seconds_between(cue_time, cues.at(path[index + 1].cue));
         kinematics = motion.advance(op.law, kinematics, path[index].value, seconds);
@@ -847,6 +848,22 @@ fn family_lane(program: *const Program, node: *const Node, lane: usize) u32 {
 fn lane_start(program: *const Program, start: Cue, cue_by_lane: bool, stagger: Time, lane: u32) Time {
     const cue = if (cue_by_lane) lane_cue(start, lane) else start;
     return lane_time(program.cues.at(cue), negated(stagger), lane);
+}
+
+/// How many flicks later lane `lane` of a family of a motion runs lane 0's path (`graph.zig`,
+/// section 16): `lane * stagger`, and, when its one goal's cue is chosen by lane, the distance
+/// from that cue to the lane's own. Wrapping, as `lane_time` is: lane g reads `time - offset`.
+fn motion_lane_offset(program: *const Program, op: *const Motion, lane: u32) i64 {
+    assert(op.goals.count > 0);
+    const first = program.goals[op.goals.first];
+    const staggered = @as(i64, lane) *% op.stagger.flicks;
+    if (!first.cue_by_lane) return staggered;
+    assert(op.goals.count == 1);
+    const own = program.cues.at(lane_cue(first.cue, lane));
+    // Cues stay in order (`Cues.move` refuses to reorder), so a later lane is never earlier.
+    const moved = own.flicks -% program.cues.at(first.cue).flicks;
+    assert(moved >= 0);
+    return staggered +% moved;
 }
 
 /// `time` negated, so `lane_time` moves later instead of earlier.
@@ -967,10 +984,14 @@ fn eval_node(
                 @memset(out, motion.sample(op, program.goals, program.cues, cursor, time));
                 return;
             }
-            // In time order, so the cursor folds forward from lane to lane (section 16).
+            // In time order, so the cursor folds forward from lane to lane (section 16): a later
+            // lane reads an earlier time when staggered forward or by lane.
+            const by_lane = program.goals[op.goals.first].cue_by_lane;
+            const reversed = op.stagger.flicks > 0 or by_lane;
             for (0..out.len) |at| {
-                const lane = if (op.stagger.flicks > 0) out.len - 1 - at else at;
-                const lane_at = lane_time(time, op.stagger, first + lane);
+                const lane = if (reversed) out.len - 1 - at else at;
+                const offset = motion_lane_offset(program, op, @intCast(first + lane));
+                const lane_at: Time = .{ .flicks = time.flicks -% offset };
                 out[lane] = motion.sample(op, program.goals, program.cues, cursor, lane_at);
             }
         },

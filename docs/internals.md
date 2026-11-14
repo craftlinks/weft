@@ -426,6 +426,10 @@ a tween or a bounce with `cue_by_lane` starts lane *i* at cue `start + i` of the
 the language writes `at: letters[lane]` over a series written as a list of times. The cue table
 is already read by `eval` and by `events`, so this costs one load and one add a lane, the events
 of a bounce stay solved without stepping, and moving one cue with `Cues.move` moves one lane.
+A spring or a Newtonian move takes the same (step 39) on the only goal of its path, a flag on
+`motion.Goal` that fills its padding: lane *i* is then lane 0's motion moved as much later as its
+cue is, so `motion.zig` never reads the flag and the shared cursor stays exact. A path of two
+goals by lane would give every lane its own fold, and is refused until a client needs it.
 
 The loops over lanes are plain `for` loops over contiguous `f64`, which the compiler vectorises
 on its own. 100,000 lanes of a typical region evaluate in about 2.5 ms.

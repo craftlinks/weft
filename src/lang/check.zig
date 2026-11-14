@@ -197,12 +197,17 @@
 //! `cue_ref` allows it only where the parameter's `by_lane` says, the `at` of the table's `tween`
 //! and `bounce`, and only inside a region whose lane count the series covers; the value is then
 //! `cue_by_lane`, the series' first cue, and the call takes the region's lanes, as a stagger
-//! gives. Everywhere else, a path's goals, `cues(…)`, a cue's declaration, and a client's noun,
-//! it is refused with a hint that names where it belongs, as are a name other than `lane` in
-//! brackets and `stagger:` beside it; an expression in brackets is the parser's refusal. Through a
-//! module's parameter it is checked where it is used, in the caller's frame, so a module of a
-//! tween works by lane unchanged. A series written as a list, `cue title = [1s, 1080ms]`, adds
-//! each item as a cue in time order, so a series need not be evenly spaced.
+//! gives. The `goals` of the table's `spring` and `newtonian` take it too (step 39), as the cue
+//! of a path's only goal written in the call: the goal is then `cue_by_lane`, which a vector
+//! path's every run copies, a path by lane never shares a run with one that is not, and the call
+//! takes the region's lanes. `LanePlace` says where a cue is read. Everywhere else, `cues(…)`, a
+//! cue's declaration, and a client's noun, it is refused with a hint that names where it
+//! belongs, and a path of two goals or more and a declared path each with a hint of its own, as
+//! are a name other than `lane` in brackets and `stagger:` beside it; an expression in brackets
+//! is the parser's refusal. Through a module's parameter, a cue or a whole path, it is checked
+//! where it is used, in the caller's frame, so a module of a tween or a spring works by lane
+//! unchanged. A series written as a list, `cue title = [1s, 1080ms]`, adds each item as a cue in
+//! time order, so a series need not be evenly spaced.
 //!
 //! ## 7. TigerStyle Invariants
 //! - Every array is the caller's; a full one is an error naming its limit, and checking stops.
@@ -360,7 +365,9 @@ pub const Expr = struct {
     };
 };
 
-pub const Goal = struct { cue: u32, value: f64 };
+/// A path's goal: its cue, its value, and whether lane g of the region reads the cue g after it,
+/// `[series[lane]: value]` as a spring's or a Newtonian move's only goal (section 9a).
+pub const Goal = struct { cue: u32, value: f64, cue_by_lane: bool = false };
 
 comptime {
     // A cue's form is kept for each cue of the table (section 4a), so it stays a few words:
@@ -374,6 +381,11 @@ const Timed = struct { flicks: i64, written: CueTime };
 
 /// A cue found by `cue_ref`: its index, or a series' first cue chosen by lane (section 9a).
 const CueRef = struct { index: u32, by_lane: bool = false };
+
+/// Where `cue_ref` reads a cue, which decides whether `series[lane]` is taken there and, if not,
+/// what the refusal says (section 9a): a place that takes it, one that does not, a path of more
+/// than one goal, and a declared path, which is outside any region.
+const LanePlace = enum { taken, refused, path_of_goals, declared_path };
 pub const Region = struct { low: f64, high: f64 };
 
 /// A path's goals or a list of regions. A declared one is a run of its own, even when an equal
@@ -1010,7 +1022,7 @@ const Checker = struct {
         if (value.tag == .list) {
             const children = checker.tree.children(it.a);
             if (children.len > 0 and checker.item(children[0]).tag == .goal) {
-                const path = try checker.path_of(it.a, true);
+                const path = try checker.path_of(it.a, true, false);
                 _ = try checker.declare(index, .{ .name = name, .item = index, .kind = .path, .index = path });
                 return;
             }
@@ -2045,8 +2057,7 @@ const Checker = struct {
             .region => return checker.region orelse 1,
             .stagger => {
                 const at = entry.param("stagger").?;
-                const cue_at = entry.param("at");
-                if (cue_at != null and values[cue_at.?] == .cue_by_lane) {
+                if (checker.call_by_lane(entry, values)) {
                     if (values[at].time != 0) {
                         const diagnostic = checker.fail(items[at], .wrong_lanes, "`stagger:` and a cue chosen by lane both set when each lane starts", .{});
                         error_module.hint(diagnostic, "each lane already starts at its own cue; drop `stagger:`", .{});
@@ -2068,6 +2079,21 @@ const Checker = struct {
             lanes = try checker.joined(index, lanes, checker.lanes_of(value.signal));
         }
         return lanes;
+    }
+
+    /// Whether a call's lanes each start at their own cue (section 9a): a `tween`'s or a
+    /// `bounce`'s `at:` by lane, or the one goal by lane of a `spring`'s or a `newtonian`'s path,
+    /// whose every run, one a component, has the flag.
+    fn call_by_lane(checker: *const Checker, entry: *const Entry, values: []const Value) bool {
+        assert(values.len == entry.params.len);
+        if (entry.param("at")) |at| return values[at] == .cue_by_lane;
+        const goals = entry.param("goals") orelse return false;
+        if (values[goals] != .path) return false;
+        const run = checker.memory.paths[values[goals].path];
+        assert(run.count > 0);
+        const by_lane = checker.memory.goals[run.first].cue_by_lane;
+        if (by_lane) assert(run.count == 1);
+        return by_lane;
     }
 
     /// The shape of `left` and `right` together (section 8): theirs when equal, the other's when
@@ -2206,7 +2232,7 @@ const Checker = struct {
         for (0..count) |k| {
             const first = checker.goal_count;
             for (goals, values, 0..) |goal, value, at| {
-                checker.memory.goals[first + at] = .{ .cue = goal.cue, .value = value[k] };
+                checker.memory.goals[first + at] = .{ .cue = goal.cue, .value = value[k], .cue_by_lane = goal.cue_by_lane };
             }
             checker.goal_count += @intCast(goals.len);
             checker.memory.paths[checker.path_count] = .{
@@ -2303,7 +2329,7 @@ const Checker = struct {
                 // Only the table's own `tween` and `bounce`: a client's entry never gets a cue by
                 // lane, whatever its parameter says, so it never reads `.cue_by_lane`.
                 const by_lane = param.by_lane and (entry.op == .tween or entry.op == .bounce);
-                const found = try checker.cue_ref(index, by_lane);
+                const found = try checker.cue_ref(index, if (by_lane) .taken else .refused);
                 if (found.by_lane) return .{ .cue_by_lane = found.index };
                 return .{ .cue = found.index };
             },
@@ -2317,7 +2343,9 @@ const Checker = struct {
                 return .{ .span = .{ .first = try checker.cue_of(index), .count = 1 } };
             },
             .path => {
-                const path = if (it.tag == .list) try checker.path_of(index, false) else try checker.named_of(index, .path);
+                // As for a cue: only the table's own `spring` and `newtonian` take a goal by lane.
+                const by_lane = param.by_lane and (entry.op == .spring or entry.op == .newtonian);
+                const path = if (it.tag == .list) try checker.path_of(index, false, by_lane) else try checker.named_of(index, .path);
                 if (!param.shaped and !checker.memory.paths[path].shape.eql(Shape.scalar)) {
                     _ = checker.fail(index, .wrong_shape, "`{s}` takes a path of numbers, found one of {s}s", .{ param.name, checker.memory.paths[path].shape.noun()[2..] });
                     return error.Checked;
@@ -2442,19 +2470,19 @@ const Checker = struct {
 
     /// A cue: a cue's name, or an element of a series.
     fn cue_of(checker: *Checker, index: u32) Fail!u32 {
-        const found = try checker.cue_ref(index, false);
+        const found = try checker.cue_ref(index, .refused);
         assert(!found.by_lane);
         return found.index;
     }
 
-    /// A cue as `cue_of` reads it, or, where `by_lane` allows it, `series[lane]` inside a region:
+    /// A cue as `cue_of` reads it, or, where `place` takes it, `series[lane]` inside a region:
     /// the series' first cue, which lane g of the region reads g cues after (section 9a).
-    fn cue_ref(checker: *Checker, index: u32, by_lane: bool) Fail!CueRef {
+    fn cue_ref(checker: *Checker, index: u32, place: LanePlace) Fail!CueRef {
         if (checker.bound(index)) |arg| {
             const saved = checker.frame;
             checker.focus(arg.frame);
             defer checker.focus(saved);
-            return checker.cue_ref(arg.item, by_lane);
+            return checker.cue_ref(arg.item, place);
         }
         const it = checker.item(index);
         if (it.tag == .element) {
@@ -2471,7 +2499,7 @@ const Checker = struct {
                 _ = checker.fail(index, .wrong_type, "`{s}` is a {s}, not a series", .{ name, kind_name(binding.kind) });
                 return error.Checked;
             }
-            if (checker.tree.tokens[it.token].tag == .name) return checker.lane_element(index, name, binding, by_lane);
+            if (checker.tree.tokens[it.token].tag == .name) return checker.lane_element(index, name, binding, place);
             const element = std.fmt.parseInt(u32, checker.text(index), 10) catch binding.count;
             if (element >= binding.count) {
                 _ = checker.fail(index, .out_of_range, "`{s}` has {d} cues, from [0] to [{d}]", .{ name, binding.count, binding.count - 1 });
@@ -2497,7 +2525,7 @@ const Checker = struct {
 
     /// `series[NAME]` (step 28): only `lane`, only where the parameter takes a cue by lane, only
     /// inside a region, and only of a series with a cue for every lane.
-    fn lane_element(checker: *Checker, index: u32, name: []const u8, binding: Binding, by_lane: bool) Fail!CueRef {
+    fn lane_element(checker: *Checker, index: u32, name: []const u8, binding: Binding, place: LanePlace) Fail!CueRef {
         const it = checker.item(index);
         const lane_name = checker.tree.token_text(it.token);
         if (!std.mem.eql(u8, lane_name, "lane")) {
@@ -2505,10 +2533,23 @@ const Checker = struct {
             error_module.hint(diagnostic, "an index is a whole number, or `lane` inside a region", .{});
             return error.Checked;
         }
-        if (!by_lane) {
-            const diagnostic = checker.fail(index, .wrong_lanes, "`{s}[lane]` is a cue for each lane, which this place does not take", .{name});
-            error_module.hint(diagnostic, "a cue chosen by lane starts a `tween` or a `bounce`, as its `at:`", .{});
-            return error.Checked;
+        switch (place) {
+            .taken => {},
+            .refused => {
+                const diagnostic = checker.fail(index, .wrong_lanes, "`{s}[lane]` is a cue for each lane, which this place does not take", .{name});
+                error_module.hint(diagnostic, "a cue by lane is a `tween`'s or `bounce`'s `at:`, or the only goal of a `spring` or `newtonian`", .{});
+                return error.Checked;
+            },
+            .path_of_goals => {
+                const diagnostic = checker.fail(index, .wrong_lanes, "`{s}[lane]` is a cue for each lane, and a path by lane has one goal", .{name});
+                error_module.hint(diagnostic, "write one goal, `[{s}[lane]: 1]`, or give every lane the same path, moved by `stagger:`", .{name});
+                return error.Checked;
+            },
+            .declared_path => {
+                const diagnostic = checker.fail(index, .wrong_lanes, "`{s}[lane]` is a cue for each lane, and a declared path is outside any region", .{name});
+                error_module.hint(diagnostic, "write the path in the call, as `spring([{s}[lane]: 1], …)`, inside `lanes(n, …)`", .{name});
+                return error.Checked;
+            },
         }
         const count = checker.region orelse {
             const diagnostic = checker.fail(index, .wrong_lanes, "`{s}[lane]` is a cue for each lane, so it is used inside `lanes(n, …)`", .{name});
@@ -2523,7 +2564,10 @@ const Checker = struct {
         return .{ .index = binding.index, .by_lane = true };
     }
 
-    fn path_of(checker: *Checker, index: u32, declared: bool) Fail!u32 {
+    /// A path written as a list, declared or inline. Where `by_lane` allows it, its goal's cue may
+    /// be `series[lane]`, when it is the path's only goal (section 9a).
+    fn path_of(checker: *Checker, index: u32, declared: bool, by_lane: bool) Fail!u32 {
+        if (declared) assert(!by_lane);
         const children = checker.tree.children(index);
         if (children.len == 0) {
             _ = checker.fail(index, .wrong_type, "a path has at least one goal", .{});
@@ -2534,6 +2578,7 @@ const Checker = struct {
         var values: [run_max][4]f64 = undefined;
         const fresh = buffer[0..children.len];
         var shape: ?Shape = null;
+        const place: LanePlace = if (declared) .declared_path else if (!by_lane) .refused else if (children.len > 1) .path_of_goals else .taken;
         for (children, fresh, 0..) |child, *goal, at| {
             const it = checker.item(child);
             if (it.tag != .goal) {
@@ -2541,7 +2586,9 @@ const Checker = struct {
                 error_module.hint(diagnostic, "a goal is a cue and a value, such as `c1: 1`", .{});
                 return error.Checked;
             }
-            const cue_index = try checker.cue_of(it.a);
+            const cue = try checker.cue_ref(it.a, place);
+            if (cue.by_lane) assert(place == .taken);
+            const cue_index = cue.index;
             var goal_shape = Shape.scalar;
             if (try checker.constant_vector(it.b)) |vector| {
                 values[at] = vector.values;
@@ -2559,7 +2606,7 @@ const Checker = struct {
                 error_module.hint(diagnostic, "move this goal before the goals at later cues", .{});
                 return error.Checked;
             }
-            goal.* = .{ .cue = cue_index, .value = values[at][0] };
+            goal.* = .{ .cue = cue_index, .value = values[at][0], .cue_by_lane = cue.by_lane };
         }
         const path_shape = shape.?;
         if (path_shape.components > 1) return checker.vector_path(index, fresh, values[0..fresh.len], path_shape, declared);
@@ -2796,10 +2843,15 @@ fn bits(value: f64) u64 {
     return @bitCast(value);
 }
 
-/// Whether two paths hold the same goals, bit for bit, so `-0` never shares with `0`.
+/// Whether two paths hold the same goals, bit for bit, so `-0` never shares with `0`, and
+/// `[s[lane]: 1]` never shares with `[s[0]: 1]`.
 fn same_goals(a: []const Goal, b: []const Goal) bool {
     if (a.len != b.len) return false;
-    for (a, b) |x, y| if (x.cue != y.cue or bits(x.value) != bits(y.value)) return false;
+    for (a, b) |x, y| {
+        if (x.cue != y.cue) return false;
+        if (bits(x.value) != bits(y.value)) return false;
+        if (x.cue_by_lane != y.cue_by_lane) return false;
+    }
     return true;
 }
 

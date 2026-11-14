@@ -398,7 +398,8 @@ motion, at that velocity. A spring is settled once what is left of the move is b
 scale, and from then on it returns its goal exactly; a Newtonian move lands exactly when its plan
 ends. Each motion node keeps a cursor after its output in the slab, `weft.motion.cursor_count` f64,
 so forward play costs one closed form per frame; it is a cache that cannot change a value, and a
-cue move makes it stale. `motion.zig` explains the closed forms and the cursor.
+cue move makes it stale. `motion.zig` explains the closed forms and the cursor. A path's only goal
+may have its cue chosen by lane, `.cue_by_lane = true` (step 39, see Lanes).
 
 ## Simulated Signals
 
@@ -829,9 +830,18 @@ hits = lanes(1000, bounce(0..1, speed: 0.5, at: c0, stagger: 3ms))   # events ca
 
   A cue moved with `Cues.move` moves its lane only. The series needs a cue for every lane, the
   index is `lane` itself (no arithmetic on it), it takes no `stagger:`, and it is the `at` of a
-  `tween` or a `bounce` only; each of these is refused with a hint. In the core it is one field,
-  `cue_by_lane`, on `Tween`, `Bounce`, and `BounceNode`: lane g reads cue `start + g`
-  (`graph.lane_cue`), one load and one add a lane, in `eval` and in `events`.
+  `tween` or a `bounce`, or the only goal of a `spring` or a `newtonian` (step 39); each of these
+  is refused with a hint. In the core it is one field, `cue_by_lane`, on `Tween`, `Bounce`, and
+  `BounceNode`, and on `motion.Goal`: lane g reads cue `start + g` (`graph.lane_cue`), one load
+  and one add a lane, in `eval` and in `events`.
+- **A spring by lane** (step 39): `lanes(3, spring([s[lane]: 1], time: 450ms, overshoot: 0.3))`
+  heads lane g for the goal from cue `s[g]`, bit for bit the one-lane spring at that cue, values
+  and goals reached, and the same for `newtonian`. A row that pops in at uneven times is then
+  Tapestry's `lanes(3, pop(s[lane]))` through its own module, unchanged. The path is one goal: a
+  path of two goals or more with a goal by lane is refused, since the lanes would no longer be
+  one motion moved in time, and so is a declared path by lane, which lies outside any region. It
+  stays exact, adds nothing to a lane's slab, and fills the padding of `motion.Goal`, so no node
+  grows; at 1,000 lanes an eval costs about 2% more than a staggered spring's.
 - **Lanes are checked** where they are written: two counts above 1 meet only when equal, a
   parameter a signal sets takes one value for every lane, regions do not nest, and `lane` and
   `stagger:` belong inside a region, each with an error that says so (`wrong_lanes`). `sample`
@@ -1052,7 +1062,8 @@ solved sources, and that eval alone (step 23); a track write at the playhead at 
 frame's eval, which is what a knob costs from now on; a compile of Play's `signals.weft`; a
 compile of modules nested 8 deep, 511 instances; and a region of a noise, a staggered tween, a
 map, a product, and a staggered bounce at 1,000 and 100,000 lanes, an eval and a frame's events
-per frame; each op's cost a node, 64 nodes of it playing at 60 Hz; a seek back from 600 s with
+per frame; a spring over 1,000 lanes, staggered and then by lane at uneven cues (step 39), the
+same two; each op's cost a node, 64 nodes of it playing at 60 Hz; a seek back from 600 s with
 checkpoints; a pure edit of Play's file at 600 s, compiled, carried, and read; and a reader on its
 own thread at audio pace, a block's events and an eval every 2.667 ms for 5 s, for Play's file
 and the lanes page, with its worst block and the blocks over budget. It is native only and needs

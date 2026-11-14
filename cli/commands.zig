@@ -513,7 +513,8 @@ fn json_entry(writer: *std.Io.Writer, entry: *const schema.Entry) !void {
             if (param.shaped) "true" else "false",
             if (param.positional) "true" else "false",
         });
-        // Only where it is true, the `at` of `tween` and `bounce` (step 28), so no other line moves.
+        // Only where it is true, the `at` of `tween` and `bounce` (step 28) and the `goals` of
+        // `spring` and `newtonian` (step 39), so no other line moves.
         if (param.by_lane) try writer.writeAll(",\"by_lane\":true");
         try writer.writeAll(",\"default\":");
         switch (param.default) {

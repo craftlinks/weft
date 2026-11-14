@@ -411,11 +411,11 @@ const Case = struct {
 
 // Locks section 2's refusals, each with its code, the text it points at, and its hint: outside a
 // region; a name other than `lane`; an expression in the index; a series one cue short, with both
-// counts; `beat[lane]` in a path, `cues(…)`, a cue's own declaration, and a tween's `after`-less
-// cue through a noun's parameter; `stagger:` beside it; regions nested; a cue that is not a series;
-// and a list series empty or out of order.
+// counts; `beat[lane]` in a path of two goals (step 39 takes one, `test/motion_by_lane.zig`),
+// `cues(…)`, and a cue's own declaration; `stagger:` beside it; regions nested; a cue that is not
+// a series; and a list series empty or out of order.
 test "every refusal of a cue by lane, with its hint" {
-    const by_lane_hint = "a cue chosen by lane starts a `tween` or a `bounce`, as its `at:`";
+    const by_lane_hint = "a cue by lane is a `tween`'s or `bounce`'s `at:`, or the only goal of a `spring` or `newtonian`";
     const index_hint = "declare the cues the lanes want, `cue NAME = [1s, 1200ms]`, then write `NAME[lane]`";
     const cases = [_]Case{
         .{ .text = "x = tween(from: 0, to: 1, at: beat[lane], over: 1s)\n", .code = .wrong_lanes, .at = "beat[lane]", .hint = "wrap the call in a region, such as `lanes(4, …)`" },
@@ -423,7 +423,7 @@ test "every refusal of a cue by lane, with its hint" {
         .{ .text = "x = lanes(4, tween(from: 0, to: 1, at: beat[lane + 1], over: 1s))\n", .code = .unexpected_token, .at = "+", .hint = index_hint },
         .{ .text = "x = lanes(4, tween(from: 0, to: 1, at: beat[2 * lane], over: 1s))\n", .code = .unexpected_token, .at = "*", .hint = index_hint },
         .{ .text = "x = lanes(5, tween(from: 0, to: 1, at: beat[lane], over: 1s))\n", .code = .wrong_lanes, .at = "beat[lane]", .hint = "give the series a cue for every lane, or the region fewer lanes" },
-        .{ .text = "x = lanes(4, spring([beat[lane]: 1], time: 1s))\n", .code = .wrong_lanes, .at = "beat[lane]", .hint = by_lane_hint },
+        .{ .text = "x = lanes(4, spring([beat[lane]: 1, beat[3]: 0], time: 1s))\n", .code = .wrong_lanes, .at = "beat[lane]", .hint = "write one goal, `[beat[lane]: 1]`, or give every lane the same path, moved by `stagger:`" },
         .{ .text = "x = lanes(4, cues(beat[lane]))\n", .code = .wrong_lanes, .at = "beat[lane]", .hint = by_lane_hint },
         .{ .text = "cue c = beat[lane]\n", .code = .wrong_lanes, .at = "beat[lane]", .hint = by_lane_hint },
         .{ .text = "cue c = beat[lane] + 10ms\n", .code = .wrong_lanes, .at = "beat[lane]", .hint = by_lane_hint },
@@ -462,7 +462,7 @@ test "a client's cue parameter refuses a cue by lane" {
     failing.compile_client(&score.nouns, &.{}, text) catch {
         const found = failing.errors()[0];
         try testing.expectEqual(weft.lang.diagnostic.Code.wrong_lanes, found.code);
-        try testing.expectEqualStrings("a cue chosen by lane starts a `tween` or a `bounce`, as its `at:`", found.hint_text());
+        try testing.expectEqualStrings("a cue by lane is a `tween`'s or `bounce`'s `at:`, or the only goal of a `spring` or `newtonian`", found.hint_text());
         try compile_client_ok("cue beat = [1s, 2s, 3s]\nn = say(beat[2], \"line\")\n");
         return;
     };
