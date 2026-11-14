@@ -914,7 +914,10 @@ $ weft sample play/signals.weft --to 1 --step 0.5 --signal wave
   region adds `a lane costs N of the slab`. A `Compiled` at the default `Limits` is about 1 MB
   whatever the file, so a client short of static memory sizes one from this line.
 - **`sample`** allocates its reader's slab, so a file of any slab size can be sampled (v0.1.0's
-  command held 262,144 values). `--events NAME` keeps the events of the signal bound to NAME,
+  command held 262,144 values). One reader walks the window once for every signal it names and
+  for the events (step 38), so a stepped file costs one replay, not one a signal. The walk keeps
+  the values in a static buffer of 65,536 values (512 KiB); signals that do not fit together
+  take another walk, and a signal larger than the buffer alone is written as it is read. `--events NAME` keeps the events of the signal bound to NAME,
   from the nodes `Compiled.event_sources` gives, so a region's bounce with no stagger and a
   vector's spring keep theirs (step 23), and `--lanes A..B` keeps lanes A to B, both included, of every signal and event of a region:
   each such signal gains `"lane_first"`. Every signal says `"bounded"`, false when its range has
