@@ -216,7 +216,7 @@ src/
     token.zig         the tokenizer
     parse.zig         the parser and its flat tree
     schema.zig        the table of primitives
-    check.zig         names, order, types, defaults, and seeds
+    check.zig         names, order, types, defaults, seeds, and where a number is written
     graph.zig         the back end: checked declarations to a Program
     format.zig        the canonical format
     error.zig         diagnostics and suggestions
@@ -238,6 +238,7 @@ test/
   division.zig        a quotient by a number against the product with its reciprocal, and refusals
   functions.zig       the functions of a value, clamp, quantize: building, folding, ranges, refusals
   chains.zig          a tween chain with `from` left out against the chain written out
+  forms.zig           a cue's form, a track's numbers, and the time literal's reader and writer
   golden/signals.txt  the committed samples
   golden/cli/         the weft command's committed output
 tools/
@@ -920,6 +921,53 @@ while (each.next()) |noun| {
 
   `For(…).check` and `For(…).sample` compile as `commands.check` and `commands.sample` do, which
   are `For(commands.limits)`'s. A limit error names the client's number.
+
+## Writing a Number Back
+
+A client that edits its own text, a knob that turns a track, a slider, a retime that lengthens
+a beat, asks Weft where the number is and how it is written, instead of walking the syntax tree
+and mirroring the checker's grammar. Weft never edits the text. The loop is four steps:
+
+1. **The form.** `compiled.cue_form(index)` says what the declaration of a cue of the table is
+   made of, a tagged value to switch on:
+
+   | Written | `CueForm` | `CueTime` |
+   |---|---|---|
+   | `cue a = 2s` | `.alone` | `.literal`: the literal |
+   | `cue b = a`, `cue b = bar[2]` | `.alone` | `.cue`: the cue's index |
+   | `cue c = a + 500ms` | `.alone` | `.after`: the base cue's index, and the literal |
+   | `cue s = [1s, a + 80ms]` | `.listed`: the item's place, and its time | any of the three |
+   | `cue bar = 0s..10s every 2s` | `.every`: the place, `from`, `to`, and `step` | the ends |
+
+   `form.written()` is the time a cue's own text writes, and null for a cue of an `every`
+   series, which has none of its own. A literal is a `TimeLiteral`: its token's bytes (`start`,
+   `len`, digits and unit), its `unit`, its `flicks`, and `negative`, a minus before it, which is
+   the parser's and not in the bytes.
+
+   `compiled.track_form(name)` gives a track's value and its two bounds, each a `NumberForm`: its
+   bytes, a minus included, and its kind. Only `plain` (`1`, `1.00`, `-0.5`) is a literal whose
+   digits are the number's, which `form.value.plain()` returns; `exponent` (`1e3`) and `folded`
+   (`2 * 0.25`, `0..tau`, which the checker folds) are numbers a client must not step digit by
+   digit. `Syntax.track_form(name)` reads the tree alone, so a knob stays bound while another line
+   has an error; there `other` is anything the checker would refuse.
+2. **The span.** The client replaces those bytes in its own copy of the text, and nothing else.
+3. **The writer.** `weft.lang.write_time(&buffer, flicks, .ms)` is the shortest literal in a
+   unit that reads back to exactly those flicks: `7s`, `6500ms`, `2.08ms`. It returns null for
+   a time no literal holds (one 441 does not divide) and for a negative one. `read_time(text)` is
+   the checker's own reader, the inverse. A number literal is written by the client's own
+   writer, such as Patchwork's `editor.literal`.
+4. **The reload.** The client compiles the new text, which checks the edit: a cue lands where the
+   checker's sum puts it, or the text is refused.
+
+```zig
+const offset = compiled.cue_form(b2).?.alone.after.offset;   // `cue b2 = b1 + 6s`
+var literal: [weft.lang.time_text_max]u8 = undefined;
+const written = weft.lang.write_time(&literal, 6500 * ms, .ms).?;   // "6500ms"; ".s" gives "6.5s"
+// text[0..offset.start] ++ written ++ text[offset.start + offset.len ..], then compile again
+```
+
+A moved cue does not carry what is written after it (`Cues.move` moves one time): rewriting the
+text and compiling again is what moves a beat and every cue written against it.
 
 ## The weft Command
 

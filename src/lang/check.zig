@@ -69,10 +69,31 @@
 //! default may fold too, from numbers and the two names, so long as neither is one of its
 //! parameters, since a default that read a parameter would stand for itself (section 6).
 //!
+//! ## 3c. Where a Number Is Written
+//! A client that writes a number back into the text (step 41), as a knob or a slider does,
+//! needs its bytes, and needs to know they are a literal. `number_form` says how an item of the
+//! file's own declarations is written: `plain`, a number literal of digits, an optional fraction,
+//! and an optional minus, `-0.5`, the one kind whose digits are the number's; `exponent`,
+//! `1e3`; `folded`, what section 3b folds, `2 * 0.25` or `tau`; and `other`, anything else.
+//! Each comes with its bytes from its first token to its last, a minus included. It reads the
+//! tree alone, through `folds_alone` with the file's shadowing, which at the file's frame is
+//! `folds` itself, so it answers for a file that does not check, and a file that checks never
+//! has `other` where a number is due: the checker asserts so at each track. `track_form` gives a
+//! track's three, its value and its bounds.
+//!
 //! ## 4. Times
 //! A time literal is a whole number of flicks, worked out in integers from its digits: seconds
 //! are exact to 5 decimal places and milliseconds to 2, since 705,600,000 = 2^9 3^2 5^5 7^2.
 //! Anything finer is refused with the nearest whole flick, so a bounce's hits stay exact.
+//!
+//! `read_time` is the one reader, public (step 41): a literal token's text, digits and `s` or
+//! `ms`, to its flicks, or what it is instead (not whole, an exponent, too large, not a time).
+//! The checker reads its own literals through it. `write_time` is its inverse: the shortest
+//! literal in a unit that reads back to exactly a number of flicks, with the fewest decimal
+//! places that hold it, read back before it is returned. A number of flicks has a literal, in
+//! either unit, exactly when 441 = 3^2 7^2 divides it, since the rest of a second's and a
+//! millisecond's factors are 2s and 5s, which decimal places hold; any other, and a negative
+//! one, whose minus is the parser's, is refused.
 //!
 //! ## 4a. A Cue After a Cue
 //! A cue's time is a time literal, or an earlier cue plus one: `cue hit = b2 + 500ms` (step 29).
@@ -81,6 +102,14 @@
 //! before: `Cues.move` on the first cue does not move the second, since the program keeps no
 //! link between them. Cues stay in time order however they are written, which is why there is
 //! no minus: a cue before the cue it names would be above it in the file.
+//!
+//! What each cue is written as is kept beside its time, in `Checked.cue_forms` (step 41), for a
+//! client that writes a cue's time back, such as a retime: a `CueForm`, the cue declared alone,
+//! an item of a list with its place, or a cue of a series spaced `every` a step with its place
+//! and the series' ends and step. A time is a `CueTime`: a literal, an earlier cue by its index
+//! in the table, or both. A literal is a `TimeLiteral`: its token's bytes, its unit, its flicks,
+//! and whether the parser's minus is before it. The form holds indexes and byte spans only, one
+//! for each cue of the table, so `Limits.cues` bounds it. The program reads none of it.
 //!
 //! ## 5. Seeds
 //! An explicit `seed:` wins. Otherwise a call's seed is the FNV-1a hash of its declaration's name,
@@ -333,6 +362,16 @@ pub const Expr = struct {
 
 pub const Goal = struct { cue: u32, value: f64 };
 
+comptime {
+    // A cue's form is kept for each cue of the table (section 4a), so it stays a few words:
+    // 120 bytes on a 64-bit target, 512 cues at the default limits.
+    assert(@sizeOf(TimeLiteral) <= 24);
+    assert(@sizeOf(CueForm) <= 120);
+}
+
+/// A cue's time as `cue_time` reads it: its flicks, and how it is written (section 4a).
+const Timed = struct { flicks: i64, written: CueTime };
+
 /// A cue found by `cue_ref`: its index, or a series' first cue chosen by lane (section 9a).
 const CueRef = struct { index: u32, by_lane: bool = false };
 pub const Region = struct { low: f64, high: f64 };
@@ -353,6 +392,67 @@ pub const Track = struct {
     low: f64,
     high: f64,
     item: u32,
+};
+
+/// A time literal as a cue's declaration writes it (section 4a): the bytes of its token, the
+/// digits and the unit `read_time` reads and `write_time` writes, and what they read as. A minus
+/// before the token is the parser's, a token of its own, so it is `negative` and not in the
+/// bytes: the cue's sum takes away `flicks` then.
+pub const TimeLiteral = struct {
+    flicks: i64,
+    start: u32,
+    len: u32,
+    unit: TimeUnit,
+    negative: bool,
+
+    /// What the literal adds to the cue's sum: `flicks`, its minus applied.
+    pub fn signed(literal: TimeLiteral) i64 {
+        assert(literal.flicks >= 0);
+        return if (literal.negative) -literal.flicks else literal.flicks;
+    }
+
+    /// The token's bytes in `source`, the file the cue is declared in.
+    pub fn text(literal: TimeLiteral, source: []const u8) []const u8 {
+        assert(literal.start + literal.len <= source.len);
+        return source[literal.start..][0..literal.len];
+    }
+};
+
+/// How one cue's time is written (section 4a): a time literal, `2s`; an earlier cue alone, `a`
+/// or `bar[2]`, by its index in the cue table; or an earlier cue and a literal after it,
+/// `a + 500ms`.
+pub const CueTime = union(enum) {
+    literal: TimeLiteral,
+    cue: u32,
+    after: After,
+
+    pub const After = struct { base: u32, offset: TimeLiteral };
+};
+
+/// What a cue's declaration is made of (section 4a), for a client that writes a cue's time back
+/// into the text: `Compiled.cue_form`. A cue declared alone, `cue a = …`, a cue of a series
+/// written as a list, `cue s = [1s, a + 80ms]`, and a cue of a series spaced `every` a step,
+/// `cue bar = 0s..600s every 2s`, whose cues are the series' ends and step, not a time of their
+/// own.
+pub const CueForm = union(enum) {
+    alone: CueTime,
+    listed: Listed,
+    every: Every,
+
+    /// Item `element` of the list, and how that item is written.
+    pub const Listed = struct { element: u32, time: CueTime };
+    /// Cue `element` of the series, `from + element * step`, and how the series is written.
+    pub const Every = struct { element: u32, from: CueTime, to: CueTime, step: TimeLiteral };
+
+    /// The time a cue's own text writes: the cue's declaration's, or its item's of a list. Null
+    /// for a cue of a series spaced `every` a step, which has no text of its own.
+    pub fn written(form: CueForm) ?CueTime {
+        return switch (form) {
+            .alone => |time| time,
+            .listed => |listed| listed.time,
+            .every => null,
+        };
+    }
 };
 
 pub const Binding = struct {
@@ -388,6 +488,8 @@ pub const Memory = struct {
     value_items: []u32,
     exprs: []Expr,
     cue_times: []i64,
+    /// What each cue of the table is written as (section 4a), as long as `cue_times`.
+    cue_forms: []CueForm,
     goals: []Goal,
     paths: []Run,
     regions: []Region,
@@ -407,6 +509,8 @@ pub const Checked = struct {
     /// The cue simulated nodes start at.
     start: u32,
     cue_times: []const i64,
+    /// What each cue's declaration is made of (section 4a), one for each of `cue_times`.
+    cue_forms: []const CueForm,
     bindings: []const Binding,
     declarations: []const Declaration,
     calls: []const Call,
@@ -707,8 +811,8 @@ const Checker = struct {
             },
             .cue => {
                 if (checker.item(it.a).tag == .list) return checker.cue_list(index);
-                const time = try checker.cue_time(it.a);
-                const cue = try checker.add_cue(index, time);
+                const timed = try checker.cue_time(it.a);
+                const cue = try checker.add_cue(index, timed.flicks, .{ .alone = timed.written });
                 _ = try checker.declare(index, .{ .name = name, .item = index, .kind = .cue, .index = cue });
             },
             .cue_series => try checker.cue_series(index),
@@ -723,6 +827,12 @@ const Checker = struct {
                 if (checker.track_count == checker.memory.tracks.len) {
                     return checker.limit(index, "tracks", .tracks, checker.memory.tracks.len);
                 }
+                // What the checker folded, `number_form` reads as a number: the form a client
+                // is given (section 3c) agrees with the value, and is never `other`.
+                const form = track_form(checker.root, index).?;
+                assert(form.value.kind != .other);
+                assert(form.low.kind != .other);
+                assert(form.high.kind != .other);
                 const track = checker.track_count;
                 checker.memory.tracks[track] = .{ .initial = initial, .low = bounds[0], .high = bounds[1], .item = index };
                 checker.track_count += 1;
@@ -734,7 +844,9 @@ const Checker = struct {
         }
     }
 
-    fn add_cue(checker: *Checker, index: u32, time: i64) Fail!u32 {
+    fn add_cue(checker: *Checker, index: u32, time: i64, form: CueForm) Fail!u32 {
+        assert(checker.frame == 0);
+        assert(checker.cue_count <= checker.memory.cue_forms.len);
         if (checker.cue_count > 0) {
             const previous = checker.memory.cue_times[checker.cue_count - 1];
             if (time < previous) {
@@ -748,16 +860,21 @@ const Checker = struct {
         }
         const cue = checker.cue_count;
         checker.memory.cue_times[cue] = time;
+        checker.memory.cue_forms[cue] = form;
         checker.cue_count += 1;
         return cue;
     }
 
     /// A cue's time (section 4a): a time literal, an earlier cue, or that cue plus a time
-    /// literal.
-    fn cue_time(checker: *Checker, index: u32) Fail!i64 {
+    /// literal, with how it is written.
+    fn cue_time(checker: *Checker, index: u32) Fail!Timed {
+        assert(checker.frame == 0);
         const it = checker.item(index);
         switch (it.tag) {
-            .name, .element => return checker.memory.cue_times[try checker.cue_of(index)],
+            .name, .element => {
+                const cue = try checker.cue_of(index);
+                return .{ .flicks = checker.memory.cue_times[cue], .written = .{ .cue = cue } };
+            },
             .subtract => {
                 const diagnostic = checker.fail(index, .cue_out_of_order, "a cue comes at or after the cue it names, so there is no minus", .{});
                 error_module.hint(diagnostic, "declare this cue first, and write the other as this one plus a time", .{});
@@ -770,15 +887,46 @@ const Checker = struct {
                     error_module.hint(diagnostic, "for example `cue hit = beat + 500ms`", .{});
                     return error.Checked;
                 }
-                const base = checker.memory.cue_times[try checker.cue_of(it.a)];
-                const offset = try checker.literal_time(it.b);
-                return std.math.add(i64, base, offset) catch {
+                const base = try checker.cue_of(it.a);
+                const offset = try checker.time_literal(it.b);
+                const base_flicks = checker.memory.cue_times[base];
+                const flicks = std.math.add(i64, base_flicks, offset.signed()) catch {
                     _ = checker.fail(index, .out_of_range, "this cue's time is past what a time holds", .{});
                     return error.Checked;
                 };
+                const after: CueTime.After = .{ .base = base, .offset = offset };
+                return .{ .flicks = flicks, .written = .{ .after = after } };
             },
-            else => return checker.literal_time(index),
+            else => {
+                const literal = try checker.time_literal(index);
+                return .{ .flicks = literal.signed(), .written = .{ .literal = literal } };
+            },
         }
+    }
+
+    /// A time literal of a cue's declaration (section 4a), with its token's bytes, so a client
+    /// can find it again: `literal_time`'s flicks, split from the parser's minus.
+    fn time_literal(checker: *Checker, index: u32) Fail!TimeLiteral {
+        assert(checker.frame == 0);
+        assert(checker.tree == checker.root);
+        const flicks = try checker.literal_time(index);
+        const it = checker.item(index);
+        assert(it.tag == .literal);
+        const token = checker.tree.tokens[it.token];
+        assert(token.tag == .time);
+        const in_ms = token_module.unit_of(token, checker.source()) == .ms;
+        const unit: TimeUnit = if (in_ms) .ms else .s;
+        const negative = it.a == 1;
+        const literal: TimeLiteral = .{
+            .flicks = if (negative) -flicks else flicks,
+            .start = token.start,
+            .len = token.len,
+            .unit = unit,
+            .negative = negative,
+        };
+        assert(literal.flicks >= 0);
+        assert(literal.signed() == flicks);
+        return literal;
     }
 
     /// A series written as a list (step 28): each item a cue's time as `cue_time` reads it, in
@@ -796,13 +944,15 @@ const Checker = struct {
         }
         const first = checker.cue_count;
         for (children, 0..) |child, at| {
-            const time = try checker.cue_time(child);
+            const timed = try checker.cue_time(child);
+            const time = timed.flicks;
             if (at > 0 and time < checker.memory.cue_times[checker.cue_count - 1]) {
                 const diagnostic = checker.fail(child, .cue_out_of_order, "a series' cues are in time order, and this one is before the one before it", .{});
                 error_module.hint(diagnostic, "write the list in time order", .{});
                 return error.Checked;
             }
-            _ = try checker.add_cue(child, time);
+            const listed: CueForm.Listed = .{ .element = @intCast(at), .time = timed.written };
+            _ = try checker.add_cue(child, time, .{ .listed = listed });
         }
         assert(checker.cue_count - first == children.len);
         _ = try checker.declare(index, .{
@@ -816,9 +966,12 @@ const Checker = struct {
 
     fn cue_series(checker: *Checker, index: u32) Fail!void {
         const it = checker.item(index);
-        const from = try checker.cue_time(it.a);
-        const to = try checker.cue_time(checker.tree.extra[it.b]);
-        const every = try checker.literal_time(checker.tree.extra[it.b + 1]);
+        const from_timed = try checker.cue_time(it.a);
+        const to_timed = try checker.cue_time(checker.tree.extra[it.b]);
+        const step = try checker.time_literal(checker.tree.extra[it.b + 1]);
+        const from = from_timed.flicks;
+        const to = to_timed.flicks;
+        const every = step.signed();
         if (every <= 0 or to < from or @rem(to - from, every) != 0) {
             const diagnostic = checker.fail(index, .bad_series, "a series' step must be above 0s and divide its span exactly", .{});
             error_module.hint(diagnostic, "for example `0s..600s every 2s`, which is 301 cues", .{});
@@ -829,8 +982,18 @@ const Checker = struct {
             return checker.limit(index, "cues", .cues, checker.memory.cue_times.len);
         }
         const count: u32 = @intCast(count_wide);
-        const first = try checker.add_cue(index, from);
-        for (1..count) |step| _ = try checker.add_cue(index, from + every * @as(i64, @intCast(step)));
+        var form: CueForm.Every = .{
+            .element = 0,
+            .from = from_timed.written,
+            .to = to_timed.written,
+            .step = step,
+        };
+        const first = try checker.add_cue(index, from, .{ .every = form });
+        for (1..count) |element| {
+            form.element = @intCast(element);
+            const time = from + every * @as(i64, @intCast(element));
+            _ = try checker.add_cue(index, time, .{ .every = form });
+        }
         _ = try checker.declare(index, .{
             .name = checker.tree.token_text(it.token),
             .item = index,
@@ -1548,7 +1711,7 @@ const Checker = struct {
         for (params) |param| {
             const default = tree.item(param).a;
             if (default == 0 or tree.item(default - 1).tag == .literal) continue;
-            if (default_folds(tree, default - 1, params, 0)) continue;
+            if (folds_alone(tree, default - 1, params, false, 0)) continue;
             const diagnostic = checker.fail(report, .wrong_type, "the default of `{s}` in {s} is not a literal", .{ tree.text(param), name });
             error_module.hint(diagnostic, "a default is a number, a time, or a frequency, such as `0.25s`", .{});
             return error.Checked;
@@ -2609,12 +2772,12 @@ const Checker = struct {
             }
             return error.Checked;
         }
-        const unit = token_module.unit_of(token.?, checker.source());
-        const digits = token_module.digits_of(token.?, checker.source());
-        const unit_flicks: u128 = if (unit == .ms) @divExact(flicks_per_second, 1000) else flicks_per_second;
-        const result = time_flicks(digits, unit_flicks);
+        // The one reader of a time literal, the public one (section 4). A time token is digits,
+        // a fraction, an exponent, and `s` or `ms`, so it is never `not_time`.
+        const result = read_time(token.?.text(checker.source()));
         switch (result) {
             .flicks => |flicks| return if (it.a == 1) -flicks else flicks,
+            .not_time => unreachable,
             .exponent => {
                 const diagnostic = checker.fail(index, .wrong_type, "a time is written without an exponent", .{});
                 error_module.hint(diagnostic, "write its digits, such as `0.001s` or `1ms`", .{});
@@ -2675,15 +2838,98 @@ fn same_regions(a: []const Region, b: []const Region) bool {
     return true;
 }
 
-const TimeResult = union(enum) {
-    flicks: i64,
-    not_whole: i64,
-    exponent,
-    too_large,
+/// A time literal's unit (section 4).
+pub const TimeUnit = enum {
+    s,
+    ms,
+
+    /// The flicks in one of the unit.
+    pub fn flicks(unit: TimeUnit) u128 {
+        return switch (unit) {
+            .s => flicks_per_second,
+            .ms => @divExact(flicks_per_second, 1000),
+        };
+    }
 };
 
-/// Digits such as `2.5` in units of `unit_flicks`, exactly (section 4).
-fn time_flicks(digits: []const u8, unit_flicks: u128) TimeResult {
+/// What `read_time` makes of a time literal's text (section 4).
+pub const TimeRead = union(enum) {
+    /// The literal's flicks, exactly.
+    flicks: i64,
+    /// Not a whole number of flicks: the nearest whole flick.
+    not_whole: i64,
+    /// Written with an exponent, such as `1e3ms`, which a time never is.
+    exponent,
+    /// Past what an `i64` of flicks holds, or more places than `time_places_max`.
+    too_large,
+    /// Not a time literal's text: no unit, a sign, a space, or any other byte.
+    not_time,
+};
+
+/// The most decimal places a time literal is read with, and written with (section 4).
+pub const time_places_max = 18;
+/// The longest text `write_time` writes: 14 whole digits of milliseconds, a point, 6 places,
+/// and `ms`, for the largest `i64` of flicks; 22 in seconds.
+pub const time_text_max = 24;
+
+/// The flicks of a time literal's text, `6500ms` or `2.08ms`, as the checker reads it (section
+/// 4): the token's text, digits and unit, with no sign, since a minus before a literal is the
+/// parser's. The checker's own literals are read by this function.
+pub fn read_time(text: []const u8) TimeRead {
+    assert(text.len <= std.math.maxInt(u32));
+    const unit: TimeUnit = if (std.mem.endsWith(u8, text, "ms"))
+        .ms
+    else if (std.mem.endsWith(u8, text, "s"))
+        .s
+    else
+        return .not_time;
+    const digits = text[0 .. text.len - @tagName(unit).len];
+    switch (number_shape(digits)) {
+        .plain => {},
+        .exponent => return .exponent,
+        .none => return .not_time,
+    }
+    const result = time_flicks(digits, unit.flicks());
+    if (result == .flicks) assert(result.flicks >= 0);
+    return result;
+}
+
+/// The shortest time literal in `unit` that `read_time` reads back as exactly `flicks`, into
+/// `out` (section 4): the fewest decimal places that hold it, so no zero ends a fraction. Null
+/// for a negative time, whose minus is the parser's, and for one no literal in `unit` holds
+/// exactly, such as 1 flick.
+pub fn write_time(out: *[time_text_max]u8, flicks: i64, unit: TimeUnit) ?[]const u8 {
+    if (flicks < 0) return null;
+    const unit_flicks = unit.flicks();
+    const value: u128 = @intCast(flicks);
+    var places: u32 = 0;
+    var scale: u128 = 1;
+    // Bounded by `time_places_max`: 10^18 times the largest i64 still fits a u128.
+    while (value * scale % unit_flicks != 0) {
+        if (places == time_places_max) return null;
+        places += 1;
+        scale *= 10;
+    }
+    const mantissa = value * scale / unit_flicks;
+    const fraction = mantissa % scale;
+    if (places > 0) assert(fraction % 10 != 0);
+    var writer: std.Io.Writer = .fixed(out);
+    writer.print("{d}", .{mantissa / scale}) catch return null;
+    if (places > 0) writer.print(".{d:0>[1]}", .{ fraction, places }) catch return null;
+    writer.writeAll(@tagName(unit)) catch return null;
+    const text = writer.buffered();
+    // The inverse, checked: a literal the reader would refuse is not written.
+    const back = read_time(text);
+    if (back != .flicks) return null;
+    if (back.flicks != flicks) return null;
+    return text;
+}
+
+/// Digits such as `2.5` in units of `unit_flicks`, exactly (section 4). `read_time` has checked
+/// the digits' shape.
+fn time_flicks(digits: []const u8, unit_flicks: u128) TimeRead {
+    assert(number_shape(digits) == .plain);
+    assert(unit_flicks > 0);
     var mantissa: u128 = 0;
     var places: u32 = 0;
     var fraction = false;
@@ -2692,11 +2938,11 @@ fn time_flicks(digits: []const u8, unit_flicks: u128) TimeResult {
             fraction = true;
             continue;
         }
-        if (!std.ascii.isDigit(byte)) return .exponent;
+        assert(std.ascii.isDigit(byte));
         if (mantissa > std.math.maxInt(u64)) return .too_large;
         mantissa = mantissa * 10 + (byte - '0');
         if (fraction) places += 1;
-        if (places > 18) return .too_large;
+        if (places > time_places_max) return .too_large;
     }
     const scale = std.math.powi(u128, 10, places) catch return .too_large;
     const numerator = mantissa * unit_flicks;
@@ -2705,6 +2951,36 @@ fn time_flicks(digits: []const u8, unit_flicks: u128) TimeResult {
     if (numerator % scale == 0) return .{ .flicks = @intCast(whole) };
     const rounded = (numerator + scale / 2) / scale;
     return .{ .not_whole = @intCast(@min(rounded, std.math.maxInt(i64))) };
+}
+
+/// The shape of a literal's digits, its unit cut off: `plain` for digits with an optional point
+/// and fraction, `2.5`; `exponent` for those followed by an exponent, `1e3`, `2.5E-2`; `none`
+/// for anything else. A number token's text is always `plain` or `exponent` (`token.zig`).
+const DigitShape = enum { plain, exponent, none };
+
+fn number_shape(digits: []const u8) DigitShape {
+    var at: usize = digit_run(digits, 0);
+    if (at == 0) return .none;
+    if (at < digits.len and digits[at] == '.') {
+        const end = digit_run(digits, at + 1);
+        if (end == at + 1) return .none;
+        at = end;
+    }
+    if (at == digits.len) return .plain;
+    if (digits[at] != 'e' and digits[at] != 'E') return .none;
+    at += 1;
+    if (at < digits.len and (digits[at] == '+' or digits[at] == '-')) at += 1;
+    const end = digit_run(digits, at);
+    if (end == at or end != digits.len) return .none;
+    return .exponent;
+}
+
+/// The index after the run of digits from `from`.
+fn digit_run(bytes: []const u8, from: usize) usize {
+    assert(from <= bytes.len);
+    var at = from;
+    while (at < bytes.len and std.ascii.isDigit(bytes[at])) at += 1;
+    return at;
 }
 
 fn parse_float(digits: []const u8) ?f64 {
@@ -2767,11 +3043,13 @@ fn declares_name(tree: *const Tree, name: []const u8) bool {
     return false;
 }
 
-/// Whether a module's default, `index` in `tree`, folds to a number on its own (section 3b):
-/// numbers, `pi`, and `tau` with arithmetic, where neither name is one of the module's `params`,
-/// since a default that read a parameter would stand for itself. `depth` bounds the walk as
-/// the parser bounds the nesting.
-fn default_folds(tree: *const Tree, index: u32, params: []const u32, depth: u32) bool {
+/// Whether `index` in `tree` folds to a number on its own (section 3b): numbers, `pi`, and
+/// `tau` with arithmetic, where neither name is one of `params` nor, when `file` is set, a
+/// name the file declares. A module's default passes its parameters, since a default that read
+/// a parameter would stand for itself, and no `file`, since a body never sees the file's names;
+/// an item of the file's own declarations passes no parameters and `file`, which is `folds` at
+/// the file's frame. `depth` bounds the walk as the parser bounds the nesting.
+fn folds_alone(tree: *const Tree, index: u32, params: []const u32, file: bool, depth: u32) bool {
     assert(index < tree.items.len);
     assert(depth <= parse_module.depth_max * 2);
     if (depth == parse_module.depth_max * 2) return false;
@@ -2784,15 +3062,99 @@ fn default_folds(tree: *const Tree, index: u32, params: []const u32, depth: u32)
             for (params) |param| {
                 if (std.mem.eql(u8, tree.token_text(tree.item(param).token), name)) return false;
             }
+            if (file and declares_name(tree, name)) return false;
             return true;
         },
-        .paren, .negate => return default_folds(tree, it.a, params, depth + 1),
+        .paren, .negate => return folds_alone(tree, it.a, params, file, depth + 1),
         .add, .subtract, .multiply, .divide => {
-            if (!default_folds(tree, it.a, params, depth + 1)) return false;
-            return default_folds(tree, it.b, params, depth + 1);
+            if (!folds_alone(tree, it.a, params, file, depth + 1)) return false;
+            return folds_alone(tree, it.b, params, file, depth + 1);
         },
         else => return false,
     }
+}
+
+/// Bytes of a file's text: `source[start..][0..len]`.
+pub const Bytes = struct {
+    start: u32,
+    len: u32,
+
+    pub fn end(bytes: Bytes) u32 {
+        return bytes.start + bytes.len;
+    }
+
+    pub fn of(bytes: Bytes, source: []const u8) []const u8 {
+        assert(bytes.end() <= source.len);
+        return source[bytes.start..][0..bytes.len];
+    }
+};
+
+/// How a number of a file is written where one fixed when the program is built is due (section
+/// 3c), and its bytes, a minus included, from its first token to its last.
+pub const NumberForm = struct {
+    kind: Kind,
+    bytes: Bytes,
+
+    pub const Kind = enum {
+        /// A number literal of digits, with an optional point and fraction, and an optional
+        /// minus: `1`, `1.00`, `-0.5`. The only kind whose digits are the number's.
+        plain,
+        /// A number literal with an exponent, `1e3` or `-2.5e-1`.
+        exponent,
+        /// Arithmetic of numbers, `pi`, or `tau`, which the checker folds: `2 * 0.25`, `tau`,
+        /// `(1)`, `-pi`.
+        folded,
+        /// Anything else, which the checker refuses, so only a file that does not check has it.
+        other,
+    };
+
+    /// The bytes of a plain literal, the one kind a client may rewrite digit for digit; null
+    /// for any other kind.
+    pub fn plain(form: NumberForm) ?Bytes {
+        return if (form.kind == .plain) form.bytes else null;
+    }
+};
+
+/// A track's three numbers, `track a = 1 in 0.25..2`, as `number_form` reads them.
+pub const TrackForm = struct { value: NumberForm, low: NumberForm, high: NumberForm };
+
+/// How the number at `index` is written (section 3c). `index` is an item of the file's own
+/// declarations, outside a module, so `pi` and `tau` are the language's unless the file
+/// declares the name. It reads the tree alone, so it answers for a file that does not check.
+pub fn number_form(tree: *const Tree, index: u32) NumberForm {
+    assert(index < tree.items.len);
+    const it = tree.item(index);
+    const first = tree.tokens[it.first];
+    const last = tree.tokens[it.last];
+    assert(last.start + last.len >= first.start);
+    const bytes: Bytes = .{ .start = first.start, .len = last.start + last.len - first.start };
+    const token = tree.tokens[it.token];
+    if (it.tag == .literal and token.tag == .number) {
+        const kind: NumberForm.Kind = switch (number_shape(token.text(tree.source))) {
+            .plain => .plain,
+            .exponent => .exponent,
+            // A number token is digits, a fraction, and an exponent (`token.zig`, section 2).
+            .none => unreachable,
+        };
+        return .{ .kind = kind, .bytes = bytes };
+    }
+    const kind: NumberForm.Kind = if (folds_alone(tree, index, &.{}, true, 0)) .folded else .other;
+    return .{ .kind = kind, .bytes = bytes };
+}
+
+/// The three numbers of the track declared at `index`, an item of kind `track` (section 3c).
+/// Null when its bounds are not a range, `track a = 1 in 2`, which parses and the checker
+/// refuses, so only for a file that does not check.
+pub fn track_form(tree: *const Tree, index: u32) ?TrackForm {
+    const it = tree.item(index);
+    assert(it.tag == .track);
+    const bounds = tree.item(it.b);
+    if (bounds.tag != .range) return null;
+    return .{
+        .value = number_form(tree, it.a),
+        .low = number_form(tree, bounds.a),
+        .high = number_form(tree, bounds.b),
+    };
 }
 
 /// Whether `tree` declares a module called `name`.
@@ -2839,6 +3201,7 @@ fn example_of(param: *const schema.Param) []const u8 {
 /// Checks `tree`, which parsed with no error, into `memory`.
 pub fn check(tree: *const Tree, memory: Memory, diagnostics: *Diagnostics) Checked {
     assert(memory.values.len == memory.value_items.len);
+    assert(memory.cue_forms.len == memory.cue_times.len);
     var checker: Checker = .{ .tree = tree, .root = tree, .memory = memory, .diagnostics = diagnostics };
     const before = diagnostics.total();
     assert(memory.frames.len >= frames_max);
@@ -2873,6 +3236,7 @@ pub fn check(tree: *const Tree, memory: Memory, diagnostics: *Diagnostics) Check
         .seed = checker.seed orelse 0,
         .start = start,
         .cue_times = memory.cue_times[0..checker.cue_count],
+        .cue_forms = memory.cue_forms[0..checker.cue_count],
         .bindings = memory.bindings[0..checker.binding_count],
         .declarations = memory.declarations[0..checker.declaration_count],
         .calls = memory.calls[0..checker.call_count],
@@ -2892,12 +3256,21 @@ pub fn check(tree: *const Tree, memory: Memory, diagnostics: *Diagnostics) Check
 
 const testing = std.testing;
 
-// Locks section 4: exact times to 5 places of seconds and 2 of ms, and the nearest otherwise.
+// Locks section 4: exact times to 5 places of seconds and 2 of ms, the nearest otherwise, and
+// the reader's refusals: an exponent, no unit, a sign, a bare point.
 test "a time literal is a whole number of flicks or refused" {
-    try testing.expectEqual(TimeResult{ .flicks = 352_800_000 }, time_flicks("0.5", flicks_per_second));
-    try testing.expectEqual(TimeResult{ .flicks = 7_056 }, time_flicks("0.00001", flicks_per_second));
-    try testing.expectEqual(TimeResult{ .flicks = 7_056 }, time_flicks("0.01", 705_600));
-    try testing.expectEqual(TimeResult{ .not_whole = 706 }, time_flicks("0.000001", flicks_per_second));
-    try testing.expectEqual(TimeResult{ .flicks = 423_360_000_000 }, time_flicks("600", flicks_per_second));
-    try testing.expectEqual(TimeResult.exponent, time_flicks("1e3", flicks_per_second));
+    try testing.expectEqual(TimeRead{ .flicks = 352_800_000 }, read_time("0.5s"));
+    try testing.expectEqual(TimeRead{ .flicks = 7_056 }, read_time("0.00001s"));
+    try testing.expectEqual(TimeRead{ .flicks = 7_056 }, read_time("0.01ms"));
+    try testing.expectEqual(TimeRead{ .not_whole = 706 }, read_time("0.000001s"));
+    try testing.expectEqual(TimeRead{ .flicks = 423_360_000_000 }, read_time("600s"));
+    try testing.expectEqual(TimeRead.exponent, read_time("1e3s"));
+    try testing.expectEqual(TimeRead.exponent, read_time("2.5E-2ms"));
+    const refused = [_][]const u8{
+        "1", "-1s", "+1s", "1 s", ".5s", "5.s", "ms", "s", "1hz", "1e3", "1.2.3s",
+    };
+    for (refused) |text| {
+        try testing.expectEqual(TimeRead.not_time, read_time(text));
+    }
+    try testing.expectEqual(TimeRead.too_large, read_time("99999999999999999999s"));
 }

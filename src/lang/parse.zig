@@ -20,7 +20,7 @@
 //! declaration
 //!         = "seed" number | "start" name
 //!         | "cue" name "=" expr [ ".." expr "every" expr ]
-//!         | "track" name "=" expr "in" expr ".." expr
+//!         | "track" name "=" expr "in" value
 //!         | name "=" value | name "<-" value
 //!         | "module" name "(" [ param { "," param } [","] ] ")" [ "in" value ] "=" expr
 //!         | "use" name
