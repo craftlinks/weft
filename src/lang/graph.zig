@@ -25,6 +25,16 @@
 //! A builder error becomes a diagnostic on the argument it is about, with the parameter's domain,
 //! and stops the back end, since later nodes may read the one refused.
 //!
+//! ## 5. The Slab's Limit
+//! The slab is a count, never an array the back end writes, so the builder is given the most a
+//! program can hold and `Limits.slab` is compared once, after every declaration is built (step
+//! 35). A file past it is refused on the name of the declaration whose nodes take the most of the
+//! slab, with its values and its lanes, and the hint says fewer lanes, at what a lane costs, before
+//! it gives the `Limits.slab` the file needs: a refusal at the call where the slab ran out named a
+//! line that was only last, often a module's. When another error stops the build, the refusal
+//! follows it and gives the least the slab needs, of the declarations built until then. The node
+//! array is memory the builder writes, so its limit is still refused where it runs out.
+//!
 //! ## 6. Vectors
 //! The core's vector nodes are only `pack` and `pick`, and its per-component arithmetic, map,
 //! `apply`, `minimum`, and `maximum` (`graph.zig`, sections 15 and 17), so `abs`, `min`, and
@@ -52,7 +62,8 @@
 //!
 //! ## 7. TigerStyle Invariants
 //! - Every table is the caller's and sized by `Limits`; the checker already refused what would
-//!   not fit, except the node array and the slab, whose refusals are errors naming their limit.
+//!   not fit, except the node array and the slab, whose refusals are errors naming their limit,
+//!   the slab's once the build is done (section 5).
 //! - The recursion over expressions follows the tree, whose depth the parser bounds.
 
 const std = @import("std");
@@ -617,9 +628,11 @@ const Back = struct {
                 error_module.hint(diagnostic, "raise `Limits.nodes`", .{});
                 return error.Refused;
             },
+            // Only past the most a program holds, since the limit is compared after the build
+            // (section 5).
             error.SlabCapacityExceeded => {
-                const diagnostic = back.fail(item, Code.limit, "the program needs a slab of more than {d} values", .{back.memory.slab_count_max});
-                error_module.hint(diagnostic, "raise `Limits.slab`", .{});
+                const diagnostic = back.fail(item, Code.limit, "the program needs a slab of more than {d} values, the most a program holds", .{back.builder.slab_count_max});
+                error_module.hint(diagnostic, "use fewer lanes", .{});
                 return error.Refused;
             },
             error.InvalidOvershoot => .{ .param = "overshoot", .message = "`overshoot` must be in [0, 1)", .hint = "0 settles without passing the goal; 0.5 is bouncy" },
@@ -763,8 +776,10 @@ pub fn build(
         .tree = tree,
         .memory = memory,
         .tables = tables,
+        // The slab is only a count, so the builder takes the most a program can hold and the
+        // limit is compared once every declaration is built (section 5).
         .builder = Builder.init(memory.nodes, .{
-            .slab_count_max = memory.slab_count_max,
+            .slab_count_max = std.math.maxInt(u32),
             .cues = &tables.cues,
             .goals = tables.goals.table(),
             .regions = tables.regions.table(),
@@ -774,31 +789,126 @@ pub fn build(
         }),
         .diagnostics = diagnostics,
     };
-    for (checked.declarations) |declaration| {
-        switch (declaration) {
-            .signal => |signal| {
-                const first = back.builder.node_count;
-                const ids = back.eval(signal.expr) catch return null;
-                memory.node_ranges[signal.binding] = .{ .first = first, .end = back.builder.node_count };
-                memory.ids[signal.binding] = ids;
-                memory.goal_sources[signal.binding] = goal_source(&back, signal.expr);
-            },
-            .noun => |noun| {
-                const first = back.builder.node_count;
-                for (checked.call_values(noun.call)) |value| {
-                    if (value == .signal) _ = back.eval(value.signal) catch return null;
-                }
-                memory.node_ranges[noun.binding] = .{ .first = first, .end = back.builder.node_count };
-                memory.goal_sources[noun.binding] = .none;
-            },
-            .feed => |feed| {
-                const input = (back.eval(feed.expr) catch return null).first;
-                const delay = memory.ids[feed.binding].first;
-                back.builder.close(delay, input) catch unreachable;
-            },
-        }
+    var most: Most = .{};
+    const built = build_declarations(&back, &most);
+    // Past the limit, the slab's refusal names the declaration that needs the most, after the
+    // error that stopped the build if one did, of the declarations built until then.
+    if (back.builder.slab_count > memory.slab_count_max) {
+        refuse_slab(&back, most, if (built) |_| true else |_| false);
+        return null;
     }
+    built catch return null;
     return back.builder.finish();
+}
+
+/// Builds every declaration in order (section 1), keeping in `most` the one whose nodes take the
+/// most of the slab (section 5), the one an error stopped among them.
+fn build_declarations(back: *Back, most: *Most) Fail!void {
+    const checked = back.checked;
+    assert(most.need == 0);
+    for (checked.declarations) |declaration| {
+        const first = back.builder.node_count;
+        const slab_before = back.builder.slab_count;
+        const built = build_declaration(back, declaration, first);
+        const need = back.builder.slab_count - slab_before;
+        if (need > most.need) {
+            const nodes = back.builder.nodes[first..back.builder.node_count];
+            const binding, const item = switch (declaration) {
+                .signal => |signal| .{ signal.binding, checked.bindings[signal.binding].item },
+                .noun => |noun| .{ noun.binding, checked.bindings[noun.binding].item },
+                .feed => |feed| .{ feed.binding, feed.item },
+            };
+            most.* = .{ .need = need, .binding = binding, .item = item, .lanes = lanes_of(nodes), .per_lane = per_lane_of(nodes) };
+        }
+        try built;
+    }
+    assert(most.need <= back.builder.slab_count);
+}
+
+/// One declaration's nodes, from `first`.
+fn build_declaration(back: *Back, declaration: check_module.Declaration, first: u32) Fail!void {
+    const checked = back.checked;
+    const memory = back.memory;
+    assert(first == back.builder.node_count);
+    switch (declaration) {
+        .signal => |signal| {
+            const ids = try back.eval(signal.expr);
+            memory.node_ranges[signal.binding] = .{ .first = first, .end = back.builder.node_count };
+            memory.ids[signal.binding] = ids;
+            memory.goal_sources[signal.binding] = goal_source(back, signal.expr);
+        },
+        .noun => |noun| {
+            for (checked.call_values(noun.call)) |value| {
+                if (value == .signal) _ = try back.eval(value.signal);
+            }
+            memory.node_ranges[noun.binding] = .{ .first = first, .end = back.builder.node_count };
+            memory.goal_sources[noun.binding] = .none;
+        },
+        .feed => |feed| {
+            const input = (try back.eval(feed.expr)).first;
+            const delay = memory.ids[feed.binding].first;
+            back.builder.close(delay, input) catch unreachable;
+        },
+    }
+    assert(back.builder.node_count >= first);
+}
+
+/// The declaration whose nodes take the most of the slab, for the slab's refusal (section 5).
+const Most = struct {
+    need: u32 = 0,
+    binding: u32 = 0,
+    /// Its declaration's item, whose token is its name.
+    item: u32 = 0,
+    /// The most lanes among its nodes.
+    lanes: u32 = 1,
+    /// What a lane of it adds to the slab, as `weft check` counts it.
+    per_lane: u64 = 0,
+};
+
+/// The most lanes among `nodes`.
+fn lanes_of(nodes: []const graph.Node) u32 {
+    var lanes: u32 = 1;
+    for (nodes) |node| lanes = @max(lanes, node.extent.lanes);
+    assert(lanes >= 1);
+    return lanes;
+}
+
+/// The f64 a lane adds to the slab among `nodes`: each node of many lanes' values and caches over
+/// its lanes, rounded up, summed, as `weft check`'s `a lane costs` counts them. 0 for none.
+fn per_lane_of(nodes: []const graph.Node) u64 {
+    var total: u64 = 0;
+    for (nodes) |node| {
+        if (node.extent.lanes <= 1) continue;
+        const count: u64 = node.extent.count();
+        total += std.math.divCeil(u64, count + node.op.cache_count(count), node.extent.lanes) catch unreachable;
+    }
+    return total;
+}
+
+/// The slab's refusal (section 5): the slab the program needs, its limit, and the declaration that
+/// needs the most, on its name, with its lanes; the hint says fewer lanes before `Limits.slab`.
+/// `complete` is false when an error stopped the build, so the need is only a least.
+fn refuse_slab(back: *Back, most: Most, complete: bool) void {
+    const total = back.builder.slab_count;
+    const limit = back.memory.slab_count_max;
+    assert(total > limit);
+    assert(most.need > 0);
+    const name = back.checked.bindings[most.binding].name;
+    const token = back.tree.tokens[back.tree.item(most.item).token];
+    const least = if (complete) "" else "at least ";
+    const diagnostic = if (most.lanes > 1)
+        back.diagnostics.add(.limit, token.start, @max(token.len, 1), "the slab needs {s}{d} values, more than {d}; `{s}` needs {d} of them, at {d} lanes", .{ least, total, limit, name, most.need, most.lanes })
+    else
+        back.diagnostics.add(.limit, token.start, @max(token.len, 1), "the slab needs {s}{d} values, more than {d}; `{s}` needs {d} of them", .{ least, total, limit, name, most.need });
+    if (most.lanes > 1 and complete) {
+        error_module.hint(diagnostic, "give `{s}` fewer lanes, which cost {d} of the slab each, or raise `Limits.slab` to {d}", .{ name, most.per_lane, total });
+    } else if (most.lanes > 1) {
+        error_module.hint(diagnostic, "give `{s}` fewer lanes, which cost {d} of the slab each, or raise `Limits.slab`", .{ name, most.per_lane });
+    } else if (complete) {
+        error_module.hint(diagnostic, "raise `Limits.slab` to {d}", .{total});
+    } else {
+        error_module.hint(diagnostic, "raise `Limits.slab`", .{});
+    }
 }
 
 /// The goal source of a declaration whose value is a call itself, which `build_call` recorded.

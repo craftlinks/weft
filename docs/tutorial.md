@@ -122,7 +122,9 @@ at 1 s, is 81% of the way half a second later, and has landed on exactly 1 by 2 
 times are **seconds**; times in the output are **flicks** (705,600,000 a second). `range` is a
 bound the signal never leaves, worked out without sampling (section 13).
 
-**`describe`** lists every call the language has, with its parameters, defaults, and kinds:
+**`describe`** lists every call the language has, with its parameters, defaults, and kinds, a
+sentence on what each parameter means, and each call's class, which says what a seek costs
+(section 16):
 
 ```bash
 zig-out/bin/weft describe --use std=src/lang/std.weft
@@ -918,8 +920,10 @@ The limits worth knowing before you design around Weft:
 - **Lanes cannot read each other**, and a number parameter or a cue cannot vary by lane
   (section 11). A region is a line, with no rows and columns, and the client cannot hand it a
   table of per-lane values.
-- **The `weft` command's own slab limit is 262,144 values** and cannot be raised, so a file with
-  a large region is checked at a smaller lane count. A `stagger:` cannot be finer than 10 µs.
+- **The `weft` command takes a slab of any size**: `sample` allocates its reader's slab, so a
+  file with a large region is checked and sampled at its own lane count. Its limit is 1,024
+  nodes, which a client's own command raises with its `Limits`. A `stagger:` cannot be finer
+  than 10 µs.
 - **A `bounce` asserts beyond 148 days** (2⁵³ flicks) from its cue.
 - **`colour.to_srgb` costs 0.1 to 0.4 µs a call**, which is 30 ms for 100,000 colours. At that
   scale send OKLab to the GPU and convert in the shader.

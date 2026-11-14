@@ -94,6 +94,13 @@
 //! signal is the client's to read. A `noun` parameter takes the name of a noun bound above, so a
 //! plot can name its axes, and the order of the file is the order a client resolves them in.
 //!
+//! A word, or a noun of the wrong entry, is refused with a hint that names every word the
+//! parameter takes, up to `words_hinted_max`, "it takes `point`, `tangent`, `secant`, or
+//! `segment`", and only past that the first of them and an ellipsis (step 35). A misspelt word
+//! close to one gets "did you mean" instead. Six holds every list of Weft's table, at most four,
+//! and all of Tapestry's but its ten places of a slot, and six words of eight letters fit the
+//! hint's 96 bytes where ten do not; a longer list is `describe`'s to give in full.
+//!
 //! ## 6b. A Tween After a Tween
 //! A tween's `from` may be left out when its `after` names a tween (step 31): it is then that
 //! tween's `to`, a number or a vector or colour whole, copied into the call's values. So the call
@@ -2137,7 +2144,7 @@ const Checker = struct {
                 if (error_module.nearest(word, param.words)) |near| {
                     error_module.hint(diagnostic, "did you mean `{s}`?", .{near});
                 } else {
-                    error_module.hint(diagnostic, "for example `{s}`", .{param.words[0]});
+                    hint_words(diagnostic, param.words);
                 }
                 return error.Checked;
             },
@@ -2168,11 +2175,7 @@ const Checker = struct {
                     if (std.mem.eql(u8, word, binding.entry.?.name)) return .{ .noun = found };
                 }
                 const diagnostic = checker.fail(index, .wrong_type, "`{s}` is `{s}`, which `{s}` does not take", .{ name, binding.entry.?.name, param.name });
-                if (param.words.len == 1) {
-                    error_module.hint(diagnostic, "it takes `{s}`", .{param.words[0]});
-                } else {
-                    error_module.hint(diagnostic, "it takes `{s}`, `{s}`, …", .{ param.words[0], param.words[1] });
-                }
+                hint_words(diagnostic, param.words);
                 return error.Checked;
             },
             .seed => {
@@ -2498,6 +2501,34 @@ fn same_goals(a: []const Goal, b: []const Goal) bool {
     if (a.len != b.len) return false;
     for (a, b) |x, y| if (x.cue != y.cue or bits(x.value) != bits(y.value)) return false;
     return true;
+}
+
+/// The most words a hint lists before it ends in an ellipsis (section 6a).
+pub const words_hinted_max = 6;
+
+/// The hint "it takes `a`, `b`, or `c`": every one of `words` up to `words_hinted_max`, then the
+/// first `words_hinted_max` and an ellipsis (section 6a).
+fn hint_words(diagnostic: ?*error_module.Diagnostic, words: []const []const u8) void {
+    assert(words.len > 0);
+    var text: [2 * error_module.hint_len_max]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&text);
+    // Twice the hint, so a list too long for it is cut by `hint` itself, with its `...`.
+    write_words(&writer, words) catch {};
+    error_module.hint(diagnostic, "{s}", .{writer.buffered()});
+}
+
+fn write_words(writer: *std.Io.Writer, words: []const []const u8) std.Io.Writer.Error!void {
+    assert(words.len > 0);
+    const shown = @min(words.len, words_hinted_max);
+    const cut = words.len > words_hinted_max;
+    try writer.writeAll("it takes ");
+    for (words[0..shown], 0..) |word, at| {
+        if (at > 0 and shown > 2) try writer.writeAll(",");
+        if (at > 0) try writer.writeAll(" ");
+        if (at > 0 and at == shown - 1 and !cut) try writer.writeAll("or ");
+        try writer.print("`{s}`", .{word});
+    }
+    if (cut) try writer.writeAll(", …");
 }
 
 /// Whether two lists of regions are the same, bit for bit.

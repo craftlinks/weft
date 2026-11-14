@@ -21,7 +21,7 @@
 //! A client of its own `Limits`, more cues than the command's and fewer nodes and libraries,
 //! checks and samples through `commands.For` (step 37): once compiled, its `summary` and
 //! `sample_compiled` print what `check` and `sample` would, and its limit errors name its own
-//! numbers.
+//! numbers. A client's slab refusal names the declaration that needs the most (step 35).
 
 const std = @import("std");
 const testing = std.testing;
@@ -159,6 +159,8 @@ test "a client's noun is checked beside the primitives and refused by the back e
 
 // Locks what `describe` says of a noun that only describes (step 27): its op, that its signals
 // keep their own lanes, a string's kind and default, and the entries a `noun` parameter takes.
+// It builds no node, so its class is null, and a client's parameter has a sentence only where it
+// gives one, `null` otherwise (step 35).
 test "describe lists a describing noun with its string and noun parameters" {
     const clients = [_]weft.lang.schema.Entry{.{
         .name = "label",
@@ -166,16 +168,16 @@ test "describe lists a describing noun with its string and noun parameters" {
         .role = .signal,
         .params = &.{
             .{ .name = "of", .kind = .noun, .positional = true, .words = &.{ "axes", "plot" } },
-            .{ .name = "text", .kind = .string, .default = .{ .text = "?" } },
+            .{ .name = "text", .kind = .string, .default = .{ .text = "?" }, .doc = "the name it shows" },
         },
         .summary = "a name beside a noun",
     }};
     var writer: std.Io.Writer = .fixed(&output);
     try commands.describe(&writer, &.{}, &clients);
     const expected = "\"nouns\":[{\"name\":\"label\",\"role\":\"signal\",\"op\":\"noun\",\"summary\":\"a name beside a noun\"," ++
-        "\"lanes\":\"apart\",\"events\":null,\"outputs\":[],\"params\":[" ++
-        "{\"name\":\"of\",\"kind\":\"noun\",\"live\":false,\"shaped\":false,\"positional\":true,\"default\":null,\"words\":[\"axes\",\"plot\"]}," ++
-        "{\"name\":\"text\",\"kind\":\"string\",\"live\":false,\"shaped\":false,\"positional\":false,\"default\":\"?\",\"words\":[]}]}]";
+        "\"lanes\":\"apart\",\"class\":null,\"events\":null,\"outputs\":[],\"params\":[" ++
+        "{\"name\":\"of\",\"kind\":\"noun\",\"live\":false,\"shaped\":false,\"positional\":true,\"default\":null,\"words\":[\"axes\",\"plot\"],\"doc\":null}," ++
+        "{\"name\":\"text\",\"kind\":\"string\",\"live\":false,\"shaped\":false,\"positional\":false,\"default\":\"?\",\"words\":[],\"doc\":\"the name it shows\"}]}]";
     try testing.expect(std.mem.indexOf(u8, writer.buffered(), expected) != null);
 }
 
@@ -614,4 +616,54 @@ test "a client's calls print the command's bytes on a file both hold" {
     var client_lines: std.Io.Writer = .fixed(&wide_output[1]);
     try testing.expect(try client_command.check(&client_compiled, &client_lines, source, &.{}, &.{}));
     try testing.expectEqualStrings(weft_lines.buffered(), client_lines.buffered());
+}
+
+/// A client's limits with a small slab, for its refusal (step 35).
+const slab_limits: weft.lang.Limits = .{ .nodes = 64, .slab = 1024, .libraries = 1 };
+const slab_command = commands.For(slab_limits);
+var slab_compiled: weft.lang.Compiled(slab_limits) = undefined;
+
+/// A plot of 100 lanes that uses a library's module twice, past a slab of 1024: each lane's two
+/// noises, two chases of 4 values, and their sum take 11 values, and `base` one.
+const big_plot =
+    \\use lib
+    \\cue c0 = 0s
+    \\base = noise(smooth, 1hz)
+    \\plot = lanes(100, wobble(noise(smooth, 1hz)) + wobble(noise(steps, 2hz)))
+    \\
+;
+const wobble_library: []const weft.lang.Source = &.{.{ .name = "lib", .text = "module wobble(x) = chase(x, time: 0.2s)\n" }};
+
+/// A client's limits of 3 nodes and a slab of 2, for a refusal of both.
+const tiny_limits: weft.lang.Limits = .{ .nodes = 3, .slab = 2 };
+const tiny_command = commands.For(tiny_limits);
+var tiny_compiled: weft.lang.Compiled(tiny_limits) = undefined;
+
+// Locks step 35's slab refusal: it names the declaration that needs the most, on its name, with
+// its values and lanes, and the client's limit. `plot` needs 1100 of the 1101 values, at 100 lanes
+// of 11 values each, so the hint says fewer lanes first, then the `Limits.slab` that fits. A file
+// of one lane each says only the limit, 3; a build the node limit stopped gives its error, then
+// the least the slab needs, 6, of the declarations built until then, with `a`'s 4 lanes.
+test "a slab refusal names the declaration that needs the most" {
+    var writer: std.Io.Writer = .fixed(&output);
+    const plot: commands.Source = .{ .name = "plot.weft", .text = big_plot };
+    try testing.expect(!try slab_command.check(&slab_compiled, &writer, plot, wobble_library, &.{}));
+    try testing.expectEqualStrings("plot.weft:4:1: error: the slab needs 1101 values, more than 1024; `plot` needs 1100 of them, at 100 lanes\n" ++
+        "    plot = lanes(100, wobble(noise(smooth, 1hz)) + wobble(noise(steps, 2hz)))\n    ^^^^\n" ++
+        "    hint: give `plot` fewer lanes, which cost 11 of the slab each, or raise `Limits.slab` to 1101\n", writer.buffered());
+
+    writer = .fixed(&output);
+    const one_lane: commands.Source = .{ .name = "one.weft", .text = "a = wave(sine, 1hz)\nb = wave(saw, 1hz)\nc = wave(square, 1hz)\n" };
+    try testing.expect(!try tiny_command.check(&tiny_compiled, &writer, one_lane, &.{}, &.{}));
+    try testing.expectEqualStrings("one.weft:1:1: error: the slab needs 3 values, more than 2; `a` needs 1 of them\n" ++
+        "    a = wave(sine, 1hz)\n    ^\n    hint: raise `Limits.slab` to 3\n", writer.buffered());
+
+    writer = .fixed(&output);
+    const four: commands.Source = .{ .name = "four.weft", .text = "a = lanes(4, noise(smooth, 1hz))\nb = wave(sine, 1hz)\nc = wave(saw, 1hz)\nd = wave(square, 1hz)\n" };
+    try testing.expect(!try tiny_command.check(&tiny_compiled, &writer, four, &.{}, &.{}));
+    try testing.expectEqualStrings("four.weft:4:5: error: the program needs more than 3 nodes\n" ++
+        "    d = wave(square, 1hz)\n        ^^^^^^^^^^^^^^^^^\n    hint: raise `Limits.nodes`\n" ++
+        "four.weft:1:1: error: the slab needs at least 6 values, more than 2; `a` needs 4 of them, at 4 lanes\n" ++
+        "    a = lanes(4, noise(smooth, 1hz))\n    ^\n" ++
+        "    hint: give `a` fewer lanes, which cost 1 of the slab each, or raise `Limits.slab`\n", writer.buffered());
 }

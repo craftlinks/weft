@@ -24,8 +24,16 @@ zig-out/bin/weft sample FILE --signal NAME               # one signal
 
 - **`describe`** lists every primitive: its parameters in order, which may go by position, each
   one's kind (`number`, `time`, `frequency`, `signal`, `cue`, `path`, …), its default, whether a
-  signal may set it (`live`), and whether it takes a vector or a colour (`shaped`). Then every
-  module of the standard library, with its body. Read it before writing a call.
+  signal may set it (`live`), whether it takes a vector or a colour (`shaped`), and a sentence on
+  what it means (`doc`). Then every module of the standard library, with its body. Read it
+  before writing a call.
+- **What a seek costs**: `describe` gives each call's `"class"`, the class of the nodes it builds
+  itself: `pure` (a function of t), `exact` (a fold over its goals, as a `spring`), `simulated`
+  (stepped at 1/480 s from the start cue, as a `chase`), or `live` (an `input`). A call whose own
+  nodes are pure and which reads a signal, such as `map`, `abs`, `vec2`, or `lanes`, is
+  `inputs`: it costs what the signals it reads cost. A value is as costly as the costliest call
+  it reads, so one `chase` makes everything downstream of it stepped. A mover is `null`: it is
+  its `follow`'s law.
 - **`check`** prints `ok:` with the program's counts and whether it is seekable and stepped,
   then `limits: .{ … }`, the least `Limits` the file compiles with, ready to paste, and for a
   file with a region what a lane costs of the slab. Or it prints each error with a line, a
@@ -247,8 +255,11 @@ reads as one in `test/lang.zig`, so step 33's are `fn_NAME`.
      `git diff test/golden/signals.txt` shows added lines only.
 4. **`src/lang/schema.zig`**: a value of `Op` and an entry, placed where `describe` should list
    it: its parameters in the builder's order and names, their kinds, defaults, and which are
-   `positional`, `live`, or `shaped`. Add the `Op` to `Entry.lane_rule()`, which is exhaustive
-   and is `describe`'s `"lanes"`; a pure op reading signals is `.inputs`. Add it to
+   `positional`, `live`, or `shaped`, and each parameter's `doc`, one sentence on what it means
+   (a test fails on a parameter without one). Add the `Op` to `Entry.lane_rule()`, which is
+   exhaustive and is `describe`'s `"lanes"`; a pure op reading signals is `.inputs`. Add it to
+   `core_op()`, the core op its call builds, whose `Op.class` is `describe`'s `"class"`, and a
+   call of it to `class_sample` in `test/lang.zig`, which checks the two agree. Add it to
    `event_value()` if it fires events.
 5. **`src/lang/check.zig`**:
    - `call_shape`: a call is one number unless it has an arm, so an op with a `shaped`

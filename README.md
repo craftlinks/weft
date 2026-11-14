@@ -695,6 +695,19 @@ signals.weft:14:22: error: chase has no parameter `tme`
     hint: did you mean `time`?
 ```
 
+  A word, or a noun of the wrong entry, gets a hint that lists every word the parameter takes,
+  up to six, and an ellipsis only past that (step 35). A file past `Limits.slab` is refused on
+  the name of the declaration that needs the most of the slab, once every declaration is built,
+  with its values and lanes, and the hint says fewer lanes, at what a lane costs, before it
+  gives the `Limits.slab` the file needs:
+
+```txt
+plot.weft:4:1: error: the slab needs 1101 values, more than 1024; `plot` needs 1100 of them, at 100 lanes
+    plot = lanes(100, wobble(noise(smooth, 1hz)) + wobble(noise(steps, 2hz)))
+    ^^^^
+    hint: give `plot` fewer lanes, which cost 11 of the slab each, or raise `Limits.slab` to 1101
+```
+
 There is one canonical format, which `lang.Syntax` writes: one declaration a line, no lining up,
 named arguments in the table's order, and a call written one argument a line exactly when its last
 argument has a trailing comma, as `zig fmt` does. `src/lang/lang.zig` explains the stages.
@@ -937,6 +950,12 @@ $ weft sample play/signals.weft --to 1 --step 0.5 --signal wave
   an infinite end, which prints as `null`.
 - **`describe`** gives each primitive's `"lanes"`, how it takes them (`region`, `stagger`,
   `inputs`, `one`, or `makes`), and its `"events"`, what an event's `value` carries, or `null`.
+  Since step 35 each primitive has its `"class"`, the class of the nodes its call builds, from
+  the core's `Op.class`: `pure`, `exact`, `simulated`, `live`, or `inputs` for a call of pure
+  nodes that reads a signal and so has the class of what it reads, and `null` for a mover, a
+  client's signal, or a noun, which build no node of their own. Each parameter has its `"doc"`,
+  one sentence on what it means, which a test requires of every parameter of Weft's table; a
+  client's parameter without one prints `null`.
 - **At most two `--use`**; a third is an error that says so, as it is from `commands.check` and
   `commands.sample`, which a client's command calls with its own entries (A Client's Nouns).
 - **JSON** has its keys in a fixed order and no whitespace, and a value that is not finite, such

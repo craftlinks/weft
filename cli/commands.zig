@@ -417,6 +417,8 @@ fn slab_per_lane(program: weft.Program) u64 {
 }
 
 /// `weft describe`: the primitives, the modules of each library, and a client's nouns, as JSON.
+/// Each call's class and each parameter's sentence come from the table (`schema.zig`, sections
+/// 3d and 3e), so this prints them and decides nothing.
 pub fn describe(writer: *std.Io.Writer, libraries: []const lang.Source, nouns: []const schema.Entry) !void {
     try writer.writeAll("{\"primitives\":[");
     for (&schema.entries, 0..) |*entry, at| {
@@ -476,7 +478,11 @@ fn json_entry(writer: *std.Io.Writer, entry: *const schema.Entry) !void {
     try writer.print(",\"role\":\"{s}\",\"op\":\"{s}\",\"summary\":", .{ @tagName(entry.role), @tagName(entry.op) });
     try json_string(writer, entry.summary);
     // How it takes lanes, and what its events carry (step 22).
-    try writer.print(",\"lanes\":\"{s}\",\"events\":", .{@tagName(entry.lane_rule())});
+    try writer.print(",\"lanes\":\"{s}\",\"class\":", .{@tagName(entry.lane_rule())});
+    // The class of the call's own nodes, from the core, or null for one that builds none
+    // (step 35).
+    if (entry.class()) |class| try writer.print("\"{s}\"", .{@tagName(class)}) else try writer.writeAll("null");
+    try writer.writeAll(",\"events\":");
     if (entry.event_value()) |value| try json_string(writer, value) else try writer.writeAll("null");
     try writer.writeAll(",\"outputs\":[");
     for (entry.outputs, 0..) |output, index| {
@@ -517,7 +523,10 @@ fn json_entry(writer: *std.Io.Writer, entry: *const schema.Entry) !void {
             if (index > 0) try writer.writeAll(",");
             try json_string(writer, word);
         }
-        try writer.writeAll("]}");
+        // What it means (step 35), or null where a client's entry gives no sentence.
+        try writer.writeAll("],\"doc\":");
+        if (param.doc.len == 0) try writer.writeAll("null") else try json_string(writer, param.doc);
+        try writer.writeAll("}");
     }
     try writer.writeAll("]}");
 }
