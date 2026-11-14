@@ -416,14 +416,27 @@ fn slab_per_lane(program: weft.Program) u64 {
     return total;
 }
 
-/// `weft describe`: the primitives, the modules of each library, and a client's nouns, as JSON.
-/// Each call's class and each parameter's sentence come from the table (`schema.zig`, sections
-/// 3d and 3e), so this prints them and decides nothing.
+/// `weft describe`: the primitives, the numbers the language knows, the modules of each library,
+/// and a client's nouns, as JSON. Each call's class, each parameter's sentence, and each number
+/// come from the table (`schema.zig`, sections 3d, 3e, and 3f), so this prints them and decides
+/// nothing.
 pub fn describe(writer: *std.Io.Writer, libraries: []const lang.Source, nouns: []const schema.Entry) !void {
     try writer.writeAll("{\"primitives\":[");
     for (&schema.entries, 0..) |*entry, at| {
         if (at > 0) try writer.writeAll(",");
         try json_entry(writer, entry);
+    }
+    // The numbers the language knows by name (step 40), each with its sentence.
+    try writer.writeAll("],\"numbers\":[");
+    for (&schema.numbers, 0..) |*known, at| {
+        if (at > 0) try writer.writeAll(",");
+        try writer.writeAll("{\"name\":");
+        try json_string(writer, known.name);
+        try writer.writeAll(",\"value\":");
+        try json_number(writer, known.value);
+        try writer.writeAll(",\"doc\":");
+        try json_string(writer, known.doc);
+        try writer.writeAll("}");
     }
     try writer.writeAll("],\"modules\":[");
     var first = true;

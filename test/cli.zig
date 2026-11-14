@@ -49,8 +49,9 @@ const std_library: []const weft.lang.Source = &.{.{ .name = "std", .text = weft.
 var output: [1 << 18]u8 = undefined;
 var compiled: commands.Compiled = undefined;
 
-// Locks the describe output: every primitive with its parameters, then the standard library's
-// modules with their defaults and bodies, and no nouns.
+// Locks the describe output: every primitive with its parameters, the numbers the language
+// knows (step 40), then the standard library's modules with their defaults and bodies, and no
+// nouns.
 test "describe lists the primitives and the standard library's modules" {
     var writer: std.Io.Writer = .fixed(&output);
     try commands.describe(&writer, std_library, &.{});
