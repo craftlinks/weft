@@ -11,7 +11,9 @@
 //! - a noun is not a signal, a string is not a number, and each mistake is one error that says
 //!   what to write instead;
 //! - a file with nouns formats to canonical text and back;
-//! - an entry may take `schema.params_max` parameters, 24 since step 36, every one by name.
+//! - an entry may take `schema.params_max` parameters, 24 since step 36, every one by name;
+//! - a word or a noun of the wrong entry is refused with a hint naming every word the parameter
+//!   takes, up to six (step 35).
 //!
 //! ## 2. The Nouns
 //! Four entries shaped like an explainer's, and the score that uses them, are in `score.zig`,
@@ -204,4 +206,40 @@ test "an entry with 24 parameters, each given by name, checks, compiles, and for
     try testing.expectError(error.Invalid, compiled.compile_client(&wide, &.{}, "w = wide(weight: 1, weight: 2)\n"));
     try testing.expectEqual(weft.lang.diagnostic.Code.duplicate_argument, compiled.errors()[0].code);
     try testing.expectEqual(@as(usize, 1), compiled.errors().len);
+}
+
+/// Nouns whose parameters take one, four, and seven entries, for the hints of step 35.
+const listing = [_]schema.Entry{
+    .{ .name = "mark", .op = .noun, .role = .signal, .summary = "a mark", .params = &.{
+        .{ .name = "text", .kind = .string, .positional = true },
+    } },
+    .{ .name = "readout", .op = .noun, .role = .signal, .summary = "a readout", .params = &.{
+        .{ .name = "of", .kind = .noun, .words = &.{ "point", "tangent", "secant", "segment" } },
+    } },
+    .{ .name = "badge", .op = .noun, .role = .signal, .summary = "a badge", .params = &.{
+        .{ .name = "on", .kind = .noun, .words = &.{"axes"} },
+    } },
+    .{ .name = "tag", .op = .noun, .role = .signal, .summary = "a tag", .params = &.{
+        .{ .name = "on", .kind = .noun, .words = &.{ "one", "two", "three", "four", "five", "six", "seven" } },
+    } },
+};
+
+/// The hint of the first error of `source`, compiled with `listing`.
+fn hint_of(source: []const u8) ![]const u8 {
+    try testing.expectError(error.Invalid, compiled.compile_client(&listing, &.{}, source));
+    return compiled.errors()[0].hint_text();
+}
+
+// Locks step 35's hints: a noun of the wrong entry, and a word with none near it, list every word
+// the parameter takes, with `or` before the last, up to six, and past six the first six and an
+// ellipsis. A misspelt word near one is still "did you mean".
+test "a hint names every word a parameter takes, up to six" {
+    const mark = "m = mark(\"x\")\n";
+    try testing.expectEqualStrings("it takes `point`, `tangent`, `secant`, or `segment`", try hint_of(mark ++ "r = readout(of: m)\n"));
+    try testing.expectEqualStrings("it takes `axes`", try hint_of(mark ++ "b = badge(on: m)\n"));
+    try testing.expectEqualStrings("it takes `one`, `two`, `three`, `four`, `five`, `six`, …", try hint_of(mark ++ "t = tag(on: m)\n"));
+    try testing.expectEqualStrings("it takes `sine`, `triangle`, `saw`, or `square`", try hint_of("w = wave(zigzag, 1hz)\n"));
+    try testing.expectEqualStrings("it takes `smooth` or `steps`", try hint_of("n = noise(wiggly, 1hz)\n"));
+    try testing.expectEqualStrings("it takes `linear`, `in`, `out`, or `in_out`", try hint_of("cue c = 0s\nt = tween(from: 0, to: 1, at: c, over: 1s, ease: bouncy)\n"));
+    try testing.expectEqualStrings("did you mean `triangle`?", try hint_of("w = wave(triangel, 1hz)\n"));
 }

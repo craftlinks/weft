@@ -19,6 +19,14 @@
 //! ## 3. Equality
 //! Nodes are compared with `std.meta.eql`, field by field: a node's padding has no defined value,
 //! so bytes would differ where fields do not.
+//!
+//! ## 4. A Call's Class
+//! `describe` gives each call the class of the nodes it builds itself, from `schema.core_op` and
+//! the core's `Op.class` (step 35). So that the table of core ops cannot drift from the back end,
+//! each entry's call is compiled once, with its signal arguments bound to an `input` on a line of
+//! their own, and the nodes of its own line are read: one is of its core op, and the highest of
+//! their classes is the entry's. A call of class `inputs` builds only pure nodes, and its value
+//! then has its input's class, live.
 
 const std = @import("std");
 const weft = @import("weft");
@@ -117,4 +125,82 @@ test "the catalog's graphs as text compile to the catalog's nodes" {
         }
         try std.testing.expectEqual(expected.output, compiled.signal("out").?);
     }
+}
+
+/// A file whose last line, `out = …`, is a call of `entry`, its signal arguments `x`, an input
+/// (section 4).
+fn class_sample(entry: *const weft.lang.schema.Entry, writer: *std.Io.Writer) !void {
+    try writer.writeAll("cue c0 = 0s\ncue c1 = 1s\nx = input()\n");
+    switch (entry.op) {
+        .wave => try writer.writeAll("out = wave(sine, 1hz)\n"),
+        .noise => try writer.writeAll("out = noise(smooth, 1hz)\n"),
+        .tween => try writer.writeAll("out = tween(from: 0, to: 1, at: c0, over: 1s)\n"),
+        .spring => try writer.writeAll("out = spring([c1: 1], time: 1s)\n"),
+        .newtonian => try writer.writeAll("out = newtonian([c1: 1], speed: 1, accel: 1, decel: 1)\n"),
+        .chase => try writer.writeAll("out = chase(x, time: 1s)\n"),
+        .oscillator => try writer.writeAll("out = oscillator(sine, rate: x)\n"),
+        .follow => try writer.writeAll("out = follow([0..1], by: spring(time: 1s))\n"),
+        .shift => try writer.writeAll("out = shift(0..1, buckets: 4, period: 1s, odds: 0.5, shape: steps)\n"),
+        .delay => try writer.writeAll("out = delay(0)\nout <- x\n"),
+        .bounce => try writer.writeAll("out = bounce(0..1, speed: 1, at: c0)\n"),
+        .crossing => try writer.writeAll("out = crossing(x, level: 0.5)\n"),
+        .cues => try writer.writeAll("out = cues(c0)\n"),
+        .input => try writer.writeAll("out = input()\n"),
+        .map => try writer.writeAll("out = map(x, 0..1, to: 0..2)\n"),
+        .function => try writer.print("out = {s}(x{s})\n", .{ entry.name, if (entry.params.len == 2) ", 2" else "" }),
+        .minimum, .maximum => try writer.print("out = {s}(x, x)\n", .{entry.name}),
+        .pack => try writer.print("out = {s}(x, x{s})\n", .{ entry.name, if (entry.params.len == 3) ", x" else "" }),
+        .srgb => try writer.writeAll("out = srgb(0.5, 0.5, 0.5)\n"),
+        .lanes => try writer.writeAll("out = lanes(3, x)\n"),
+        .spring_mover, .newtonian_mover, .client, .noun => unreachable,
+    }
+}
+
+// Locks section 4: every entry's class is the class of the nodes its call builds, for each of
+// the table's calls that builds any; `map(x, …)`, `abs(x)`, `vec2(x, x)`, and `lanes(3, x)` of an
+// input are live, as their `inputs` says.
+test "describe's class of a call is the class of the nodes it builds" {
+    const schema = weft.lang.schema;
+    for (&schema.entries) |*entry| {
+        const tag = schema.core_op(entry.op) orelse {
+            try std.testing.expectEqual(null, entry.class());
+            continue;
+        };
+        var text: [256]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&text);
+        try class_sample(entry, &writer);
+        errdefer std.debug.print("entry {s}: {s}\n", .{ entry.name, writer.buffered() });
+        try compiled.compile(writer.buffered());
+        const program = compiled.program;
+        const nodes = compiled.node_ranges[binding_of(compiled.checked.bindings, "out")];
+        try std.testing.expect(nodes.end > nodes.first);
+        var own: weft.Class = .pure;
+        var built = false;
+        for (program.nodes[nodes.first..nodes.end]) |node| {
+            own = own.max(node.op.class());
+            built = built or std.meta.activeTag(node.op) == tag;
+        }
+        try std.testing.expect(built);
+        var classes: [64]weft.Class = undefined;
+        program.classes(&classes);
+        const out = compiled.signal("out").?;
+        switch (entry.class().?) {
+            .inputs => {
+                try std.testing.expectEqual(weft.Class.pure, own);
+                try std.testing.expectEqual(weft.Class.live, classes[out.index]);
+            },
+            .pure => try std.testing.expectEqual(weft.Class.pure, own),
+            .exact => try std.testing.expectEqual(weft.Class.exact, own),
+            .simulated => try std.testing.expectEqual(weft.Class.simulated, own),
+            .live => try std.testing.expectEqual(weft.Class.live, own),
+        }
+    }
+}
+
+/// The index of the binding called `name`.
+fn binding_of(bindings: []const weft.lang.check.Binding, name: []const u8) usize {
+    for (bindings, 0..) |binding, at| {
+        if (std.mem.eql(u8, binding.name, name)) return at;
+    }
+    unreachable;
 }
