@@ -488,7 +488,7 @@ fn source_of(tree: *const lang.parse.Tree, index: u32) []const u8 {
 fn json_entry(writer: *std.Io.Writer, entry: *const schema.Entry) !void {
     try writer.writeAll("{\"name\":");
     try json_string(writer, entry.name);
-    try writer.print(",\"role\":\"{s}\",\"op\":\"{s}\",\"summary\":", .{ @tagName(entry.role), @tagName(entry.op) });
+    try writer.print(",\"role\":\"{s}\",\"op\":\"{s}\",\"summary\":", .{ @tagName(entry.role), @tagName(weft.lang.table.op_of(entry)) });
     try json_string(writer, entry.summary);
     // How it takes lanes, and what its events carry (step 22).
     try writer.print(",\"lanes\":\"{s}\",\"class\":", .{@tagName(entry.lane_rule())});

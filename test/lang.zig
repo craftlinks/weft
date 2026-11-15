@@ -131,7 +131,7 @@ test "the catalog's graphs as text compile to the catalog's nodes" {
 /// (section 4).
 fn class_sample(entry: *const weft.lang.schema.Entry, writer: *std.Io.Writer) !void {
     try writer.writeAll("cue c0 = 0s\ncue c1 = 1s\nx = input()\n");
-    switch (entry.op) {
+    switch (weft.lang.table.op_of(entry)) {
         .wave => try writer.writeAll("out = wave(sine, 1hz)\n"),
         .noise => try writer.writeAll("out = noise(smooth, 1hz)\n"),
         .tween => try writer.writeAll("out = tween(from: 0, to: 1, at: c0, over: 1s)\n"),
@@ -161,7 +161,7 @@ fn class_sample(entry: *const weft.lang.schema.Entry, writer: *std.Io.Writer) !v
 // input are live, as their `inputs` says.
 test "describe's class of a call is the class of the nodes it builds" {
     for (&weft.lang.table.entries) |*entry| {
-        const tag = weft.lang.table.core_op(entry.op) orelse {
+        const tag = weft.lang.table.core_op(weft.lang.table.op_of(entry)) orelse {
             try std.testing.expectEqual(null, entry.class());
             continue;
         };

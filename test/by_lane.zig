@@ -415,7 +415,7 @@ const Case = struct {
 // `cues(…)`, and a cue's own declaration; `stagger:` beside it; regions nested; a cue that is not
 // a series; and a list series empty or out of order.
 test "every refusal of a cue by lane, with its hint" {
-    const by_lane_hint = "a cue by lane is a `tween`'s or `bounce`'s `at:`, or the only goal of a `spring` or `newtonian`";
+    const by_lane_hint = "a cue by lane is taken by `tween`'s `at:`, `spring`'s `goals:`, `newtonian`'s `goals:`, or `bounce`'s `at:`";
     const index_hint = "declare the cues the lanes want, `cue NAME = [1s, 1200ms]`, then write `NAME[lane]`";
     const cases = [_]Case{
         .{ .text = "x = tween(from: 0, to: 1, at: beat[lane], over: 1s)\n", .code = .wrong_lanes, .at = "beat[lane]", .hint = "wrap the call in a region, such as `lanes(4, …)`" },
@@ -462,7 +462,7 @@ test "a client's cue parameter refuses a cue by lane" {
     failing.compile_client(&score.nouns, &.{}, text) catch {
         const found = failing.errors()[0];
         try testing.expectEqual(weft.lang.diagnostic.Code.wrong_lanes, found.code);
-        try testing.expectEqualStrings("a cue by lane is a `tween`'s or `bounce`'s `at:`, or the only goal of a `spring` or `newtonian`", found.hint_text());
+        try testing.expectEqualStrings("a cue by lane is taken by `tween`'s `at:`, `spring`'s `goals:`, `newtonian`'s `goals:`, or `bounce`'s `at:`", found.hint_text());
         try compile_client_ok("cue beat = [1s, 2s, 3s]\nn = say(beat[2], \"line\")\n");
         return;
     };

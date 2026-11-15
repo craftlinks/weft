@@ -29,7 +29,6 @@ const time = @import("../core/time.zig");
 
 const Entry = schema.Entry;
 const Default = schema.Default;
-const Op = schema.Op;
 const Role = schema.Role;
 const Class = schema.Class;
 const ease_words = schema.ease_words;
@@ -40,6 +39,63 @@ const params_max = schema.params_max;
 
 fn words_of(comptime E: type) []const []const u8 {
     return comptime std.meta.fieldNames(E);
+}
+
+/// What Weft's back end builds for an entry. The language gives meaning to the first three
+/// (`schema.Op`), which come first here, in the same order; an entry stores one as a `schema.Op`
+/// (`tag`) and the back end reads it back (`op_of`).
+pub const Op = enum(u8) {
+    client = 0,
+    noun = 1,
+    /// `lanes(n, body)`: its body over a region of n lanes (step 17).
+    lanes = 2,
+    wave,
+    noise,
+    tween,
+    spring,
+    newtonian,
+    chase,
+    oscillator,
+    follow,
+    shift,
+    delay,
+    bounce,
+    crossing,
+    cues,
+    input,
+    map,
+    spring_mover,
+    newtonian_mover,
+    /// `vec2`, `vec3`, and `oklab`: scalars packed into one value (step 16).
+    pack,
+    /// `srgb`: a colour from three numbers, converted to OKLab at compile time.
+    srgb,
+    /// A function of one value, the entry's `function` (section 3c).
+    function,
+    /// `min` and `max`: the smaller and the larger of two values (section 3c).
+    minimum,
+    maximum,
+};
+
+comptime {
+    // The language's three tags are Weft's first three, by name and number.
+    const ours = std.meta.fieldNames(schema.Op);
+    for (ours, 0..) |name, at| {
+        assert(std.mem.eql(u8, name, std.meta.fieldNames(Op)[at]));
+        assert(@backingInt(@field(schema.Op, name)) == @backingInt(@field(Op, name)));
+    }
+    assert(ours.len == 3);
+}
+
+/// The language's tag for `op`, which an entry stores.
+pub fn tag(op: Op) schema.Op {
+    return @fromBackingInt(@intCast(@backingInt(op)));
+}
+
+/// Weft's op of `entry`: the tag of any entry of Weft's table, and `client`, `noun`, or `lanes`
+/// for a client's or the language's own.
+pub fn op_of(entry: *const Entry) Op {
+    return @fromBackingInt(@intCast(@backingInt(entry.op)));
 }
 
 /// The kind of a core node, `graph.Op`'s tag.
@@ -76,8 +132,8 @@ pub fn core_op(op: Op) ?OpTag {
 }
 
 /// `graph.Op.class` of an op with the tag `tag`, which reads the tag only.
-fn core_class(tag: OpTag) range.Class {
-    switch (tag) {
+fn core_class(node_tag: OpTag) range.Class {
+    switch (node_tag) {
         inline else => |known| {
             const op = @unionInit(graph.Op, @tagName(known), undefined);
             return op.class();
@@ -110,17 +166,17 @@ const radians_doc = "the signal, in radians, per component of a vector or a colo
 const chase_hint = "chase follows a moving value, and a follower's mover reads signals";
 
 const written = [_]Entry{
-    .{ .name = "wave", .op = .wave, .role = .signal, .lanes = .stagger, .summary = "a wave of a shape at a frequency", .params = &.{
+    .{ .name = "wave", .op = tag(.wave), .role = .signal, .lanes = .stagger, .summary = "a wave of a shape at a frequency", .params = &.{
         .{ .name = "shape", .kind = .word, .positional = true, .words = wave_words, .doc = shape_doc },
         .{ .name = "hz", .kind = .frequency, .positional = true, .doc = "cycles a second" },
         .{ .name = "stagger", .kind = .time, .default = .{ .time = 0 }, .doc = "how much later each lane reads the wave, inside `lanes(n, …)`" },
     } },
-    .{ .name = "noise", .op = .noise, .role = .signal, .lanes = .region, .summary = "seeded noise, smooth or in steps", .params = &.{
+    .{ .name = "noise", .op = tag(.noise), .role = .signal, .lanes = .region, .summary = "seeded noise, smooth or in steps", .params = &.{
         .{ .name = "shape", .kind = .word, .positional = true, .words = noise_words, .doc = "`smooth` is a curve over the drawn values with no kinks, and `steps` holds each for its cycle" },
         .{ .name = "hz", .kind = .frequency, .positional = true, .doc = "drawn values a second" },
         .{ .name = "seed", .kind = .seed, .default = .seed, .doc = seed_doc },
     } },
-    .{ .name = "tween", .op = .tween, .role = .signal, .shape = .{ .agree = .{ "from", "to" } }, .after = .{ .by = "after", .takes = "to" }, .lanes = .stagger, .summary = "a move from one value to another, from a cue", .params = &.{
+    .{ .name = "tween", .op = tag(.tween), .role = .signal, .shape = .{ .agree = .{ "from", "to" } }, .after = .{ .by = "after", .takes = "to" }, .lanes = .stagger, .summary = "a move from one value to another, from a cue", .params = &.{
         .{ .name = "from", .kind = .number, .shaped = true, .default = .after, .doc = "the value it starts from at its cue; left out, the `to` of the tween `after` names" },
         .{ .name = "to", .kind = .number, .shaped = true, .doc = "the value it lands on, exactly, at the end of `over`" },
         .{ .name = "at", .kind = .cue, .by_lane = true, .doc = "the cue it starts at, or `series[lane]` for a cue a lane" },
@@ -129,14 +185,14 @@ const written = [_]Entry{
         .{ .name = "after", .kind = .signal, .shaped = true, .default = .absent, .doc = "the signal it gives before its cue; without one it holds `from` there" },
         .{ .name = "stagger", .kind = .time, .default = .{ .time = 0 }, .doc = stagger_doc },
     } },
-    .{ .name = "spring", .op = .spring, .role = .signal, .shape = .{ .agree = .{ "goals", "from" } }, .lanes = .stagger, .event = "the goal reached", .fixed_hint = chase_hint, .summary = "a spring toward goals at cues", .params = &.{
+    .{ .name = "spring", .op = tag(.spring), .role = .signal, .shape = .{ .agree = .{ "goals", "from" } }, .lanes = .stagger, .event = "the goal reached", .fixed_hint = chase_hint, .summary = "a spring toward goals at cues", .params = &.{
         .{ .name = "goals", .kind = .path, .positional = true, .shaped = true, .by_lane = true, .doc = goals_doc },
         .{ .name = "from", .kind = .number, .shaped = true, .default = .{ .number = 0 }, .doc = goal_from_doc },
         .{ .name = "time", .kind = .time, .doc = spring_time_doc },
         .{ .name = "overshoot", .kind = .number, .default = .{ .number = 0 }, .doc = overshoot_doc },
         .{ .name = "stagger", .kind = .time, .default = .{ .time = 0 }, .doc = "how much later each lane heads for its goals, inside `lanes(n, …)`" },
     } },
-    .{ .name = "newtonian", .op = .newtonian, .role = .signal, .shape = .{ .agree = .{ "goals", "from" } }, .lanes = .stagger, .event = "the goal reached", .fixed_hint = chase_hint, .summary = "a Newtonian move toward goals at cues", .params = &.{
+    .{ .name = "newtonian", .op = tag(.newtonian), .role = .signal, .shape = .{ .agree = .{ "goals", "from" } }, .lanes = .stagger, .event = "the goal reached", .fixed_hint = chase_hint, .summary = "a Newtonian move toward goals at cues", .params = &.{
         .{ .name = "goals", .kind = .path, .positional = true, .shaped = true, .by_lane = true, .doc = goals_doc },
         .{ .name = "from", .kind = .number, .shaped = true, .default = .{ .number = 0 }, .doc = goal_from_doc },
         .{ .name = "speed", .kind = .number, .doc = speed_doc },
@@ -144,18 +200,18 @@ const written = [_]Entry{
         .{ .name = "decel", .kind = .number, .doc = decel_doc },
         .{ .name = "stagger", .kind = .time, .default = .{ .time = 0 }, .doc = "how much later each lane heads for its goals, inside `lanes(n, …)`" },
     } },
-    .{ .name = "chase", .op = .chase, .role = .signal, .shape = .{ .of = "target" }, .summary = "a spring chasing a signal", .params = &.{
+    .{ .name = "chase", .op = tag(.chase), .role = .signal, .shape = .{ .of = "target" }, .summary = "a spring chasing a signal", .params = &.{
         .{ .name = "target", .kind = .signal, .positional = true, .shaped = true, .doc = "the signal it heads for, read at each step of 1/480 s" },
         .{ .name = "from", .kind = .number, .default = .{ .number = 0 }, .doc = start_from_doc },
         .{ .name = "time", .kind = .time, .live = true, .doc = spring_time_doc },
         .{ .name = "overshoot", .kind = .number, .live = true, .default = .{ .number = 0 }, .doc = overshoot_doc },
     } },
-    .{ .name = "oscillator", .op = .oscillator, .role = .signal, .summary = "a wave whose rate is a signal", .params = &.{
+    .{ .name = "oscillator", .op = tag(.oscillator), .role = .signal, .summary = "a wave whose rate is a signal", .params = &.{
         .{ .name = "shape", .kind = .word, .positional = true, .words = wave_words, .doc = shape_doc },
         .{ .name = "rate", .kind = .signal, .doc = "the signal of its cycles a second, read at each step of 1/480 s, which may be negative" },
         .{ .name = "phase", .kind = .number, .default = .{ .number = 0 }, .doc = "where in its cycle it is at the start cue, in turns, in [0, 1)" },
     } },
-    .{ .name = "follow", .op = .follow, .role = .signal, .lanes = .region, .event = "the goal reached", .summary = "a follower of goals drawn from regions", .params = &.{
+    .{ .name = "follow", .op = tag(.follow), .role = .signal, .lanes = .region, .event = "the goal reached", .summary = "a follower of goals drawn from regions", .params = &.{
         .{ .name = "regions", .kind = .regions, .positional = true, .doc = "the ranges it draws its goals from, as `[low..high, …]` or their name" },
         .{ .name = "from", .kind = .number, .default = .{ .number = 0 }, .doc = start_from_doc },
         .{ .name = "by", .kind = .mover, .doc = "how it moves to each goal: `spring(time: …)` or `newtonian(speed: …, accel: …, decel: …)`" },
@@ -164,7 +220,7 @@ const written = [_]Entry{
         .{ .name = "pause", .kind = .time_range, .default = zero_pause, .doc = "the shortest and longest rest after it arrives, drawn each time" },
         .{ .name = "seed", .kind = .seed, .default = .seed, .doc = seed_doc },
     } },
-    .{ .name = "shift", .op = .shift, .role = .signal, .lanes = .region, .event = "the value of the bucket entered", .summary = "a shift register of drawn buckets", .params = &.{
+    .{ .name = "shift", .op = tag(.shift), .role = .signal, .lanes = .region, .event = "the value of the bucket entered", .summary = "a shift register of drawn buckets", .params = &.{
         .{ .name = "range", .kind = .number_range, .positional = true, .doc = "the range its buckets' values are drawn from" },
         .{ .name = "buckets", .kind = .integer, .doc = "how many values it holds and visits in turn, from 1 to 64" },
         .{ .name = "period", .kind = .time, .doc = "how long one pass over every bucket takes" },
@@ -172,97 +228,94 @@ const written = [_]Entry{
         .{ .name = "shape", .kind = .word, .words = shift_words, .doc = "`steps` holds each bucket, `linear` runs to the next, `smooth` curves through the midpoints" },
         .{ .name = "seed", .kind = .seed, .default = .seed, .doc = seed_doc },
     } },
-    .{ .name = "delay", .op = .delay, .role = .signal, .fed = true, .lanes = .region, .summary = "its input from one step before, fed by `<-`", .params = &.{
+    .{ .name = "delay", .op = tag(.delay), .role = .signal, .fed = true, .example = "delay(0)", .lanes = .region, .summary = "its input from one step before, fed by `<-`", .params = &.{
         .{ .name = "initial", .kind = .number, .positional = true, .doc = "its value at the start cue, before a step of 1/480 s has passed" },
     } },
-    .{ .name = "bounce", .op = .bounce, .role = .signal, .lanes = .stagger, .event = "the velocity just before the hit: +speed at the top, -speed at the bottom", .first_output = "position", .outputs = &.{"velocity"}, .summary = "a value bouncing between two walls", .params = &.{
+    .{ .name = "bounce", .op = tag(.bounce), .role = .signal, .lanes = .stagger, .event = "the velocity just before the hit: +speed at the top, -speed at the bottom", .first_output = "position", .outputs = &.{"velocity"}, .summary = "a value bouncing between two walls", .params = &.{
         .{ .name = "range", .kind = .number_range, .positional = true, .doc = "the two walls, `low..high`" },
         .{ .name = "speed", .kind = .number, .doc = "how fast it moves between the walls, in units a second" },
         .{ .name = "at", .kind = .cue, .by_lane = true, .doc = "the cue it leaves the low wall at, going up, or `series[lane]` for a cue a lane" },
         .{ .name = "stagger", .kind = .time, .default = .{ .time = 0 }, .doc = stagger_doc },
     } },
-    .{ .name = "crossing", .op = .crossing, .role = .signal, .event = "the slope over the step of the crossing, in units a second", .summary = "a gate on a level, firing at each crossing", .params = &.{
+    .{ .name = "crossing", .op = tag(.crossing), .role = .signal, .event = "the slope over the step of the crossing, in units a second", .summary = "a gate on a level, firing at each crossing", .params = &.{
         .{ .name = "input", .kind = .signal, .positional = true, .doc = "the signal it watches, compared at each step of 1/480 s for its events" },
         .{ .name = "level", .kind = .number, .doc = "the gate is 1 while the input is at or above it, and 0 below" },
         .{ .name = "direction", .kind = .word, .default = .{ .word = 0 }, .words = direction_words, .doc = "which crossings fire an event" },
     } },
-    .{ .name = "cues", .op = .cues, .role = .signal, .lanes = .one, .event = "the index of the cue in its table", .summary = "the count of cues passed, firing at each", .params = &.{
+    .{ .name = "cues", .op = tag(.cues), .role = .signal, .lanes = .one, .event = "the index of the cue in its table", .summary = "the count of cues passed, firing at each", .params = &.{
         .{ .name = "first", .kind = .cues, .positional = true, .doc = "the series it counts, by name, or the one cue it starts at" },
         .{ .name = "count", .kind = .integer, .default = .whole, .doc = "how many cues it counts from `first`, in time order; by default the whole series, or the one cue" },
     } },
-    .{ .name = "input", .op = .input, .role = .signal, .lanes = .one, .summary = "a live value the client sets", .params = &.{
+    .{ .name = "input", .op = tag(.input), .role = .signal, .lanes = .one, .summary = "a live value the client sets", .params = &.{
         .{ .name = "range", .kind = .number_range, .positional = true, .default = .unbounded, .doc = "the range a value the client sets is clamped into" },
         .{ .name = "initial", .kind = .number, .default = .{ .number = 0 }, .doc = "its value until the client first sets one" },
     } },
-    .{ .name = "map", .op = .map, .role = .signal, .shape = .{ .of = "input" }, .summary = "a signal moved from one range to another", .params = &.{
+    .{ .name = "map", .op = tag(.map), .role = .signal, .shape = .{ .of = "input" }, .summary = "a signal moved from one range to another", .params = &.{
         .{ .name = "input", .kind = .signal, .positional = true, .shaped = true, .doc = "the signal it moves, per component of a vector" },
         .{ .name = "from", .kind = .number_range, .positional = true, .doc = "the input's range that lands on `to`, with no clamp outside it" },
         .{ .name = "to", .kind = .number_range, .doc = "where `from` lands, low end on low end, so `1..0` flips it" },
     } },
-    .{ .name = "abs", .op = .function, .function = .abs, .role = .signal, .shape = .{ .of = "input" }, .summary = "the absolute value of a signal, per component", .params = &.{
+    .{ .name = "abs", .op = tag(.function), .function = .abs, .role = .signal, .folds = true, .shape = .{ .of = "input" }, .summary = "the absolute value of a signal, per component", .params = &.{
         .{ .name = "input", .kind = .signal, .positional = true, .shaped = true, .doc = function_input_doc },
     } },
-    .{ .name = "sin", .op = .function, .function = .sin, .role = .signal, .shape = .{ .of = "input" }, .summary = "the sine of a signal in radians, per component", .params = &.{
+    .{ .name = "sin", .op = tag(.function), .function = .sin, .role = .signal, .folds = true, .shape = .{ .of = "input" }, .summary = "the sine of a signal in radians, per component", .params = &.{
         .{ .name = "input", .kind = .signal, .positional = true, .shaped = true, .doc = radians_doc },
     } },
-    .{ .name = "cos", .op = .function, .function = .cos, .role = .signal, .shape = .{ .of = "input" }, .summary = "the cosine of a signal in radians, per component", .params = &.{
+    .{ .name = "cos", .op = tag(.function), .function = .cos, .role = .signal, .folds = true, .shape = .{ .of = "input" }, .summary = "the cosine of a signal in radians, per component", .params = &.{
         .{ .name = "input", .kind = .signal, .positional = true, .shaped = true, .doc = radians_doc },
     } },
-    .{ .name = "exp", .op = .function, .function = .exp, .role = .signal, .shape = .{ .of = "input" }, .summary = "e to the power of a signal, held at e^709, per component", .params = &.{
+    .{ .name = "exp", .op = tag(.function), .function = .exp, .role = .signal, .folds = true, .shape = .{ .of = "input" }, .summary = "e to the power of a signal, held at e^709, per component", .params = &.{
         .{ .name = "input", .kind = .signal, .positional = true, .shaped = true, .doc = function_input_doc },
     } },
-    .{ .name = "ln", .op = .function, .function = .ln, .role = .signal, .shape = .{ .of = "input" }, .summary = "the natural log of a signal, held at the log of 2^-1074 at and below 0, per component", .params = &.{
+    .{ .name = "ln", .op = tag(.function), .function = .ln, .role = .signal, .folds = true, .shape = .{ .of = "input" }, .summary = "the natural log of a signal, held at the log of 2^-1074 at and below 0, per component", .params = &.{
         .{ .name = "input", .kind = .signal, .positional = true, .shaped = true, .doc = function_input_doc },
     } },
-    .{ .name = "sqrt", .op = .function, .function = .sqrt, .role = .signal, .shape = .{ .of = "input" }, .summary = "the square root of a signal, 0 at and below 0, per component", .params = &.{
+    .{ .name = "sqrt", .op = tag(.function), .function = .sqrt, .role = .signal, .folds = true, .shape = .{ .of = "input" }, .summary = "the square root of a signal, 0 at and below 0, per component", .params = &.{
         .{ .name = "input", .kind = .signal, .positional = true, .shaped = true, .doc = function_input_doc },
     } },
-    .{ .name = "floor", .op = .function, .function = .floor, .role = .signal, .shape = .{ .of = "input" }, .summary = "the largest whole number at or below a signal, per component", .params = &.{
+    .{ .name = "floor", .op = tag(.function), .function = .floor, .role = .signal, .folds = true, .shape = .{ .of = "input" }, .summary = "the largest whole number at or below a signal, per component", .params = &.{
         .{ .name = "input", .kind = .signal, .positional = true, .shaped = true, .doc = function_input_doc },
     } },
-    .{ .name = "round", .op = .function, .function = .round, .role = .signal, .shape = .{ .of = "input" }, .summary = "the nearest whole number to a signal, a half away from zero, per component", .params = &.{
+    .{ .name = "round", .op = tag(.function), .function = .round, .role = .signal, .folds = true, .shape = .{ .of = "input" }, .summary = "the nearest whole number to a signal, a half away from zero, per component", .params = &.{
         .{ .name = "input", .kind = .signal, .positional = true, .shaped = true, .doc = function_input_doc },
     } },
-    .{ .name = "pow", .op = .function, .function = .{ .pow = 0 }, .role = .signal, .shape = .{ .of = "input" }, .summary = "a signal to a whole power from 2 to 8, per component", .params = &.{
+    .{ .name = "pow", .op = tag(.function), .function = .{ .pow = 0 }, .role = .signal, .folds = true, .shape = .{ .of = "input" }, .summary = "a signal to a whole power from 2 to 8, per component", .params = &.{
         .{ .name = "input", .kind = .signal, .positional = true, .shaped = true, .doc = function_input_doc },
-        .{ .name = "n", .kind = .integer, .positional = true, .doc = "the power, a whole number literal from 2 to 8" },
+        .{ .name = "n", .kind = .integer, .positional = true, .range = .{ elementary.power_min, elementary.power_max }, .hint = "for 1 write the signal itself; for more than 8 multiply two, such as `pow(x, 8) * pow(x, 2)`", .doc = "the power, a whole number literal from 2 to 8" },
     } },
-    .{ .name = "min", .op = .minimum, .role = .signal, .shape = .{ .combine = .{ "a", "b" } }, .summary = "the smaller of two signals, per component", .params = &.{
+    .{ .name = "min", .op = tag(.minimum), .role = .signal, .folds = true, .shape = .{ .combine = .{ "a", "b" } }, .summary = "the smaller of two signals, per component", .params = &.{
         .{ .name = "a", .kind = .signal, .positional = true, .shaped = true, .doc = "one of the two, a number meeting each component of a vector or a colour" },
         .{ .name = "b", .kind = .signal, .positional = true, .shaped = true, .doc = "the other, as `a`" },
     } },
-    .{ .name = "max", .op = .maximum, .role = .signal, .shape = .{ .combine = .{ "a", "b" } }, .summary = "the larger of two signals, per component", .params = &.{
+    .{ .name = "max", .op = tag(.maximum), .role = .signal, .folds = true, .shape = .{ .combine = .{ "a", "b" } }, .summary = "the larger of two signals, per component", .params = &.{
         .{ .name = "a", .kind = .signal, .positional = true, .shaped = true, .doc = "one of the two, a number meeting each component of a vector or a colour" },
         .{ .name = "b", .kind = .signal, .positional = true, .shaped = true, .doc = "the other, as `a`" },
     } },
-    .{ .name = "vec2", .op = .pack, .role = .signal, .shape = .{ .constructor = .{} }, .summary = "a 2D vector of two signals", .params = &.{
+    .{ .name = "vec2", .op = tag(.pack), .role = .signal, .shape = .{ .constructor = .{} }, .summary = "a 2D vector of two signals", .params = &.{
         .{ .name = "x", .kind = .signal, .positional = true, .doc = "the first component, `.x`" },
         .{ .name = "y", .kind = .signal, .positional = true, .doc = "the second component, `.y`" },
     } },
-    .{ .name = "vec3", .op = .pack, .role = .signal, .shape = .{ .constructor = .{} }, .summary = "a 3D vector of three signals", .params = &.{
+    .{ .name = "vec3", .op = tag(.pack), .role = .signal, .shape = .{ .constructor = .{} }, .summary = "a 3D vector of three signals", .params = &.{
         .{ .name = "x", .kind = .signal, .positional = true, .doc = "the first component, `.x`" },
         .{ .name = "y", .kind = .signal, .positional = true, .doc = "the second component, `.y`" },
         .{ .name = "z", .kind = .signal, .positional = true, .doc = "the third component, `.z`" },
     } },
-    .{ .name = "oklab", .op = .pack, .role = .signal, .shape = .{ .constructor = .{ .colour = true } }, .summary = "a colour of three signals: lightness and the a and b axes of OKLab", .params = &.{
+    .{ .name = "oklab", .op = tag(.pack), .role = .signal, .shape = .{ .constructor = .{ .colour = true } }, .summary = "a colour of three signals: lightness and the a and b axes of OKLab", .params = &.{
         .{ .name = "l", .kind = .signal, .positional = true, .doc = "the lightness, from 0 for black to 1 for white" },
         .{ .name = "a", .kind = .signal, .positional = true, .doc = "the green to red axis, green below 0 and red above" },
         .{ .name = "b", .kind = .signal, .positional = true, .doc = "the blue to yellow axis, blue below 0 and yellow above" },
     } },
-    .{ .name = "srgb", .op = .srgb, .role = .signal, .shape = .{ .constructor = .{ .colour = true, .converts = true } }, .summary = "a colour of three sRGB numbers in [0, 1], kept as OKLab", .params = &.{
-        .{ .name = "r", .kind = .number, .positional = true, .doc = "red, from 0 to 1" },
-        .{ .name = "g", .kind = .number, .positional = true, .doc = "green, from 0 to 1" },
-        .{ .name = "b", .kind = .number, .positional = true, .doc = "blue, from 0 to 1" },
+    .{ .name = "srgb", .op = tag(.srgb), .role = .signal, .shape = .{ .constructor = .{ .colour = true, .converts = true } }, .summary = "a colour of three sRGB numbers in [0, 1], kept as OKLab", .params = &.{
+        .{ .name = "r", .kind = .number, .positional = true, .range = .{ 0, 1 }, .hint = "write each of r, g, and b from 0 to 1", .doc = "red, from 0 to 1" },
+        .{ .name = "g", .kind = .number, .positional = true, .range = .{ 0, 1 }, .hint = "write each of r, g, and b from 0 to 1", .doc = "green, from 0 to 1" },
+        .{ .name = "b", .kind = .number, .positional = true, .range = .{ 0, 1 }, .hint = "write each of r, g, and b from 0 to 1", .doc = "blue, from 0 to 1" },
     } },
-    .{ .name = "lanes", .op = .lanes, .role = .signal, .lanes = .makes, .summary = "its body over n lanes, each with its own `lane`, seeds, and stagger", .params = &.{
-        .{ .name = "count", .kind = .integer, .positional = true, .doc = "how many lanes, numbered from 0 by `lane`" },
-        .{ .name = "body", .kind = .signal, .positional = true, .shaped = true, .doc = "what each lane computes, a name bound outside shared by them all" },
-    } },
-    .{ .name = "spring", .op = .spring_mover, .role = .mover, .lanes = .one, .summary = "a follower's spring", .params = &.{
+    schema.lanes_entry,
+    .{ .name = "spring", .op = tag(.spring_mover), .role = .mover, .example = "spring(time: 0.5s)", .lanes = .one, .summary = "a follower's spring", .params = &.{
         .{ .name = "time", .kind = .time, .live = true, .doc = spring_time_doc },
         .{ .name = "overshoot", .kind = .number, .live = true, .default = .{ .number = 0 }, .doc = overshoot_doc },
     } },
-    .{ .name = "newtonian", .op = .newtonian_mover, .role = .mover, .lanes = .one, .summary = "a follower's Newtonian move", .params = &.{
+    .{ .name = "newtonian", .op = tag(.newtonian_mover), .role = .mover, .example = "newtonian(speed: 1, accel: 2, decel: 2)", .lanes = .one, .summary = "a follower's Newtonian move", .params = &.{
         .{ .name = "speed", .kind = .number, .live = true, .doc = speed_doc },
         .{ .name = "accel", .kind = .number, .live = true, .doc = accel_doc },
         .{ .name = "decel", .kind = .number, .live = true, .doc = decel_doc },
@@ -274,7 +327,7 @@ pub const entries = filled: {
     @setEvalBranchQuota(10_000);
     var list = written;
     for (&list) |*entry| {
-        entry.node_class = if (core_op(entry.op)) |tag| switch (core_class(tag)) {
+        entry.node_class = if (core_op(op_of(entry))) |core| switch (core_class(core)) {
             .pure => .pure,
             .exact => .exact,
             .simulated => .simulated,
@@ -289,7 +342,7 @@ comptime {
     @setEvalBranchQuota(20_000);
     for (&entries) |*entry| {
         schema.assert_entry(entry);
-        assert((entry.op == .function) == (entry.function != null));
+        assert((op_of(entry) == .function) == (entry.function != null));
         // Weft's own entries also keep a default to its kind, which a client's need not.
         for (entry.params) |param_a| {
             switch (param_a.default) {
@@ -330,29 +383,37 @@ comptime {
 pub fn core_function(function: schema.Function) graph.Function {
     return switch (function) {
         .pow => |n| .{ .pow = n },
-        inline else => |_, tag| @unionInit(graph.Function, @tagName(tag), {}),
+        inline else => |_, function_tag| @unionInit(graph.Function, @tagName(function_tag), {}),
     };
 }
 
-fn fold(function: schema.Function, x: f64) f64 {
-    return core_function(function).of(x);
+/// The value of a call of a folding entry of Weft's table (section 3c): a function of one value
+/// through the core's function, `min` and `max` through the core's own.
+fn fold(entry: *const Entry, operands: [2]f64) f64 {
+    switch (op_of(entry)) {
+        .function => {
+            assert(entry.params.len == 1 or entry.params.len == 2);
+            const n: u64 = @intFromFloat(operands[1]);
+            return core_function(entry.function_of(n).?).of(operands[0]);
+        },
+        .minimum => return graph.minimum(operands[0], operands[1]),
+        .maximum => return graph.maximum(operands[0], operands[1]),
+        else => unreachable,
+    }
 }
 
-fn fold_pair(op: Op, a: f64, b: f64) f64 {
-    assert(op == .minimum or op == .maximum);
-    return if (op == .minimum) graph.minimum(a, b) else graph.maximum(a, b);
-}
-
-fn from_srgb(rgb: [3]f64) [3]f64 {
-    return colour.from_srgb(rgb);
+/// The sRGB numbers a call of `srgb` is written with, as the colour the language keeps.
+fn convert(entry: *const Entry, values: [4]f64) [4]f64 {
+    assert(op_of(entry) == .srgb);
+    const lab = colour.from_srgb(.{ values[0], values[1], values[2] });
+    return .{ lab[0], lab[1], lab[2], 0 };
 }
 
 /// What Weft gives the language's checker and formatter.
 pub const vocabulary: schema.Vocabulary = .{
     .entries = &entries,
     .fold = fold,
-    .fold_pair = fold_pair,
-    .from_srgb = from_srgb,
+    .convert = convert,
     .seed_hash = noise.hash,
 };
 
@@ -367,8 +428,8 @@ const testing = std.testing;
 test "spring is a signal with goals and a mover without" {
     const signal = find("spring", .signal).?;
     const mover = find("spring", .mover).?;
-    try testing.expectEqual(Op.spring, signal.op);
-    try testing.expectEqual(Op.spring_mover, mover.op);
+    try testing.expectEqual(Op.spring, op_of(signal));
+    try testing.expectEqual(Op.spring_mover, op_of(mover));
     try testing.expectEqual(@as(?u32, 0), signal.param("goals"));
     try testing.expectEqual(null, mover.param("goals"));
     try testing.expectEqual(@as(u32, 1), signal.positional_count());
@@ -418,85 +479,10 @@ test "a call's class comes from the core op it builds" {
     try testing.expectEqual(null, noun.class());
 }
 
-// The switches this step moved onto the entries, kept as they were so every entry's fields can be
-// held to them. Step 55 removes them and the test below with the enum.
-fn old_lanes(op: Op) schema.LaneRule {
-    return switch (op) {
-        .noise, .follow, .shift, .delay => .region,
-        .wave, .tween, .spring, .newtonian, .bounce => .stagger,
-        .chase, .crossing, .map, .oscillator, .pack, .srgb, .client => .inputs,
-        .function, .minimum, .maximum => .inputs,
-        .cues, .input, .spring_mover, .newtonian_mover => .one,
-        .lanes => .makes,
-        .noun => .apart,
-    };
-}
-
-fn old_event(op: Op) ?[]const u8 {
-    return switch (op) {
-        .bounce => "the velocity just before the hit: +speed at the top, -speed at the bottom",
-        .crossing => "the slope over the step of the crossing, in units a second",
-        .cues => "the index of the cue in its table",
-        .spring, .newtonian, .follow => "the goal reached",
-        .shift => "the value of the bucket entered",
-        else => null,
-    };
-}
-
-fn old_fixed_hint(op: Op) []const u8 {
-    return switch (op) {
-        .spring, .newtonian => "chase follows a moving value, and a follower's mover reads signals",
-        else => "",
-    };
-}
-
-/// What `call_shape` and `constant_vector` once read from the op and the name `oklab`.
-fn old_shape(entry: Entry) schema.ShapeRule {
-    return switch (entry.op) {
-        .pack => .{ .constructor = .{ .colour = std.mem.eql(u8, entry.name, "oklab") } },
-        .srgb => .{ .constructor = .{ .colour = true, .converts = true } },
-        .tween => .{ .agree = .{ "from", "to" } },
-        .spring, .newtonian => .{ .agree = .{ "goals", "from" } },
-        .chase => .{ .of = "target" },
-        .map => .{ .of = "input" },
-        .function => .{ .of = "input" },
-        .minimum, .maximum => .{ .combine = .{ "a", "b" } },
-        else => .one,
-    };
-}
-
-/// What `after_to` and `tween_named` once read from the op: only `tween` continues a call.
-fn old_after(op: Op) ?schema.After {
-    return if (op == .tween) .{ .by = "after", .takes = "to" } else null;
-}
-
-// Locks that every entry's `lanes`, `event`, `fixed_hint`, and `first_output` are what the old
-// switches gave: only a bounce names a first output, only a spring and a Newtonian move have a
-// fixed hint, and the seven event sentences are word for word; its `shape` is what `call_shape`
-// switched on (a constructor's colour, which pair agrees, which parameter a call takes its shape
-// from), only `delay` is `fed`, and only `tween` has an `after`, and a `by_lane` parameter is where the op tests let one be.
-// Step 55 removes this test with the enum.
-test "the entries' fields equal the old switches" {
-    for (entries) |entry| {
-        try testing.expectEqual(old_lanes(entry.op), entry.lane_rule());
-        try testing.expectEqualDeep(old_event(entry.op), entry.event_value());
-        try testing.expectEqualStrings(old_fixed_hint(entry.op), entry.fixed_hint);
-        const expected: []const u8 = if (entry.op == .bounce) "position" else "";
-        try testing.expectEqualStrings(expected, entry.first_output);
-        try testing.expectEqualDeep(old_shape(entry), entry.shape);
-        try testing.expectEqual(entry.op == .delay, entry.fed);
-        try testing.expectEqualDeep(old_after(entry.op), entry.after);
-        for (entry.params) |param| {
-            if (!param.by_lane) continue;
-            const old = switch (param.kind) {
-                .cue => entry.op == .tween or entry.op == .bounce,
-                .path => entry.op == .spring or entry.op == .newtonian,
-                else => false,
-            };
-            try testing.expect(old);
-        }
-    }
+// Locks that `bounce` names its first output `position`, which its builder's tests use.
+test "a bounce's first output is its position" {
     try testing.expectEqual(@as(?u32, 0), find("bounce", .signal).?.output("position"));
+    try testing.expectEqualStrings("position", find("bounce", .signal).?.first_output);
 }
 
 // The formatter's tests, here since they format Weft's calls in the order of Weft's table (step 53).

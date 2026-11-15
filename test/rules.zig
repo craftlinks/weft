@@ -164,6 +164,6 @@ test "the language imports only std and its own files" {
             from = start + length;
         }
     }
-    try testing.expectEqual(@as(usize, 8), files);
+    try testing.expectEqual(@as(usize, 9), files);
     try testing.expect(imports >= 8);
 }

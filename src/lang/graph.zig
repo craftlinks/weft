@@ -306,7 +306,7 @@ const Back = struct {
         const v = checked.call_values(call);
         const item = checked.calls[call].item;
         const builder = &back.builder;
-        switch (entry.op) {
+        switch (table.op_of(entry)) {
             // The checker binds a noun as a declaration, never as an expression.
             .noun => unreachable,
             .client => {
@@ -502,7 +502,7 @@ const Back = struct {
                 const m = checked.call_values(mover_call);
                 var mover: simulation.Mover = undefined;
                 var from: graph.MoverFrom = .{};
-                switch (checked.calls[mover_call].entry.op) {
+                switch (table.op_of(checked.calls[mover_call].entry)) {
                     .spring_mover => {
                         const time = try back.live_time(m[0]);
                         const overshoot = try back.live_number(m[1], 0, valid_overshoot);
@@ -603,7 +603,7 @@ const Back = struct {
             .minimum, .maximum => {
                 const a = try back.signal_id(v[0]);
                 const b = try back.signal_id(v[1]);
-                const result = switch (entry.op) {
+                const result = switch (table.op_of(entry)) {
                     .minimum => builder.minimum(a, b),
                     else => builder.maximum(a, b),
                 };
@@ -620,7 +620,7 @@ const Back = struct {
     /// A builder error as a diagnostic on the argument it is about (section 4).
     fn refuse(back: *Back, err: Builder.Error, item: u32, call: ?u32) Fail {
         const entry_name = if (call) |at| back.checked.calls[at].entry.name else "this";
-        const op: ?schema.Op = if (call) |at| back.checked.calls[at].entry.op else null;
+        const op: ?table.Op = if (call) |at| table.op_of(back.checked.calls[at].entry) else null;
         const Code = error_module.Code;
         const At = struct { param: []const u8, message: []const u8, hint: []const u8 = "" };
         const at: At = switch (err) {
@@ -677,7 +677,7 @@ const Back = struct {
         const record = back.checked.calls[call];
         const items = back.checked.call_value_items(call);
         if (record.entry.param(name)) |index| return items[index];
-        if (record.entry.op == .follow) {
+        if (table.op_of(record.entry) == .follow) {
             const mover = back.checked.calls[back.checked.call_values(call)[2].mover];
             if (mover.entry.param(name)) |index| return back.checked.call_value_items(back.checked.call_values(call)[2].mover)[index];
             return items[2];
@@ -916,7 +916,7 @@ fn refuse_slab(back: *Back, most: Most, complete: bool) void {
 fn goal_source(back: *const Back, expr_index: u32) GoalSource {
     const expr = back.checked.exprs[expr_index];
     if (expr.tag != .call or expr.b != 0) return .none;
-    return switch (back.checked.calls[expr.a].entry.op) {
+    return switch (table.op_of(back.checked.calls[expr.a].entry)) {
         .spring, .newtonian, .chase => back.goal,
         else => .none,
     };

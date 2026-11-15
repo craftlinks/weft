@@ -36,7 +36,7 @@
 //!
 //! `abs`, `min`, and `max` (step 26), and step 33's functions of a value, are calls, not
 //! operators, and fold the same way: given only numbers, the call is the constant the back
-//! end's own function gives (`Vocabulary.fold` and `fold_pair`), the bits its node would hold, so `max(1, 2)` builds one node, and a module such as `std`'s `clamp` given numbers
+//! end's own function gives (`Vocabulary.fold`), the bits its node would hold, so `max(1, 2)` builds one node, and a module such as `std`'s `clamp` given numbers
 //! builds none of its own. The call's record stays in `calls`, which a back end never reaches
 //! from an expression. A power that overflows folds to an infinity, which the back end refuses
 //! as it refuses `1e300 * 1e300`. `pow`'s `n` is a whole number from 2 to 8, fixed when the
@@ -1075,14 +1075,14 @@ const Checker = struct {
         const name = checker.tree.token_text(it.token);
         const target = checker.find(name) orelse {
             const diagnostic = checker.fail_token(index, .unknown_name, "`{s}` is not declared", .{name});
-            error_module.hint(diagnostic, "declare it above, such as `{s} = delay(0)`", .{name});
+            if (checker.first_example(.fed)) |example| error_module.hint(diagnostic, "declare it above, such as `{s} = {s}`", .{ name, example });
             return error.Checked;
         };
         const binding = &checker.memory.bindings[target];
         if (binding.kind == .failed) return checker.reported();
         if (!binding.delay) {
             const diagnostic = checker.fail_token(index, .not_a_delay, "only a delay is fed with `<-`, and `{s}` is not one", .{name});
-            error_module.hint(diagnostic, "declare it as `{s} = delay(0)`", .{name});
+            if (checker.first_example(.fed)) |example| error_module.hint(diagnostic, "declare it as `{s} = {s}`", .{ name, example });
             return error.Checked;
         }
         if (binding.fed) {
@@ -1107,10 +1107,41 @@ const Checker = struct {
         try checker.push_declaration(index, .{ .feed = .{ .binding = target, .expr = expr, .item = index } });
     }
 
+    /// The example of the first entry that is `fed`, or the first mover, of the vocabulary and then
+    /// the client's entries; null where none has one, so a hint that needs it is left out.
+    fn first_example(checker: *const Checker, which: enum { fed, mover }) ?[]const u8 {
+        for (checker.memory.vocabulary.entries) |entry| {
+            if (entry.example.len > 0 and example_wanted(&entry, which == .fed)) return entry.example;
+        }
+        for (checker.memory.clients) |entry| {
+            if (entry.example.len > 0 and example_wanted(&entry, which == .fed)) return entry.example;
+        }
+        return null;
+    }
+
+    /// The example of every mover entry, in backquotes and joined by " or ", as far as `buffer`
+    /// holds them.
+    fn mover_examples(checker: *const Checker, buffer: *[hint_list_size]u8) []const u8 {
+        var stream = std.Io.Writer.fixed(buffer);
+        var count: u32 = 0;
+        const lists = [2][]const Entry{ checker.memory.vocabulary.entries, checker.memory.clients };
+        for (lists) |list| {
+            for (list) |entry| {
+                if (entry.role != .mover or entry.example.len == 0) continue;
+                const joiner: []const u8 = if (count > 0) " or " else "";
+                stream.print("{s}`{s}`", .{ joiner, entry.example }) catch return stream.buffered();
+                count += 1;
+            }
+        }
+        return stream.buffered();
+    }
+
     /// A delay inside an expression has no name, so no `<-` can feed it (section 2).
     fn unreachable_delay(checker: *Checker, index: u32) Fail {
         const diagnostic = checker.fail(index, .not_a_delay, "a delay is fed by its name, so it is a declaration's whole value", .{});
-        error_module.hint(diagnostic, "declare it alone, such as `fb = delay(0)`, feed it with `fb <- …`, then use `fb`", .{});
+        if (checker.first_example(.fed)) |example| {
+            error_module.hint(diagnostic, "declare it alone, such as `fb = {s}`, feed it with `fb <- …`, then use `fb`", .{example});
+        }
         return error.Checked;
     }
 
@@ -1248,27 +1279,23 @@ const Checker = struct {
         }
     }
 
-    /// The constant a call of `abs`, `min`, or `max` given only numbers folds to (section 3), or
-    /// null for any other call.
+    /// The constant a call of an entry that `folds` given only numbers folds to (section 3), or
+    /// null for any other call. The operands go in parameter order, an integer as a number.
     fn folded(checker: *const Checker, call: u32) ?f64 {
         const entry = checker.memory.calls[call].entry;
+        if (!entry.folds) return null;
         const first = checker.memory.calls[call].values;
         const values = checker.memory.values[first..][0..entry.params.len];
-        switch (entry.op) {
-            .function => {
-                assert(values.len == 1 or values.len == 2);
-                const x = checker.is_constant(values[0].signal) orelse return null;
-                const n = if (values.len == 2) values[1].integer else 0;
-                return checker.memory.vocabulary.fold(entry.function_of(n).?, x);
-            },
-            .minimum, .maximum => {
-                assert(values.len == 2);
-                const a = checker.is_constant(values[0].signal) orelse return null;
-                const b = checker.is_constant(values[1].signal) orelse return null;
-                return checker.memory.vocabulary.fold_pair(entry.op, a, b);
-            },
-            else => return null,
+        assert(values.len <= 2);
+        var operands: [2]f64 = .{ 0, 0 };
+        for (values, 0..) |value, at| {
+            operands[at] = switch (value) {
+                .signal => |expr| checker.is_constant(expr) orelse return null,
+                .integer => |whole| @floatFromInt(whole),
+                else => unreachable,
+            };
         }
+        return checker.memory.vocabulary.fold(entry, operands);
     }
 
     /// The number `index` divides by (section 3): a constant with a finite reciprocal.
@@ -1589,7 +1616,7 @@ const Checker = struct {
         return switch (param.default) {
             .required => {
                 const diagnostic = checker.fail_token(index, .missing_argument, "{s} needs `{s}`", .{ entry.name, param.name });
-                error_module.hint(diagnostic, "add `{s}: {s}`", .{ param.name, example_of(param) });
+                error_module.hint(diagnostic, "add `{s}: {s}`", .{ param.name, example_of(checker, param) });
                 return error.Checked;
             },
             .absent => .absent,
@@ -1686,6 +1713,9 @@ const Checker = struct {
     /// The entry called `name` in `role`: a primitive, else one of the client's nouns.
     fn lookup(checker: *const Checker, name: []const u8, role: schema.Role) ?*const Entry {
         if (checker.memory.vocabulary.find(name, role)) |entry| return entry;
+        for (&schema.language_entries) |*entry| {
+            if (entry.role == role and std.mem.eql(u8, entry.name, name)) return entry;
+        }
         for (checker.memory.clients) |*entry| {
             if (entry.role == role and std.mem.eql(u8, entry.name, name)) return entry;
         }
@@ -1952,12 +1982,12 @@ const Checker = struct {
     }
 
     /// A mover: a primitive mover, or a module whose body is one (section 6).
-    fn mover_of(checker: *Checker, index: u32) Fail!u32 {
+    fn mover_of(checker: *Checker, index: u32, param: []const u8) Fail!u32 {
         if (checker.bound(index)) |arg| {
             const saved = checker.frame;
             checker.focus(arg.frame);
             defer checker.focus(saved);
-            return checker.mover_of(arg.item);
+            return checker.mover_of(arg.item, param);
         }
         const it = checker.item(index);
         if (it.tag == .call) {
@@ -1969,11 +1999,13 @@ const Checker = struct {
                 const saved = checker.frame;
                 checker.focus(frame);
                 defer checker.focus(saved);
-                return checker.mover_of(checker.memory.frames[frame].body);
+                return checker.mover_of(checker.memory.frames[frame].body, param);
             }
         }
-        const diagnostic = checker.fail(index, .wrong_type, "`by` takes a mover", .{});
-        error_module.hint(diagnostic, "`spring(time: …)` or `newtonian(speed: …, accel: …, decel: …)`", .{});
+        const diagnostic = checker.fail(index, .wrong_type, "`{s}` takes a mover", .{param});
+        var buffer: [hint_list_size]u8 = undefined;
+        const examples = checker.mover_examples(&buffer);
+        if (examples.len > 0) error_module.hint(diagnostic, "{s}", .{examples});
         return error.Checked;
     }
 
@@ -1985,13 +2017,40 @@ const Checker = struct {
         return checker.memory.exprs[expr].lanes;
     }
 
-    /// `pow(x, n)`'s power: a whole number from 2 to 8 (section 3).
-    fn power_in_range(checker: *Checker, index: u32, number: f64) Fail!void {
-        const low = limits_module.power_min;
-        const high = limits_module.power_max;
-        if (number >= low and number <= high and @floor(number) == number) return;
-        const diagnostic = checker.fail(index, .out_of_range, "a power is a whole number from {d} to {d}", .{ low, high });
-        error_module.hint(diagnostic, "for 1 write the signal itself; for more than 8 multiply two, such as `pow(x, 8) * pow(x, 2)`", .{});
+    /// Refuses a signal whose shape or lanes the parameter's `need` does not take (step 55b).
+    fn expect_need(checker: *Checker, index: u32, entry: *const Entry, param: *const schema.Param, expr: u32) Fail!void {
+        const need = param.need;
+        const shape = checker.shape_of(expr);
+        const lanes = checker.lanes_of(expr);
+        const shape_fits = if (need.colour) shape.colour else if (need.components == 0) true else (!shape.colour and shape.components == need.components);
+        const lanes_fit = switch (need.lanes) {
+            .any => true,
+            .one => lanes == 1,
+            .many => lanes >= 2,
+        };
+        if (shape_fits and lanes_fit) return;
+        var need_buffer: [need_text_size]u8 = undefined;
+        var found_buffer: [need_text_size]u8 = undefined;
+        _ = checker.fail(index, .wrong_shape, "`{s}` of {s} takes {s}, and this is {s}", .{
+            param.name,
+            entry.name,
+            need_text(need, &need_buffer),
+            found_text(shape, lanes, &found_buffer),
+        });
+        return error.Checked;
+    }
+
+    /// Refuses a number outside its parameter's `range`, at the number's own item: a whole
+    /// number where the parameter is an `integer` (section 3).
+    fn in_range(checker: *Checker, index: u32, param: *const schema.Param, number: f64) Fail!void {
+        const range = param.range orelse return;
+        const whole = param.kind != .integer or @floor(number) == number;
+        if (number >= range[0] and number <= range[1] and whole) return;
+        const diagnostic = if (param.kind == .integer)
+            checker.fail(index, .out_of_range, "`{s}` is a whole number from {d} to {d}", .{ param.name, range[0], range[1] })
+        else
+            checker.fail(index, .out_of_range, "`{s}` is from {d} to {d}", .{ param.name, range[0], range[1] });
+        if (param.hint.len > 0) error_module.hint(diagnostic, "{s}", .{param.hint});
         return error.Checked;
     }
 
@@ -2154,12 +2213,7 @@ const Checker = struct {
         const values = checker.memory.values[checker.memory.calls[call].values..][0..entry.params.len];
         assert(values.len == entry.params.len);
         switch (entry.shape) {
-            .one => {
-                // `lanes` is the language's own region: its value is its body's (step 55b gives
-                // it `.of`).
-                if (entry.op == .lanes) return checker.shape_of(values[1].signal);
-                return Shape.scalar;
-            },
+            .one => return Shape.scalar,
             .of => |name| return checker.value_shape(values[entry.param(name).?]),
             .agree => |names| {
                 const shape = try checker.call_agree(entry, values, index, names);
@@ -2259,16 +2313,11 @@ const Checker = struct {
             .components = @intCast(entry.params.len),
             .colour = constructor.colour,
         } };
-        for (children, 0..) |child, at| vector.values[at] = try checker.fixed_number(child, "a component");
-        if (constructor.converts) {
-            for (vector.values[0..3]) |channel| if (!(channel >= 0 and channel <= 1)) {
-                const diagnostic = checker.fail(index, .out_of_range, "an sRGB channel is in [0, 1]", .{});
-                error_module.hint(diagnostic, "write each of r, g, and b from 0 to 1", .{});
-                return error.Checked;
-            };
-            const lab = checker.memory.vocabulary.from_srgb(vector.values[0..3].*);
-            vector.values = .{ lab[0], lab[1], lab[2], 0 };
+        for (children, entry.params, 0..) |child, param, at| {
+            vector.values[at] = try checker.fixed_number(child, "a component");
+            try checker.in_range(child, &param, vector.values[at]);
         }
+        if (constructor.converts) vector.values = checker.memory.vocabulary.convert(entry, vector.values);
         return vector;
     }
 
@@ -2336,17 +2385,20 @@ const Checker = struct {
                 // A number that folds is fixed as its literal is, even where a signal may set it
                 // (section 3b), so `2 * pi` builds what `6.283185307179586` builds.
                 if (it.tag == .literal or checker.folds(index)) {
-                    return .{ .number = try checker.fixed_number(index, "a number") };
+                    const number = try checker.fixed_number(index, "a number");
+                    try checker.in_range(index, param, number);
+                    return .{ .number = number };
                 }
                 if (param.shaped) if (try checker.constant_vector(index)) |vector| return .{ .vector = vector };
                 if (!param.live) return checker.not_live(entry, param, index);
                 const expr = try checker.signal(index);
                 try checker.expect_scalar(index, expr, param.name);
+                try checker.expect_need(index, entry, param, expr);
                 return .{ .signal = expr };
             },
             .integer => {
                 const number = try checker.fixed_number(index, "a whole number");
-                if (entry.op == .function) try checker.power_in_range(index, number);
+                try checker.in_range(index, param, number);
                 if (!(number >= 0 and number <= 0x1p32 and @floor(number) == number)) {
                     _ = checker.fail(index, .out_of_range, "`{s}` is a whole number from 0 to 2^32", .{param.name});
                     return error.Checked;
@@ -2374,6 +2426,7 @@ const Checker = struct {
             .signal => {
                 const expr = try checker.signal(index);
                 if (!param.shaped) try checker.expect_scalar(index, expr, param.name);
+                try checker.expect_need(index, entry, param, expr);
                 return .{ .signal = expr };
             },
             .cue => {
@@ -2438,7 +2491,7 @@ const Checker = struct {
                 }
                 return error.Checked;
             },
-            .mover => return .{ .mover = try checker.mover_of(index) },
+            .mover => return .{ .mover = try checker.mover_of(index, param.name) },
             .string => {
                 if (it.tag != .literal or checker.tree.tokens[it.token].tag != .string) {
                     const diagnostic = checker.fail(index, .wrong_type, "`{s}` takes a string", .{param.name});
@@ -2494,7 +2547,7 @@ const Checker = struct {
         if (entry.fixed_hint.len > 0) {
             error_module.hint(diagnostic, "{s}", .{entry.fixed_hint});
         } else {
-            error_module.hint(diagnostic, "write {s}", .{example_of(param)});
+            error_module.hint(diagnostic, "write {s}", .{example_of(checker, param)});
         }
         return error.Checked;
     }
@@ -2570,6 +2623,32 @@ const Checker = struct {
         return .{ .index = binding.index };
     }
 
+    /// The hint for a cue by lane where none is taken: every `by_lane` parameter of the
+    /// vocabulary's entries and then the client's, in order, as far as `buffer` holds them.
+    fn by_lane_list(checker: *const Checker, buffer: *[hint_list_size]u8) []const u8 {
+        var total: u32 = 0;
+        const lists = [2][]const Entry{ checker.memory.vocabulary.entries, checker.memory.clients };
+        for (lists) |list| {
+            for (list) |entry| {
+                for (entry.params) |param| total += @intFromBool(param.by_lane);
+            }
+        }
+        var stream = std.Io.Writer.fixed(buffer);
+        stream.writeAll("a cue by lane is taken by ") catch return stream.buffered();
+        var count: u32 = 0;
+        for (lists) |list| {
+            for (list) |entry| {
+                for (entry.params) |param| {
+                    if (!param.by_lane) continue;
+                    count += 1;
+                    const joiner: []const u8 = if (count == 1) "" else if (count == total) ", or " else ", ";
+                    stream.print("{s}`{s}`'s `{s}:`", .{ joiner, entry.name, param.name }) catch return stream.buffered();
+                }
+            }
+        }
+        return stream.buffered();
+    }
+
     /// `series[NAME]` (step 28): only `lane`, only where the parameter takes a cue by lane, only
     /// inside a region, and only of a series with a cue for every lane.
     fn lane_element(checker: *Checker, index: u32, name: []const u8, binding: Binding, place: LanePlace) Fail!CueRef {
@@ -2584,7 +2663,8 @@ const Checker = struct {
             .taken => {},
             .refused => {
                 const diagnostic = checker.fail(index, .wrong_lanes, "`{s}[lane]` is a cue for each lane, which this place does not take", .{name});
-                error_module.hint(diagnostic, "a cue by lane is a `tween`'s or `bounce`'s `at:`, or the only goal of a `spring` or `newtonian`", .{});
+                var buffer: [hint_list_size]u8 = undefined;
+                error_module.hint(diagnostic, "{s}", .{checker.by_lane_list(&buffer)});
                 return error.Checked;
             },
             .path_of_goals => {
@@ -2594,7 +2674,7 @@ const Checker = struct {
             },
             .declared_path => {
                 const diagnostic = checker.fail(index, .wrong_lanes, "`{s}[lane]` is a cue for each lane, and a declared path is outside any region", .{name});
-                error_module.hint(diagnostic, "write the path in the call, as `spring([{s}[lane]: 1], …)`, inside `lanes(n, …)`", .{name});
+                error_module.hint(diagnostic, "write the path in the call, as `[{s}[lane]: 1]`, inside `lanes(n, …)`", .{name});
                 return error.Checked;
             },
         }
@@ -3307,7 +3387,7 @@ fn outputs_list(entry: *const Entry, buffer: *[outputs_hint_size]u8) []const u8 
     return stream.buffered();
 }
 
-fn example_of(param: *const schema.Param) []const u8 {
+fn example_of(checker: *const Checker, param: *const schema.Param) []const u8 {
     return switch (param.kind) {
         .number, .integer => "a number",
         .time => "a time, such as 0.5s",
@@ -3319,12 +3399,51 @@ fn example_of(param: *const schema.Param) []const u8 {
         .number_range => "a range, such as 0..1",
         .time_range => "a range of times, such as 0s..1s",
         .word, .ease => param.words[0],
-        .mover => "spring(time: 0.5s)",
+        .mover => checker.first_example(.mover) orelse "a mover",
         .seed => "a whole number",
         .string => "\"text\"",
         .noun => "the name of a noun",
     };
 }
+
+/// Room for what a parameter takes, or what was found, in words.
+const need_text_size = 64;
+
+/// The noun of a shape needed: a number, a vec2, a colour, or "a value" where any is taken.
+fn need_noun(need: schema.Need) []const u8 {
+    if (need.colour) return "a colour";
+    return switch (need.components) {
+        0 => "a value",
+        1 => "a number",
+        2 => "a vec2",
+        3 => "a vec3",
+        else => "a vec4",
+    };
+}
+
+/// What a parameter takes: "one number", "a vec2", "a colour", "a number in each of many lanes".
+fn need_text(need: schema.Need, buffer: *[need_text_size]u8) []const u8 {
+    const noun = need_noun(need);
+    if (need.lanes == .many) return std.fmt.bufPrint(buffer, "{s} in each of many lanes", .{noun}) catch noun;
+    if (need.components == 1 and !need.colour) return "one number";
+    return noun;
+}
+
+/// What was found: "one number", "a vec2", "a colour", "3 lanes of a vec2".
+fn found_text(shape: Shape, lanes: u32, buffer: *[need_text_size]u8) []const u8 {
+    if (lanes > 1) return std.fmt.bufPrint(buffer, "{d} lanes of {s}", .{ lanes, shape.noun() }) catch shape.noun();
+    if (shape.eql(Shape.scalar)) return "one number";
+    return shape.noun();
+}
+
+/// Whether `entry` is the kind of entry a hint example is taken from: a fed signal, or a mover.
+fn example_wanted(entry: *const Entry, fed: bool) bool {
+    return if (fed) entry.fed and entry.role == .signal else entry.role == .mover;
+}
+
+/// Room for a hint built from a list of entries' examples or parameters; a longer list is cut
+/// where it fits.
+const hint_list_size = 256;
 
 /// Checks `tree`, which parsed with no error, into `memory`.
 pub fn check(tree: *const Tree, memory: Memory, diagnostics: *Diagnostics) Checked {
