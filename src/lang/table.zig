@@ -120,7 +120,7 @@ const written = [_]Entry{
         .{ .name = "hz", .kind = .frequency, .positional = true, .doc = "drawn values a second" },
         .{ .name = "seed", .kind = .seed, .default = .seed, .doc = seed_doc },
     } },
-    .{ .name = "tween", .op = .tween, .role = .signal, .lanes = .stagger, .summary = "a move from one value to another, from a cue", .params = &.{
+    .{ .name = "tween", .op = .tween, .role = .signal, .shape = .{ .agree = .{ "from", "to" } }, .after = .{ .by = "after", .takes = "to" }, .lanes = .stagger, .summary = "a move from one value to another, from a cue", .params = &.{
         .{ .name = "from", .kind = .number, .shaped = true, .default = .after, .doc = "the value it starts from at its cue; left out, the `to` of the tween `after` names" },
         .{ .name = "to", .kind = .number, .shaped = true, .doc = "the value it lands on, exactly, at the end of `over`" },
         .{ .name = "at", .kind = .cue, .by_lane = true, .doc = "the cue it starts at, or `series[lane]` for a cue a lane" },
@@ -129,14 +129,14 @@ const written = [_]Entry{
         .{ .name = "after", .kind = .signal, .shaped = true, .default = .absent, .doc = "the signal it gives before its cue; without one it holds `from` there" },
         .{ .name = "stagger", .kind = .time, .default = .{ .time = 0 }, .doc = stagger_doc },
     } },
-    .{ .name = "spring", .op = .spring, .role = .signal, .lanes = .stagger, .event = "the goal reached", .fixed_hint = chase_hint, .summary = "a spring toward goals at cues", .params = &.{
+    .{ .name = "spring", .op = .spring, .role = .signal, .shape = .{ .agree = .{ "goals", "from" } }, .lanes = .stagger, .event = "the goal reached", .fixed_hint = chase_hint, .summary = "a spring toward goals at cues", .params = &.{
         .{ .name = "goals", .kind = .path, .positional = true, .shaped = true, .by_lane = true, .doc = goals_doc },
         .{ .name = "from", .kind = .number, .shaped = true, .default = .{ .number = 0 }, .doc = goal_from_doc },
         .{ .name = "time", .kind = .time, .doc = spring_time_doc },
         .{ .name = "overshoot", .kind = .number, .default = .{ .number = 0 }, .doc = overshoot_doc },
         .{ .name = "stagger", .kind = .time, .default = .{ .time = 0 }, .doc = "how much later each lane heads for its goals, inside `lanes(n, …)`" },
     } },
-    .{ .name = "newtonian", .op = .newtonian, .role = .signal, .lanes = .stagger, .event = "the goal reached", .fixed_hint = chase_hint, .summary = "a Newtonian move toward goals at cues", .params = &.{
+    .{ .name = "newtonian", .op = .newtonian, .role = .signal, .shape = .{ .agree = .{ "goals", "from" } }, .lanes = .stagger, .event = "the goal reached", .fixed_hint = chase_hint, .summary = "a Newtonian move toward goals at cues", .params = &.{
         .{ .name = "goals", .kind = .path, .positional = true, .shaped = true, .by_lane = true, .doc = goals_doc },
         .{ .name = "from", .kind = .number, .shaped = true, .default = .{ .number = 0 }, .doc = goal_from_doc },
         .{ .name = "speed", .kind = .number, .doc = speed_doc },
@@ -144,7 +144,7 @@ const written = [_]Entry{
         .{ .name = "decel", .kind = .number, .doc = decel_doc },
         .{ .name = "stagger", .kind = .time, .default = .{ .time = 0 }, .doc = "how much later each lane heads for its goals, inside `lanes(n, …)`" },
     } },
-    .{ .name = "chase", .op = .chase, .role = .signal, .summary = "a spring chasing a signal", .params = &.{
+    .{ .name = "chase", .op = .chase, .role = .signal, .shape = .{ .of = "target" }, .summary = "a spring chasing a signal", .params = &.{
         .{ .name = "target", .kind = .signal, .positional = true, .shaped = true, .doc = "the signal it heads for, read at each step of 1/480 s" },
         .{ .name = "from", .kind = .number, .default = .{ .number = 0 }, .doc = start_from_doc },
         .{ .name = "time", .kind = .time, .live = true, .doc = spring_time_doc },
@@ -172,7 +172,7 @@ const written = [_]Entry{
         .{ .name = "shape", .kind = .word, .words = shift_words, .doc = "`steps` holds each bucket, `linear` runs to the next, `smooth` curves through the midpoints" },
         .{ .name = "seed", .kind = .seed, .default = .seed, .doc = seed_doc },
     } },
-    .{ .name = "delay", .op = .delay, .role = .signal, .lanes = .region, .summary = "its input from one step before, fed by `<-`", .params = &.{
+    .{ .name = "delay", .op = .delay, .role = .signal, .fed = true, .lanes = .region, .summary = "its input from one step before, fed by `<-`", .params = &.{
         .{ .name = "initial", .kind = .number, .positional = true, .doc = "its value at the start cue, before a step of 1/480 s has passed" },
     } },
     .{ .name = "bounce", .op = .bounce, .role = .signal, .lanes = .stagger, .event = "the velocity just before the hit: +speed at the top, -speed at the bottom", .first_output = "position", .outputs = &.{"velocity"}, .summary = "a value bouncing between two walls", .params = &.{
@@ -194,62 +194,62 @@ const written = [_]Entry{
         .{ .name = "range", .kind = .number_range, .positional = true, .default = .unbounded, .doc = "the range a value the client sets is clamped into" },
         .{ .name = "initial", .kind = .number, .default = .{ .number = 0 }, .doc = "its value until the client first sets one" },
     } },
-    .{ .name = "map", .op = .map, .role = .signal, .summary = "a signal moved from one range to another", .params = &.{
+    .{ .name = "map", .op = .map, .role = .signal, .shape = .{ .of = "input" }, .summary = "a signal moved from one range to another", .params = &.{
         .{ .name = "input", .kind = .signal, .positional = true, .shaped = true, .doc = "the signal it moves, per component of a vector" },
         .{ .name = "from", .kind = .number_range, .positional = true, .doc = "the input's range that lands on `to`, with no clamp outside it" },
         .{ .name = "to", .kind = .number_range, .doc = "where `from` lands, low end on low end, so `1..0` flips it" },
     } },
-    .{ .name = "abs", .op = .function, .function = .abs, .role = .signal, .summary = "the absolute value of a signal, per component", .params = &.{
+    .{ .name = "abs", .op = .function, .function = .abs, .role = .signal, .shape = .{ .of = "input" }, .summary = "the absolute value of a signal, per component", .params = &.{
         .{ .name = "input", .kind = .signal, .positional = true, .shaped = true, .doc = function_input_doc },
     } },
-    .{ .name = "sin", .op = .function, .function = .sin, .role = .signal, .summary = "the sine of a signal in radians, per component", .params = &.{
+    .{ .name = "sin", .op = .function, .function = .sin, .role = .signal, .shape = .{ .of = "input" }, .summary = "the sine of a signal in radians, per component", .params = &.{
         .{ .name = "input", .kind = .signal, .positional = true, .shaped = true, .doc = radians_doc },
     } },
-    .{ .name = "cos", .op = .function, .function = .cos, .role = .signal, .summary = "the cosine of a signal in radians, per component", .params = &.{
+    .{ .name = "cos", .op = .function, .function = .cos, .role = .signal, .shape = .{ .of = "input" }, .summary = "the cosine of a signal in radians, per component", .params = &.{
         .{ .name = "input", .kind = .signal, .positional = true, .shaped = true, .doc = radians_doc },
     } },
-    .{ .name = "exp", .op = .function, .function = .exp, .role = .signal, .summary = "e to the power of a signal, held at e^709, per component", .params = &.{
+    .{ .name = "exp", .op = .function, .function = .exp, .role = .signal, .shape = .{ .of = "input" }, .summary = "e to the power of a signal, held at e^709, per component", .params = &.{
         .{ .name = "input", .kind = .signal, .positional = true, .shaped = true, .doc = function_input_doc },
     } },
-    .{ .name = "ln", .op = .function, .function = .ln, .role = .signal, .summary = "the natural log of a signal, held at the log of 2^-1074 at and below 0, per component", .params = &.{
+    .{ .name = "ln", .op = .function, .function = .ln, .role = .signal, .shape = .{ .of = "input" }, .summary = "the natural log of a signal, held at the log of 2^-1074 at and below 0, per component", .params = &.{
         .{ .name = "input", .kind = .signal, .positional = true, .shaped = true, .doc = function_input_doc },
     } },
-    .{ .name = "sqrt", .op = .function, .function = .sqrt, .role = .signal, .summary = "the square root of a signal, 0 at and below 0, per component", .params = &.{
+    .{ .name = "sqrt", .op = .function, .function = .sqrt, .role = .signal, .shape = .{ .of = "input" }, .summary = "the square root of a signal, 0 at and below 0, per component", .params = &.{
         .{ .name = "input", .kind = .signal, .positional = true, .shaped = true, .doc = function_input_doc },
     } },
-    .{ .name = "floor", .op = .function, .function = .floor, .role = .signal, .summary = "the largest whole number at or below a signal, per component", .params = &.{
+    .{ .name = "floor", .op = .function, .function = .floor, .role = .signal, .shape = .{ .of = "input" }, .summary = "the largest whole number at or below a signal, per component", .params = &.{
         .{ .name = "input", .kind = .signal, .positional = true, .shaped = true, .doc = function_input_doc },
     } },
-    .{ .name = "round", .op = .function, .function = .round, .role = .signal, .summary = "the nearest whole number to a signal, a half away from zero, per component", .params = &.{
+    .{ .name = "round", .op = .function, .function = .round, .role = .signal, .shape = .{ .of = "input" }, .summary = "the nearest whole number to a signal, a half away from zero, per component", .params = &.{
         .{ .name = "input", .kind = .signal, .positional = true, .shaped = true, .doc = function_input_doc },
     } },
-    .{ .name = "pow", .op = .function, .function = .{ .pow = 0 }, .role = .signal, .summary = "a signal to a whole power from 2 to 8, per component", .params = &.{
+    .{ .name = "pow", .op = .function, .function = .{ .pow = 0 }, .role = .signal, .shape = .{ .of = "input" }, .summary = "a signal to a whole power from 2 to 8, per component", .params = &.{
         .{ .name = "input", .kind = .signal, .positional = true, .shaped = true, .doc = function_input_doc },
         .{ .name = "n", .kind = .integer, .positional = true, .doc = "the power, a whole number literal from 2 to 8" },
     } },
-    .{ .name = "min", .op = .minimum, .role = .signal, .summary = "the smaller of two signals, per component", .params = &.{
+    .{ .name = "min", .op = .minimum, .role = .signal, .shape = .{ .combine = .{ "a", "b" } }, .summary = "the smaller of two signals, per component", .params = &.{
         .{ .name = "a", .kind = .signal, .positional = true, .shaped = true, .doc = "one of the two, a number meeting each component of a vector or a colour" },
         .{ .name = "b", .kind = .signal, .positional = true, .shaped = true, .doc = "the other, as `a`" },
     } },
-    .{ .name = "max", .op = .maximum, .role = .signal, .summary = "the larger of two signals, per component", .params = &.{
+    .{ .name = "max", .op = .maximum, .role = .signal, .shape = .{ .combine = .{ "a", "b" } }, .summary = "the larger of two signals, per component", .params = &.{
         .{ .name = "a", .kind = .signal, .positional = true, .shaped = true, .doc = "one of the two, a number meeting each component of a vector or a colour" },
         .{ .name = "b", .kind = .signal, .positional = true, .shaped = true, .doc = "the other, as `a`" },
     } },
-    .{ .name = "vec2", .op = .pack, .role = .signal, .summary = "a 2D vector of two signals", .params = &.{
+    .{ .name = "vec2", .op = .pack, .role = .signal, .shape = .{ .constructor = .{} }, .summary = "a 2D vector of two signals", .params = &.{
         .{ .name = "x", .kind = .signal, .positional = true, .doc = "the first component, `.x`" },
         .{ .name = "y", .kind = .signal, .positional = true, .doc = "the second component, `.y`" },
     } },
-    .{ .name = "vec3", .op = .pack, .role = .signal, .summary = "a 3D vector of three signals", .params = &.{
+    .{ .name = "vec3", .op = .pack, .role = .signal, .shape = .{ .constructor = .{} }, .summary = "a 3D vector of three signals", .params = &.{
         .{ .name = "x", .kind = .signal, .positional = true, .doc = "the first component, `.x`" },
         .{ .name = "y", .kind = .signal, .positional = true, .doc = "the second component, `.y`" },
         .{ .name = "z", .kind = .signal, .positional = true, .doc = "the third component, `.z`" },
     } },
-    .{ .name = "oklab", .op = .pack, .role = .signal, .summary = "a colour of three signals: lightness and the a and b axes of OKLab", .params = &.{
+    .{ .name = "oklab", .op = .pack, .role = .signal, .shape = .{ .constructor = .{ .colour = true } }, .summary = "a colour of three signals: lightness and the a and b axes of OKLab", .params = &.{
         .{ .name = "l", .kind = .signal, .positional = true, .doc = "the lightness, from 0 for black to 1 for white" },
         .{ .name = "a", .kind = .signal, .positional = true, .doc = "the green to red axis, green below 0 and red above" },
         .{ .name = "b", .kind = .signal, .positional = true, .doc = "the blue to yellow axis, blue below 0 and yellow above" },
     } },
-    .{ .name = "srgb", .op = .srgb, .role = .signal, .summary = "a colour of three sRGB numbers in [0, 1], kept as OKLab", .params = &.{
+    .{ .name = "srgb", .op = .srgb, .role = .signal, .shape = .{ .constructor = .{ .colour = true, .converts = true } }, .summary = "a colour of three sRGB numbers in [0, 1], kept as OKLab", .params = &.{
         .{ .name = "r", .kind = .number, .positional = true, .doc = "red, from 0 to 1" },
         .{ .name = "g", .kind = .number, .positional = true, .doc = "green, from 0 to 1" },
         .{ .name = "b", .kind = .number, .positional = true, .doc = "blue, from 0 to 1" },
@@ -287,14 +287,11 @@ pub const entries = filled: {
 
 comptime {
     @setEvalBranchQuota(20_000);
-    for (entries) |entry| {
-        assert(entry.params.len <= params_max);
-        assert(entry.outputs.len + @intFromBool(entry.first_output.len > 0) <= schema.outputs_max);
+    for (&entries) |*entry| {
+        schema.assert_entry(entry);
         assert((entry.op == .function) == (entry.function != null));
-        var named = false;
-        for (entry.params, 0..) |param_a, index_a| {
-            if (param_a.positional) assert(!named) else named = true;
-            if (param_a.kind == .word or param_a.kind == .ease) assert(param_a.words.len > 0);
+        // Weft's own entries also keep a default to its kind, which a client's need not.
+        for (entry.params) |param_a| {
             switch (param_a.default) {
                 .word => |word| assert((param_a.kind == .word or param_a.kind == .ease) and word < param_a.words.len),
                 .number => assert(param_a.kind == .number),
@@ -305,15 +302,9 @@ comptime {
                 .whole => assert(param_a.kind == .integer),
                 .absent => assert(param_a.kind == .signal),
                 .text => assert(param_a.kind == .string),
-                .after => assert(param_a.kind == .number and param_a.shaped and entry.op == .tween),
+                .after => assert(param_a.kind == .number and param_a.shaped and entry.after != null),
                 .required => {},
             }
-            if (param_a.by_lane) switch (param_a.kind) {
-                .cue => assert(entry.op == .tween or entry.op == .bounce),
-                .path => assert(entry.op == .spring or entry.op == .newtonian),
-                else => unreachable,
-            };
-            for (entry.params[index_a + 1 ..]) |param_b| assert(!std.mem.eql(u8, param_a.name, param_b.name));
         }
     }
     assert(std.mem.eql(u8, ease_words[3], "in_out"));
@@ -459,9 +450,31 @@ fn old_fixed_hint(op: Op) []const u8 {
     };
 }
 
+/// What `call_shape` and `constant_vector` once read from the op and the name `oklab`.
+fn old_shape(entry: Entry) schema.ShapeRule {
+    return switch (entry.op) {
+        .pack => .{ .constructor = .{ .colour = std.mem.eql(u8, entry.name, "oklab") } },
+        .srgb => .{ .constructor = .{ .colour = true, .converts = true } },
+        .tween => .{ .agree = .{ "from", "to" } },
+        .spring, .newtonian => .{ .agree = .{ "goals", "from" } },
+        .chase => .{ .of = "target" },
+        .map => .{ .of = "input" },
+        .function => .{ .of = "input" },
+        .minimum, .maximum => .{ .combine = .{ "a", "b" } },
+        else => .one,
+    };
+}
+
+/// What `after_to` and `tween_named` once read from the op: only `tween` continues a call.
+fn old_after(op: Op) ?schema.After {
+    return if (op == .tween) .{ .by = "after", .takes = "to" } else null;
+}
+
 // Locks that every entry's `lanes`, `event`, `fixed_hint`, and `first_output` are what the old
 // switches gave: only a bounce names a first output, only a spring and a Newtonian move have a
-// fixed hint, and the seven event sentences are word for word.
+// fixed hint, and the seven event sentences are word for word; its `shape` is what `call_shape`
+// switched on (a constructor's colour, which pair agrees, which parameter a call takes its shape
+// from), only `delay` is `fed`, and only `tween` has an `after`, and a `by_lane` parameter is where the op tests let one be.
 // Step 55 removes this test with the enum.
 test "the entries' fields equal the old switches" {
     for (entries) |entry| {
@@ -470,6 +483,18 @@ test "the entries' fields equal the old switches" {
         try testing.expectEqualStrings(old_fixed_hint(entry.op), entry.fixed_hint);
         const expected: []const u8 = if (entry.op == .bounce) "position" else "";
         try testing.expectEqualStrings(expected, entry.first_output);
+        try testing.expectEqualDeep(old_shape(entry), entry.shape);
+        try testing.expectEqual(entry.op == .delay, entry.fed);
+        try testing.expectEqualDeep(old_after(entry.op), entry.after);
+        for (entry.params) |param| {
+            if (!param.by_lane) continue;
+            const old = switch (param.kind) {
+                .cue => entry.op == .tween or entry.op == .bounce,
+                .path => entry.op == .spring or entry.op == .newtonian,
+                else => false,
+            };
+            try testing.expect(old);
+        }
     }
     try testing.expectEqual(@as(?u32, 0), find("bounce", .signal).?.output("position"));
 }

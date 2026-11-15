@@ -15,8 +15,19 @@
 //!   says what to write;
 //! - every entry of Weft's table fits `schema.outputs_max`.
 //!
+//! Step 55a adds what a client's entry says the checker acts on, each a field of `schema.Entry`
+//! or `schema.Param`:
+//! - `shape`: `agree` holds two parameters to one shape, a number broadcast; `of` takes a
+//!   parameter's shape; `constructor` makes one component a parameter;
+//! - `fed`: the call may be fed by `<-`, once;
+//! - `after`: a parameter left out takes the `to` of the call another parameter names, and
+//!   fails with its own words after any other;
+//! - `by_lane` on a cue, with the `stagger` lane rule, takes `series[lane]` inside a region;
+//! - a parameter of kind `mover` holds its mover's signals to one lane.
+//!
 //! ## 2. The Entries
-//! Four small entries, written here, of op `client`: `osc`, `filt`, `field`, and `gate`.
+//! Small entries, written here, of op `client`: `osc`, `filt`, `field`, and `gate`, and for
+//! step 55a `pair`, `size`, `make3`, `hold`, `chain`, `begin`, and `drive`.
 
 const std = @import("std");
 const testing = std.testing;
@@ -188,4 +199,205 @@ test "every entry fits the outputs limit" {
         try testing.expect(entry.outputs.len + @intFromBool(entry.first_output.len > 0) <= schema.outputs_max);
     }
     try testing.expect(osc.outputs.len + 1 <= schema.outputs_max);
+}
+
+const pair: schema.Entry = .{
+    .name = "pair",
+    .op = .client,
+    .role = .signal,
+    .shape = .{ .agree = .{ "a", "b" } },
+    .summary = "two values of one shape",
+    .params = &.{
+        .{ .name = "a", .kind = .number, .positional = true, .shaped = true, .doc = "the first" },
+        .{ .name = "b", .kind = .number, .positional = true, .shaped = true, .doc = "the second" },
+    },
+};
+
+const size: schema.Entry = .{
+    .name = "size",
+    .op = .client,
+    .role = .signal,
+    .shape = .{ .of = "x" },
+    .summary = "a signal of its input's shape",
+    .params = &.{.{ .name = "x", .kind = .signal, .positional = true, .shaped = true, .doc = "the input" }},
+};
+
+const make3: schema.Entry = .{
+    .name = "make3",
+    .op = .client,
+    .role = .signal,
+    .shape = .{ .constructor = .{} },
+    .summary = "a vec3 of three numbers",
+    .params = &.{
+        .{ .name = "x", .kind = .number, .positional = true, .doc = "the first" },
+        .{ .name = "y", .kind = .number, .positional = true, .doc = "the second" },
+        .{ .name = "z", .kind = .number, .positional = true, .doc = "the third" },
+    },
+};
+
+const hold: schema.Entry = .{
+    .name = "hold",
+    .op = .client,
+    .role = .signal,
+    .lanes = .region,
+    .fed = true,
+    .summary = "its input from one step before",
+    .params = &.{.{ .name = "initial", .kind = .number, .positional = true, .doc = "the start" }},
+};
+
+const chain: schema.Entry = .{
+    .name = "chain",
+    .op = .client,
+    .role = .signal,
+    .shape = .{ .agree = .{ "from", "to" } },
+    .after = .{ .by = "after", .takes = "to" },
+    .summary = "a move that may continue another",
+    .params = &.{
+        .{ .name = "from", .kind = .number, .shaped = true, .default = .after, .doc = "where it starts" },
+        .{ .name = "to", .kind = .number, .shaped = true, .doc = "where it ends" },
+        .{ .name = "after", .kind = .signal, .shaped = true, .default = .absent, .doc = "the move before" },
+    },
+};
+
+const begin: schema.Entry = .{
+    .name = "begin",
+    .op = .client,
+    .role = .signal,
+    .lanes = .stagger,
+    .summary = "a start at a cue, by lane",
+    .params = &.{
+        .{ .name = "at", .kind = .cue, .by_lane = true, .doc = "the cue" },
+        .{ .name = "stagger", .kind = .time, .default = .{ .time = 0 }, .doc = "the delay a lane" },
+    },
+};
+
+const drive: schema.Entry = .{
+    .name = "drive",
+    .op = .client,
+    .role = .signal,
+    .summary = "a signal moved by a mover",
+    .params = &.{.{ .name = "by", .kind = .mover, .doc = "the law" }},
+};
+
+// Locks `agree`: a vec2 and a vec3 fail "`a` and `b` differ: a vec2 and a vec3" at the call, a
+// number beside a vec2 gives a vec2 either way round, and two numbers give a number.
+test "an entry's agree rule holds two parameters to one shape" {
+    const entries = [_]schema.Entry{pair};
+    try fails(&entries, "x = pair(vec2(1, 2), vec3(1, 2, 3))\n", "`a` and `b` differ: a vec2 and a vec3", "");
+    try checks(&entries, "x = pair(1, vec2(1, 2))\ny = pair(vec2(1, 2), 1)\nz = pair(1, 2)\n");
+    try testing.expectEqual(@as(u8, 2), expression(0).shape.components);
+    try testing.expectEqual(@as(u8, 2), expression(1).shape.components);
+    try testing.expectEqual(@as(u8, 1), expression(2).shape.components);
+    try fails(&entries, "x = pair(1, srgb(1, 0, 0))\n", "`a` and `b` differ: a number and a colour", "write the number as a colour, such as `oklab(0.5, 0, 0)`");
+}
+
+// Locks `of`: `size(x)` is a number for a number, a vec3 for a vec3, and a colour for a colour.
+test "an entry's of rule takes a parameter's shape" {
+    const entries = [_]schema.Entry{size};
+    try checks(&entries, "a = size(1)\nb = size(vec3(1, 2, 3))\nc = size(srgb(1, 0, 0))\n");
+    try testing.expectEqual(@as(u8, 1), expression(0).shape.components);
+    try testing.expectEqual(@as(u8, 3), expression(1).shape.components);
+    try testing.expect(!expression(1).shape.colour);
+    try testing.expectEqual(@as(u8, 3), expression(2).shape.components);
+    try testing.expect(expression(2).shape.colour);
+}
+
+// Locks `constructor`: `make3(1, 2, 3)` is a vec3, and a colour constructor's value is a colour.
+test "an entry's constructor rule makes one component a parameter" {
+    const entries = [_]schema.Entry{make3};
+    try checks(&entries, "v = make3(1, 2, 3)\n");
+    try testing.expectEqual(@as(u8, 3), expression(0).shape.components);
+    try testing.expect(!expression(0).shape.colour);
+    var colour = make3;
+    colour.shape = .{ .constructor = .{ .colour = true } };
+    try checks(&.{colour}, "v = make3(1, 2, 3)\n");
+    try testing.expect(expression(0).shape.colour);
+}
+
+// Locks `fed`: `h = hold(0)` is fed once by `h <- 1`, a second feed fails `delay_fed_twice`, a
+// call that is not fed fails `not_a_delay`, and a region of `hold` is fed as one.
+test "a fed entry is fed by an arrow once" {
+    const entries = [_]schema.Entry{ hold, plain };
+    try checks(&entries, "h = hold(0)\nh <- 1\ng = lanes(3, hold(0))\ng <- 2\n");
+    try testing.expectError(error.Invalid, compiled.compile_client(&entries, &.{}, "h = hold(0)\nh <- 1\nh <- 2\n"));
+    try testing.expectEqual(weft.lang.diagnostic.Code.delay_fed_twice, compiled.errors()[0].code);
+    try testing.expectEqualStrings("the delay `h` is already fed", compiled.errors()[0].message_text());
+    try testing.expectError(error.Invalid, compiled.compile_client(&entries, &.{}, "p = plain(0)\np <- 1\n"));
+    try testing.expectEqual(weft.lang.diagnostic.Code.not_a_delay, compiled.errors()[0].code);
+    try testing.expectError(error.Invalid, compiled.compile_client(&entries, &.{}, "x = hold(0) + 1\n"));
+    try testing.expectEqual(weft.lang.diagnostic.Code.not_a_delay, compiled.errors()[0].code);
+}
+
+// Locks `after`: `from` is left out after a call of the same entry, and is that call's `to` (1),
+// also through a region; after another call it fails with the entry's name and the parameters'
+// names; and an `after` of another shape fails "`after` is a vec2, and this chain a number".
+test "an entry with after continues the call it names" {
+    const entries = [_]schema.Entry{ chain, plain };
+    try checks(&entries, "a = chain(from: 0, to: 1)\nb = chain(to: 2, after: a)\n" ++
+        "r = lanes(2, chain(from: 0, to: 5))\nc = chain(to: 3, after: r)\n");
+    var found: u32 = 0;
+    for (compiled.checked.calls, 0..) |call, at| {
+        if (!std.mem.eql(u8, call.entry.name, "chain")) continue;
+        const values = compiled.checked.call_values(@intCast(at));
+        if (values[1].number == 2) {
+            try testing.expectEqual(@as(f64, 1), values[0].number);
+            found += 1;
+        }
+        if (values[1].number == 3) {
+            try testing.expectEqual(@as(f64, 5), values[0].number);
+            found += 1;
+        }
+    }
+    try testing.expectEqual(@as(u32, 2), found);
+    const hint = "`from` may be left out only when `after` names a chain";
+    try fails(&entries, "w = plain(1)\nd = chain(to: 3, after: w)\n", "chain needs `from`, since `after` is not a name bound to a chain", hint);
+    try fails(&entries, "d = chain(to: 3)\n", "chain needs `from`", hint);
+    try fails(&entries, "v = vec2(1, 2)\na = chain(from: 0, to: 1, after: v)\n", "`after` is a vec2, and this chain a number", "");
+}
+
+// Locks `by_lane` on a client's cue: inside `lanes(3, …)` `begin(at: beat[lane])` has 3 lanes and
+// its `at` is a cue by lane; outside a region the cue fails; with `stagger:` it fails both set.
+test "a client's cue by lane takes series[lane] in a region" {
+    const entries = [_]schema.Entry{begin};
+    const head = "cue beat = [1s, 2s, 3s]\n";
+    try checks(&entries, head ++ "x = lanes(3, begin(at: beat[lane]))\n");
+    var by_lane = false;
+    for (compiled.checked.calls, 0..) |call, at| {
+        if (!std.mem.eql(u8, call.entry.name, "begin")) continue;
+        by_lane = compiled.checked.call_values(@intCast(at))[0] == .cue_by_lane;
+    }
+    try testing.expect(by_lane);
+    var lanes: u32 = 0;
+    for (compiled.checked.exprs) |item| {
+        if (item.tag != .call) continue;
+        if (std.mem.eql(u8, compiled.checked.calls[item.a].entry.name, "begin")) lanes = item.lanes;
+    }
+    try testing.expectEqual(@as(u32, 3), lanes);
+    try fails(&entries, head ++ "x = begin(at: beat[lane])\n", "`beat[lane]` is a cue for each lane, so it is used inside `lanes(n, …)`", "wrap the call in a region, such as `lanes(3, …)`");
+    try fails(&entries, head ++ "x = lanes(3, begin(at: beat[lane], stagger: 1ms))\n", "`stagger:` and a cue chosen by lane both set when each lane starts", "each lane already starts at its own cue; drop `stagger:`");
+    var plain_cue = begin;
+    plain_cue.params = &.{
+        .{ .name = "at", .kind = .cue, .doc = "the cue" },
+        .{ .name = "stagger", .kind = .time, .default = .{ .time = 0 }, .doc = "the delay a lane" },
+    };
+    try testing.expectError(error.Invalid, compiled.compile_client(&.{plain_cue}, &.{}, head ++ "x = lanes(3, begin(at: beat[lane]))\n"));
+    try testing.expectEqual(weft.lang.diagnostic.Code.wrong_lanes, compiled.errors()[0].code);
+}
+
+// Locks the mover rule: a mover whose live `overshoot` has 3 lanes fails "`overshoot` takes one
+// value for every lane, found 3 lanes" for a client's `drive`, and one of one lane passes.
+test "a client's mover parameter holds its signals to one lane" {
+    const entries = [_]schema.Entry{drive};
+    try checks(&entries, "x = drive(by: spring(time: 1s, overshoot: 0.1))\n");
+    try fails(&entries, "w = lanes(3, lane)\nx = drive(by: spring(time: 1s, overshoot: w))\n", "`overshoot` takes one value for every lane, found 3 lanes", "a node has one law; let the lanes differ in what it reads instead");
+}
+
+// Locks `of` on a shaped number: `size(2)` is one value and `size(vec2(1, 2))`, arriving as a
+// constant vector, is a vec2, where a signal parameter's expression gave its shape before.
+test "an entry's of rule reads a number parameter's shape" {
+    var numbers = size;
+    numbers.params = &.{.{ .name = "x", .kind = .number, .positional = true, .shaped = true, .doc = "the input" }};
+    try checks(&.{numbers}, "a = size(2)\nb = size(vec2(1, 2))\n");
+    try testing.expectEqual(@as(u8, 1), expression(0).shape.components);
+    try testing.expectEqual(@as(u8, 2), expression(1).shape.components);
 }
