@@ -477,3 +477,77 @@ test "a live frequency takes a signal and a literal needs its unit" {
     try testing.expectEqual(.signal, std.meta.activeTag(first_value(2)));
     try fails(&clients, "a = ring(2)\n", "`rate` takes a frequency", "write `2hz`");
 }
+
+const FileOnly = weft.lang.File(.{ .tokens = 256, .tree = 256, .names = 16, .cues = 4, .modules = 4 }, weft.lang.table.vocabulary);
+var file_only: FileOnly = undefined;
+
+/// A filter that reads a signal, as `filt` does but with a live input.
+const tap: schema.Entry = .{
+    .name = "tap",
+    .op = .client,
+    .role = .signal,
+    .summary = "a filter reading a signal",
+    .params = &.{.{ .name = "input", .kind = .number, .positional = true, .live = true, .doc = "the input" }},
+};
+
+const client_file = "x = osc(hz: 2)\ny = tap(x)\n";
+
+/// What a file of `osc` and `tap` checked to, read from `calls` and `values`: the calls' names
+/// in order and the value of `osc`'s `hz`.
+fn expect_osc_and_tap(checked: check.Checked) !void {
+    try testing.expect(checked.ok);
+    try testing.expectEqual(@as(usize, 2), checked.calls.len);
+    try testing.expectEqualStrings("osc", checked.calls[0].entry.name);
+    try testing.expectEqualStrings("tap", checked.calls[1].entry.name);
+    try testing.expectEqual(check.Value{ .number = 2 }, checked.call_values(0)[0]);
+    try testing.expectEqual(.signal, std.meta.activeTag(checked.call_values(1)[0]));
+}
+
+// Locks step 57: a file of a client's signals, `osc` and a `tap` reading it, checks in a
+// `language.File` with no diagnostic and two calls, `osc` with `hz` 2 and `tap` reading a
+// signal; `osc(h: 2)` reports one error, `unknown_parameter`, at `h` (byte 8).
+test "a file of a client's signals checks in the language's container" {
+    const clients = [_]schema.Entry{ osc, tap };
+    try file_only.check_client(&clients, &.{}, client_file);
+    try expect_osc_and_tap(file_only.checked);
+    try testing.expectEqual(@as(usize, 0), file_only.errors().len);
+    try testing.expectEqual(weft.lang.FileLimits{ .tokens = 17, .tree = 7, .names = 2, .cues = 0, .goals = 0, .regions = 0, .tracks = 0, .modules = 0, .libraries = 0 }, file_only.needs());
+
+    try testing.expectError(error.Invalid, file_only.check_client(&clients, &.{}, "x = osc(h: 2)\ny = tap(x)\n"));
+    try testing.expectEqual(@as(usize, 1), file_only.errors().len);
+    const found = file_only.errors()[0];
+    try testing.expectEqual(weft.lang.diagnostic.Code.unknown_parameter, found.code);
+    try testing.expectEqual(@as(u32, 8), found.start);
+    try testing.expect(!file_only.checked.ok);
+}
+
+// Locks step 57: `Compiled.check_client` gives the same `checked`, and builds nothing: the
+// program of the file compiled before (one `wave`, one node) is still there, and `ok` is false,
+// since no program was built for this file. `compile_client` on it is today's `refused`.
+test "a Compiled checks a client's file and leaves its program alone" {
+    try compiled.compile(" a = wave(sine, 1hz)\n");
+    const nodes_before = compiled.program.nodes.len;
+    try testing.expectEqual(@as(usize, 1), nodes_before);
+    const clients = [_]schema.Entry{ osc, tap };
+    try compiled.check_client(&clients, &.{}, client_file);
+    try expect_osc_and_tap(compiled.checked);
+    try testing.expectEqual(nodes_before, compiled.program.nodes.len);
+    try testing.expect(!compiled.ok);
+    try testing.expectEqual(osc.name, compiled.client_signal().?.name);
+
+    try testing.expectError(error.Invalid, compiled.check_client(&clients, &.{}, "x = osc(h: 2)\n"));
+    try testing.expectEqual(@as(usize, 1), compiled.errors().len);
+    try testing.expectEqual(weft.lang.diagnostic.Code.unknown_parameter, compiled.errors()[0].code);
+    try testing.expectEqual(nodes_before, compiled.program.nodes.len);
+
+    try checks(&clients, client_file);
+    try testing.expectEqualStrings("a client builds its own nodes from `Checked.calls`, and checks such a file with `language.File`", compiled.errors()[0].hint_text());
+}
+
+// Locks step 57: the language's container at the default limits is smaller than `Compiled` at
+// the same ones (931936 and 1189624 bytes when measured); the sizes themselves are not asserted.
+test "the language's container is smaller than Compiled" {
+    const file_size = @sizeOf(weft.lang.File(.{}, weft.lang.table.vocabulary));
+    const compiled_size = @sizeOf(weft.lang.Compiled(.{}));
+    try testing.expect(file_size < compiled_size);
+}

@@ -32,6 +32,7 @@ const describe_golden = @embedFile("golden/cli/describe.json");
 const parse_golden = @embedFile("golden/cli/parse.json");
 const check_golden = @embedFile("golden/cli/check_errors.txt");
 const check_ok_golden = @embedFile("golden/cli/check_ok.txt");
+const check_client_golden = @embedFile("golden/cli/check_client.txt");
 const sample_golden = @embedFile("golden/cli/sample.json");
 const sample_filtered_golden = @embedFile("golden/cli/sample_filtered.json");
 
@@ -136,6 +137,47 @@ const dot_noun: weft.lang.schema.Entry = .{
     },
     .summary = "a client's own noun",
 };
+
+const osc_signal: weft.lang.schema.Entry = .{
+    .name = "osc",
+    .op = .client,
+    .role = .signal,
+    .summary = "an oscillator the client builds",
+    .params = &.{.{ .name = "hz", .kind = .number, .positional = true, .doc = "the rate" }},
+};
+
+const tap_signal: weft.lang.schema.Entry = .{
+    .name = "tap",
+    .op = .client,
+    .role = .signal,
+    .summary = "a filter reading a signal",
+    .params = &.{.{ .name = "input", .kind = .number, .positional = true, .live = true, .doc = "the input" }},
+};
+
+// Locks step 57: `check` on a file of a client's signals, one cue among them, is ok with the
+// checker's counts (2 calls, 1 cue, nothing else), a line saying no program was built that names
+// the first signal, and the least limits of the language's tables, byte for byte as the golden
+// (`limits` has no `nodes`, `slab`, or `track_samples`); `sample` prints one line and is false.
+// A misspelt parameter is today's error rendering and false.
+test "check says ok for a file Weft does not build, and sample says why not" {
+    const clients = [_]weft.lang.schema.Entry{ osc_signal, tap_signal };
+    const text = "cue c0 = 0s\nx = osc(2)\ny = tap(x)\n";
+    var writer: std.Io.Writer = .fixed(&output);
+    try testing.expect(try commands.check(&compiled, &writer, .{ .name = "client.weft", .text = text }, &.{}, &clients));
+    try testing.expectEqualStrings(check_client_golden, writer.buffered());
+
+    writer = .fixed(&output);
+    const window: commands.Window = .{ .from = 0, .to = 0, .step = 1 };
+    const source: commands.Source = .{ .name = "client.weft", .text = text };
+    try testing.expect(!try commands.sample(testing.allocator, &compiled, &writer, source, &.{}, &clients, &.{}, window, .{}));
+    try testing.expectEqualStrings("sample: `osc` is a client's signal, which Weft does not build, so there is nothing to sample\n", writer.buffered());
+
+    writer = .fixed(&output);
+    const bad: commands.Source = .{ .name = "bad.weft", .text = "x = osc(hz: 2, h: 3)\n" };
+    try testing.expect(!try commands.check(&compiled, &writer, bad, &.{}, &clients));
+    try testing.expect(std.mem.startsWith(u8, writer.buffered(), "bad.weft:1:"));
+    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "error: ") != null);
+}
 
 // Locks section 3: the noun is checked, Weft's back end refuses it, and the client finds its
 // call and its value; describe lists it among the nouns.

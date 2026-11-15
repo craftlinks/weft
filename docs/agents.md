@@ -40,7 +40,9 @@ zig-out/bin/weft sample FILE --signal NAME               # one signal
 - **`check`** prints `ok:` with the program's counts and whether it is seekable and stepped,
   then `limits: .{ … }`, the least `Limits` the file compiles with, ready to paste, and for a
   file with a region what a lane costs of the slab. Or it prints each error with a line, a
-  column, and a hint. The hint is usually the fix.
+  column, and a hint. The hint is usually the fix. A file with a client's own signal, which Weft
+  does not build, prints `ok:` with the checker's counts, `no program: …`, and the least limits
+  of the language's tables, and exits 0.
 - **`sample`** is how you see motion you cannot watch: each signal's range, its value at each time,
   and the events in the window. A signal of many lanes prints `"lanes"` and each value as an
   array of lanes; a vector prints `"components"`. Sample a short window first: `--to 2 --step 0.1`.

@@ -60,6 +60,15 @@
 //! libraries than the client's `libraries` is an error, not an assert. `sample_compiled` reads
 //! the tables as the `Compiled` holds them, a track's writes included.
 //!
+//! ## 4a. A File Weft Does Not Build
+//! `describe` and `parse` need no program and are the language's: they read the table and the
+//! tree, never a `Compiled`, and move with the language when it has a repository of its own
+//! (step 57). `check` runs the language's part first, and on a file with a client's own signal,
+//! which Weft does not build, prints `ok:` with the counts the checker knows, a line that says
+//! no program was built, and the least limits of the language's tables, and is true. `sample`,
+//! which is Weft's, says so in one line and is false. Any other file goes on to the back end, and
+//! `check` prints the lines it always did.
+//!
 //! ## 5. TigerStyle Invariants
 //! - No allocation: every buffer is a file-scope variable, sized by the constants below, or one
 //!   of a `For`, sized by its client's `nodes`.
@@ -168,12 +177,48 @@ pub fn For(comptime client_limits: lang.Limits) type {
             comptime clients: []const schema.Entry,
         ) !bool {
             if (!try libraries_fit(writer, libraries, client_limits.libraries)) return false;
-            compiled.compile_client(clients, libraries, source.text) catch {
+            compiled.check_client(clients, libraries, source.text) catch {
+                try render_errors(compiled, writer, source, libraries);
+                return false;
+            };
+            // A file with a client's own signal has no program to build (step 57): it checked.
+            if (compiled.client_signal()) |entry| {
+                try Self.summary_no_program(compiled, writer, entry.name);
+                return true;
+            }
+            compiled.build_program(libraries) catch {
                 try render_errors(compiled, writer, source, libraries);
                 return false;
             };
             try Self.summary(compiled, writer);
             return true;
+        }
+
+        /// What `check` prints of a file that checked and has a client's signal `name`, which
+        /// Weft does not build: the counts the checker knows, a line that says no program was
+        /// built, and the least limits of the language's tables.
+        fn summary_no_program(compiled: *const ClientCompiled, writer: *std.Io.Writer, name: []const u8) !void {
+            const checked = &compiled.checked;
+            assert(checked.ok);
+            assert(name.len > 0);
+            try writer.print("ok: {d} calls, {d} cues, {d} goals, {d} regions, {d} tracks", .{
+                checked.calls.len,
+                checked.cue_times.len,
+                checked.goals.len,
+                checked.regions.len,
+                checked.tracks.len,
+            });
+            const noun_count = nouns_of(compiled);
+            if (noun_count > 0) try writer.print(", {d} nouns", .{noun_count});
+            try writer.print("\nno program: `{s}` is a client's signal, which Weft does not build\n", .{name});
+            const needs = compiled.file_needs();
+            try writer.writeAll("limits: .{");
+            inline for (@typeInfo(lang.FileLimits).@"struct".field_names, 0..) |field, at| {
+                if (comptime std.mem.eql(u8, field, "errors")) continue;
+                const comma = if (at == 0) "" else ",";
+                try writer.print("{s} .{s} = {d}", .{ comma, field, @field(needs, field) });
+            }
+            try writer.writeAll(" }\n");
         }
 
         /// What `check` prints of a file that compiled: the `ok:` line, the least `Limits`, and
@@ -257,7 +302,16 @@ pub fn For(comptime client_limits: lang.Limits) type {
             assert(window.valid());
             assert(names.len <= signals_max);
             if (!try libraries_fit(writer, libraries, client_limits.libraries)) return false;
-            compiled.compile_client(clients, libraries, source.text) catch {
+            compiled.check_client(clients, libraries, source.text) catch {
+                try render_errors(compiled, writer, source, libraries);
+                return false;
+            };
+            if (compiled.client_signal()) |entry| {
+                const line = "sample: `{s}` is a client's signal, which Weft does not build, so there is nothing to sample\n";
+                try writer.print(line, .{entry.name});
+                return false;
+            }
+            compiled.build_program(libraries) catch {
                 try render_errors(compiled, writer, source, libraries);
                 return false;
             };

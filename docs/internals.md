@@ -450,9 +450,19 @@ compiler, with a few unconventional constraints.
 ```
 
 **It allocates nothing.** Every array every stage writes is a field of one struct,
-`Compiled(limits)`, whose sizes are compile-time parameters. A file too big for a limit is an
+`Compiled(limits)` (the language's part of it is `File`), whose sizes are compile-time
+parameters. A file too big for a limit is an
 ordinary error that names the limit. A `Compiled` is therefore large and must stay where it is,
 because the program points into its tables.
+
+**The language checks without building** (step 57). The front end's arrays are a struct of their
+own, `language.File(limits, vocabulary)` (`language/file.zig`): the syntax, the checker's tables,
+and the libraries, sized by `FileLimits`. `File.check_client` parses and checks and runs no back
+end, so a file of a client's own signals, which Weft's back end refuses, checks with no
+diagnostic. Weft's `Compiled` holds the same fields beside the program's, under the same names and
+types (a comptime block in `lang.zig` holds the two lists equal), and both call one function,
+`file.check_fields`. `Compiled.check_client` is the language's part and `build_program` the
+back end's; `compile_client` is the two in order.
 
 **Tokens are spans.** A token is a tag plus a start and length into the source; no text is
 copied. Units are part of a literal, so `500ms` is one token of kind "time".
