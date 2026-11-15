@@ -370,7 +370,7 @@ pub fn Compiled(comptime limits: Limits) type {
             for (libraries) |library| global.update(library.text);
             for (tree.declarations) |index| {
                 switch (tree.item(index).tag) {
-                    .seed, .start, .module, .use => hash_tokens(&global, tree, index),
+                    .seed, .tempo, .start, .module, .use => hash_tokens(&global, tree, index),
                     else => {},
                 }
             }
@@ -788,7 +788,7 @@ test "errors name the problem and suggest the fix" {
         .{ .source = "cue = wave(sine, 1hz)\n", .code = .reserved_name, .hint = "choose another name, such as `cue_1`" },
         .{ .source = "w = wave(sine, hz: 1hz, 2)\n", .code = .positional_after_named, .hint = "write it first, or give it its name" },
         .{ .source = "s = spring(time: 1s)\n", .code = .missing_argument, .hint = "add `goals: goals, such as [c1: 1]`" },
-        .{ .source = "x = 2sec\n", .code = .bad_unit, .hint = "a unit is s, ms, or hz, right after the number" },
+        .{ .source = "x = 2sec\n", .code = .bad_unit, .hint = "a unit is s, ms, b, or hz, right after the number" },
     };
     for (cases) |case| {
         const found = try first_error(case.source);
@@ -847,6 +847,8 @@ const fuzz_seeds = [_][]const u8{
     // Where a number is written (step 41): every form of a cue, and a track's folded numbers.
     "cue a = -250ms\ncue b = a\ncue c = b + 1.5s\ncue s = [2s, c + 1s, s0]\ncue s0 = 3s\n" ++
         "cue bar = s[1] + 1s..s[1] + 5s every 2s\ntrack t = 2 * 0.25 in -pi..tau\ntrack u = 1e-1 in 0..1\n",
+    // A tempo and times in beats (Jig step 1): a list, and a series whose cues are rounded once.
+    "tempo 174\ncue c = [1b, 2.5b]\ncue s = 0b..4b every 1b\n",
     // A loop that runs away within half a second, so the reader meets the bound (step 19).
     "cue c0 = 0s\nfb = delay(0)\nloop = chase(1 + fb * 1e100, time: 0.01s)\nfb <- loop\nx = loop * loop * loop\n",
 };
@@ -892,7 +894,13 @@ fn fuzz_forms(compiled: anytype) !void {
         const form = compiled.cue_form(@intCast(cue)).?;
         const written = form.written() orelse {
             const from = fuzz_sum(times, form.every.from);
-            try testing.expectEqual(time, from + form.every.step.signed() * form.every.element);
+            if (form.every.step.unit != .b) {
+                try testing.expectEqual(time, from + form.every.step.signed() * form.every.element);
+            } else {
+                // A beat series' cue is not `from + step * element` (Jig step 1).
+                const source = compiled.syntax.tree.source;
+                try testing.expectEqual(time, check.series_flicks(source, times, form.every, compiled.checked.tempo));
+            }
             continue;
         };
         try testing.expectEqual(time, fuzz_sum(times, written));
