@@ -185,6 +185,22 @@ memory, and prints the bytes it did (step 38). `Compiled.cue_form` and `track_fo
 track's numbers are written, so it need not mirror the checker's grammar (step 41); `check.Memory`
 gains a required `cue_forms`, which only `Compiled` builds.
 
+**0.4.0** (steps 53 to 57) moves the language into a module of its own, `language/`, which
+imports only `std`, as the first part of its move to a repository of its own. No file 0.3
+accepted changes its values, and every client's call is written as before; a client's entries
+are now a `comptime` argument in the same place, and a name they share with Weft's table, with
+`pi` or `tau`, or with a keyword stops the build (step 56). Weft's table and its enum of ops are
+`weft.lang.table` (`table.entries`, `table.Op`, `table.op_of`); the language's `schema.Op` holds
+only `client`, `noun`, and `lanes` (step 55). An entry declares what the checker once knew by op:
+its lane rule, its events, its first output's name, its shape, whether `<-` feeds it, the call it
+continues, folding, an example for hints (steps 54, 55); a parameter declares a `range`, a
+`hint`, and a `need`, the shape a signal given to it must have, and `by_lane` is honoured on any
+entry's cue or path. A defaulted integer reads as an integer, and a frequency marked `live` takes
+a signal (step 56). `language.File` parses and checks with no back end, so a file of a client's
+own signals checks with no diagnostic, and `commands.check` prints `ok:` and `no program:` for it
+(step 57). Five diagnostics are worded anew (a power's range, an sRGB channel's, and the hints
+for a mover, a cue by lane, and a path by lane); the wording of diagnostics is not promised.
+
 ## Requirements
 
 | | |
