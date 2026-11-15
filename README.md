@@ -167,6 +167,24 @@ none is as it was: `graph.Node` gains `step_skip`, which `Builder.finish` fills 
 or a module takes up to 24 parameters, and `check` asserts that a client's entries fit, where one
 over the limit used to index past the checker's arrays (step 36).
 
+**0.3.0** (steps 35, 37 to 41) adds language surface and calls for a client, so it is a minor
+version. No file 0.2 accepted changes its values. `pi` and `tau` are numbers wherever a number is
+due, and a file's own name of either shadows them; arithmetic of numbers (`+ - * /`) is folded
+wherever a number fixed at build is due, so `to: 2 * pi` checks (step 40). A spring's or a
+Newtonian move's only goal may take its cue by lane, `spring([s[lane]: 1], time: 450ms)`:
+`motion.Goal` gains `cue_by_lane`, false by default and in what was padding, so no node grows
+(step 39). `describe` gives each parameter a sentence, `"doc"`, and each call its `"class"`, and
+lists `"numbers"` and, on a spring's goals, `"by_lane"` (steps 35, 39, 40); `schema.Param` gains
+`doc`, which a client's entries may leave empty. A slab error names the declaration that needs
+the most, and a word hint lists up to six words; the wording of diagnostics is not promised. The
+`commands` module gains `For(limits)`, whose `check`, `summary`, `sample`, and `sample_compiled`
+work on a client's own `Compiled`, so a client with checks of its own compiles a file once (step
+37); `sample` reads every signal in one walk of a fresh reader, with `values_max` of static
+memory, and prints the bytes it did (step 38). `Compiled.cue_form` and `track_form`,
+`Syntax.track_form`, and `check.read_time` and `write_time` tell a client where a cue's time and a
+track's numbers are written, so it need not mirror the checker's grammar (step 41); `check.Memory`
+gains a required `cue_forms`, which only `Compiled` builds.
+
 ## Requirements
 
 | | |
