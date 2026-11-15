@@ -83,13 +83,13 @@ the cells above it. You set the clock and read the cells.
 You need Zig 0.17.0. From the root of the Weft repository:
 
 ```bash
-zig build                                 # builds zig-out/bin/weft, the command-line tool
+cd text && zig build                      # builds text/zig-out/bin/weft, the command-line tool
 ```
 
-Motion is written in a small text language, in a `.weft` file. Save this as `first.weft`:
+Motion is written in a small text language, in a `.jig` file. Save this as `first.jig`:
 
 ```txt
-# first.weft: a dot that slides in, then breathes.
+# first.jig: a dot that slides in, then breathes.
 cue go = 1s
 
 slide = tween(from: 0, to: 1, at: go, over: 800ms, ease: out)
@@ -102,14 +102,14 @@ Three commands are the whole working loop. You do not need a window to see motio
 **`check`** says whether the file is valid, and how big its program is:
 
 ```txt
-$ zig-out/bin/weft check first.weft
+$ text/zig-out/bin/weft check first.jig
 ok: 5 nodes, a slab of 5, 1 cues, 0 goals, 0 regions, 0 tracks, seekable, closed form
 ```
 
 **`sample`** prints every signal's values on a time grid, as JSON:
 
 ```txt
-$ zig-out/bin/weft sample first.weft --to 2 --step 0.5
+$ text/zig-out/bin/weft sample first.jig --to 2 --step 0.5
 {"from":0,"to":1411200000,"step":352800000,"signals":[
  {"name":"slide","range":[-0.0000000000000009,1.0000000000000009],"values":[0,0,0,0.8079780514132684,1]},
  {"name":"breath","range":[-0.05,0.05],"values":[0,0.05,0,-0.05,0]},
@@ -127,7 +127,7 @@ sentence on what each parameter means, each call's class, which says what a seek
 (section 16), and the two numbers the language knows by name, `pi` and `tau`:
 
 ```bash
-zig-out/bin/weft describe --use std=src/lang/std.weft
+text/zig-out/bin/weft describe --use std=text/src/std.jig
 ```
 
 Ask `describe` rather than guessing a parameter's name. It is the reference; this tutorial is the
@@ -136,7 +136,7 @@ tour.
 **Errors** come with a line, a column, a reason, and usually the fix:
 
 ```txt
-bad.weft:2:39: error: tween has no parameter `ovr`
+bad.jig:2:39: error: tween has no parameter `ovr`
     slide = tween(from: 0, to: 1, at: go, ovr: 800ms)
                                           ^^^
     hint: did you mean `over`?
@@ -538,8 +538,8 @@ out = snappy(stops)                         # spring(stops, time: 0.25s)
 soft = pulse(out, amount: 0.02)
 ```
 
-A file that says `use std` is checked with `--use std=src/lang/std.weft`. From Zig the library is
-the string `weft.lang.std_library`.
+A file that says `use std` is checked with `--use std=text/src/std.jig`. From Zig the library is
+the string `weft_text.std_library`.
 
 A parameter's kind is whatever the body uses it as, so a module can take a signal, a number, a
 time, a cue, a path, a colour written as `srgb(…)`, a lane count, or a whole expression to
@@ -565,11 +565,12 @@ track, and a cue.
 ```zig
 const std = @import("std");
 const weft = @import("weft");
+const weft_text = @import("weft_text");
 
-const source = @embedFile("motion.weft");
+const source = @embedFile("motion.jig");
 
 /// The sizes of every table the compile fills. `weft check` prints the counts they must hold.
-const Motion = weft.lang.Compiled(.{ .nodes = 32, .slab = 64, .cues = 4, .tracks = 1 });
+const Motion = weft_text.Compiled(.{ .nodes = 32, .slab = 64, .cues = 4, .tracks = 1 });
 
 // A Compiled holds every table and the program points into it, so it is large and must not
 // move. Keep it in static memory or in a struct that stays put, never in a returned value.
@@ -579,7 +580,7 @@ var slab: [64]f64 = undefined;                 // one reader's memory
 pub fn example(writer: *std.Io.Writer) !void {
     // 1. Compile, once. Nothing here runs again per frame.
     motion.compile(source) catch {
-        for (motion.errors()) |found| try found.render(source, "motion.weft", writer);
+        for (motion.errors()) |found| try found.render(source, "motion.jig", writer);
         return error.Invalid;
     };
     const program = motion.program;
@@ -818,11 +819,11 @@ reader. Cues, goals, regions, and tracks are small tables you create first and p
 
 ## 15. Drawing It: A Complete Client
 
-`examples/starter` is the smallest complete client: a Patchwork app of about 200 lines. Patchwork
+`text/examples/starter` is the smallest complete client: a Patchwork app of about 200 lines. Patchwork
 is a separate UI library; Weft does not know it exists, and the app is the bridge.
 
 ```bash
-cd examples/starter
+cd text/examples/starter
 zig build test                              # compiles the file, replays the scenarios; no GPU
 zig build run                               # a window: space plays, left and right step
 zig build && ./zig-out/bin/starter --render play --out frames   # PNG frames, no window
@@ -873,8 +874,9 @@ pub fn draw(app: *App, cx: *Context) void {
 Stepping backwards with the Left key needs no code beyond changing `app.t`. That is section 2's
 promise, visible.
 
-Wiring the two libraries together is `build.zig.zon` naming both by path and one `imports` line
-in `build.zig`; copy the starter's.
+Wiring the libraries together is `build.zig.zon` naming Weft's text package and Patchwork by path,
+and an `imports` line in `build.zig` for the modules the text package exposes (`weft`, `jig`,
+`weft_text`); copy the starter's.
 
 ---
 
@@ -975,7 +977,7 @@ target).
 | `4 lanes and 5 lanes do not go together` | Two regions of different sizes | Make the counts equal |
 | `` `n` is a whole number from 2 to 8 `` | `pow(x, 1)`, `pow(x, 10)`, `pow(x, 0.5)`, or `pow(x, k)` with k a name | Write `x`, multiply powers, use `sqrt`, or write the number |
 | A `floor` of a chase steps between frames, or at a frame you did not expect | `floor` reads the chase's value interpolated between its fixed steps | Expected: a step falls where the smooth value crosses a whole number |
-| ``there is no call `clamp` `` | `clamp` is a module of `std`, not a primitive | Add `use std`, and pass `--use std=src/lang/std.weft` to `weft` |
+| ``there is no call `clamp` `` | `clamp` is a module of `std`, not a primitive | Add `use std`, and pass `--use std=text/src/std.jig` to `weft` |
 | `` `min` is a primitive, not a module's name ``, or ``the module `clamp` is declared twice`` | A module of your own from before 0.2 named `abs`, `min`, or `max`, or `clamp` beside `use std` | Rename it, or delete it and use the call |
 | `error.Invalid` with no message | `compile(...) catch unreachable` | Render `compiled.errors()`; it names the `Limits` field to raise |
 | An assert in `value` | Reading after `events` with no `eval` between | Call `eval` first |
@@ -996,7 +998,7 @@ target).
 ## 18. Where to Go Next
 
 - `weft describe` for every parameter of every call.
-- `play/*.weft` for five real files, and `play/` for a client with seven pages.
+- `play/*.jig` for five real files, and `play/` for a client with seven pages.
 - `docs/agents.md` for how Play's pages are assembled and how to add a primitive.
 - `docs/internals.md` for how Weft works underneath.
 - The README for each part in depth, and the guide at the top of every source file for why it is

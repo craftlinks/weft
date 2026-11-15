@@ -1,13 +1,12 @@
 .{
     .name = .weft,
-    .version = "0.4.0",
+    .version = "0.5.0",
     .fingerprint = 0xfd7f37f63839ab34,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{},
     .paths = .{
         "build.zig",
         "build.zig.zon",
-        "language",
         "src",
         "test",
         "tools",

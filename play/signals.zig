@@ -1,10 +1,10 @@
-//! The signals Play shows: four Weft files, `signals.weft`, `bouncers.weft`, `vectors.weft`, and
-//! `lanes.weft`, compiled once, and the rows that name what to show.
+//! The signals Play shows: four Weft files, `signals.jig`, `bouncers.jig`, `vectors.jig`, and
+//! `lanes.jig`, compiled once, and the rows that name what to show.
 //!
 //! # Deep Architectural Guide for Reviewers:
 //!
 //! ## 1. What Is Here
-//! The text is the signal table. `Signals.build` compiles `signals.weft` (Weft's language, step
+//! The text is the signal table. `Signals.build` compiles `signals.jig` (Weft's language, step
 //! 12) and finds each row's node, the knobs' tracks, and each row's goal by name; this file keeps
 //! only what the text does not know: a row's accent, and which rows the scope shows. The knobs
 //! never rebuild the program: each is a track (Weft's step 9.5) that a node reads, and the app
@@ -46,7 +46,7 @@
 //! text, not a run-time condition, so it is unreachable; a test compiles both files.
 //!
 //! ## 4. The Bouncers
-//! The bouncers page has a program of its own, `Bouncers`, from `bouncers.weft`, which is pure:
+//! The bouncers page has a program of its own, `Bouncers`, from `bouncers.jig`, which is pure:
 //! ```text
 //! cues   bar[0] to bar[300], every 2 s from 0 to 600 s
 //! lane   0.7  1  1.5  2  2.5  3  3.5   units a second, between 0 and 1 from bar[0]
@@ -56,7 +56,7 @@
 //! 0.7 lane is step 7's worked bounce, whose hits land one flick after the exact multiples.
 //!
 //! ## 7. The Vectors
-//! The vectors page (step 16) has a program of its own too, `Vectors`, from `vectors.weft`, which
+//! The vectors page (step 16) has a program of its own too, `Vectors`, from `vectors.jig`, which
 //! is pure and closed form, so a read at any time costs one pass and no steps:
 //! ```text
 //! cues    c0 to c3, every 0.8 s from 0 s
@@ -74,7 +74,7 @@
 //! glow's overshoot leaves the sRGB gamut, which `weft.colour.to_srgb` maps back at the read.
 //!
 //! ## 8. The Lanes
-//! The lanes page (step 17) has `Field`, from `lanes.weft`: a thousand dots, one a lane of one
+//! The lanes page (step 17) has `Field`, from `lanes.jig`: a thousand dots, one a lane of one
 //! program, pure and closed form:
 //! ```text
 //! rise    a tween from 0 to 1 over 0.8 s from c0, each lane 3 ms after the one before   pure
@@ -87,7 +87,7 @@
 //! colour, and the hop's hits at the top wall are the flashes, each event's instance its lane.
 //!
 //! ## 9. The Swarm
-//! The swarm page (step 18's agent trial) has `Swarm`, from `swarm.weft`: forty-eight dots, one a lane
+//! The swarm page (step 18's agent trial) has `Swarm`, from `swarm.jig`: forty-eight dots, one a lane
 //! of one program, stepped (it has followers and chases) but with no live input, so seekable:
 //! ```text
 //! wander_x, wander_y  a follower a lane over -1..1 on a spring of 0.7 s, pausing up to 0.8 s   stepped
@@ -100,7 +100,7 @@
 //! as their instance. The page reads values only: a frame costs the steps since the last one.
 //!
 //! ## 6. Editing
-//! The text page edits `signals.weft` (step 15), so a `Signals` is built from any text, not only
+//! The text page edits `signals.jig` (step 15), so a `Signals` is built from any text, not only
 //! the embedded file: `build` copies the text first, since the program's names and the errors'
 //! places point into it, and returns false, with `errors` as plain `Problem`s, when it does not
 //! compile. Rows and knobs are found by name, so one the text no longer declares is null and the
@@ -117,14 +117,16 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const weft = @import("weft");
+const jig = @import("jig");
+const weft_text = @import("weft_text");
 
 /// Rows: the scope's eight, then the shapes page's eight sources.
 pub const row_count = 16;
 pub const scope_row_count = 8;
-/// The cues `signals.weft` declares, and the most an edit may declare (step 15).
+/// The cues `signals.jig` declares, and the most an edit may declare (step 15).
 pub const cue_count = 6;
 pub const cue_count_max = 16;
-/// Room for edits: `signals.weft` builds 21 nodes and a slab of 112 f64. Four readers'
+/// Room for edits: `signals.jig` builds 21 nodes and a slab of 112 f64. Four readers'
 /// checkpoints for 604 s (two programs during a recompile, two readers each) are about 3.1 MB.
 pub const node_count_max = 40;
 pub const slab_count_max = 160;
@@ -143,9 +145,9 @@ pub const knob_names = [knob_count][]const u8{ "pulse_hz", "chase_s", "sway_os",
 /// refuses a write, which changes nothing.
 pub const track_samples_max = 8192;
 
-pub const source = @embedFile("signals.weft");
+pub const source = @embedFile("signals.jig");
 
-const limits: weft.lang.Limits = .{
+const limits: weft_text.Limits = .{
     .tokens = 4096,
     .tree = 2048,
     .names = 64,
@@ -158,7 +160,7 @@ const limits: weft.lang.Limits = .{
     .track_samples = track_samples_max,
     .errors = 4,
 };
-const Compiled = weft.lang.Compiled(limits);
+const Compiled = weft_text.Compiled(limits);
 
 /// Where a row's goal trace comes from (section 2).
 pub const Goal = union(enum) {
@@ -235,7 +237,7 @@ pub const Signals = struct {
         const count = @min(found.len, out.len);
         const text = signals.text[0..signals.text_len];
         for (out[0..count], found[0..count]) |*problem, *diagnostic| {
-            const place = weft.lang.diagnostic.locate(text, diagnostic.start);
+            const place = jig.diagnostic.locate(text, diagnostic.start);
             problem.* = .{
                 .start = diagnostic.start,
                 .end = @min(diagnostic.start + diagnostic.len, signals.text_len),
@@ -274,7 +276,7 @@ pub const Problem = struct {
 /// ranges of the text (section 6).
 pub const TrackLiterals = struct { value: [2]u32, lo: [2]u32, hi: [2]u32 };
 
-var binding_syntax: weft.lang.Syntax(limits) = undefined;
+var binding_syntax: weft_text.Syntax(limits) = undefined;
 
 /// Each knob's track line in `text`, found by its name, or null where the text does not parse,
 /// the track is gone, or one of its three numbers is not a plain number literal (Weft's
@@ -305,9 +307,9 @@ pub const bar_count: u32 = @intCast(@divExact(timeline_ms, bar_ms) + 1);
 /// The bouncer program: two nodes a lane, then the bars, one f64 each.
 pub const bouncer_node_count = 2 * lane_count + 1;
 
-pub const bouncer_source = @embedFile("bouncers.weft");
+pub const bouncer_source = @embedFile("bouncers.jig");
 
-const BouncerCompiled = weft.lang.Compiled(.{
+const BouncerCompiled = weft_text.Compiled(.{
     .tokens = 512,
     .tree = 256,
     .names = 16,
@@ -349,7 +351,7 @@ pub const Bouncers = struct {
     bars: weft.Id,
     program: weft.Program,
 
-    /// Compiles `bouncers.weft` in place and finds the lanes and the bars by name.
+    /// Compiles `bouncers.jig` in place and finds the lanes and the bars by name.
     pub fn build(bouncers: *Bouncers) void {
         bouncers.compiled.compile(bouncer_source) catch unreachable;
         const compiled = &bouncers.compiled;
@@ -377,9 +379,9 @@ pub const Bouncers = struct {
 pub const vector_node_count = 25;
 pub const vector_slab_count = 55;
 pub const vector_goal_count = 4;
-pub const vector_source = @embedFile("vectors.weft");
+pub const vector_source = @embedFile("vectors.jig");
 
-const VectorCompiled = weft.lang.Compiled(.{
+const VectorCompiled = weft_text.Compiled(.{
     .tokens = 512,
     .tree = 256,
     .names = 16,
@@ -406,7 +408,7 @@ pub const Vectors = struct {
     goal_times: [vector_goal_count]weft.Time,
     program: weft.Program,
 
-    /// Compiles `vectors.weft` in place, finds its signals by name, and reads the dot's goals.
+    /// Compiles `vectors.jig` in place, finds its signals by name, and reads the dot's goals.
     pub fn build(vectors: *Vectors) void {
         const compiled = &vectors.compiled;
         compiled.compile(vector_source) catch unreachable;
@@ -439,9 +441,9 @@ pub const Vectors = struct {
 pub const field_count = 1000;
 pub const field_node_count = 14;
 pub const field_slab_count = 13 * field_count + 3;
-pub const field_source = @embedFile("lanes.weft");
+pub const field_source = @embedFile("lanes.jig");
 
-const FieldCompiled = weft.lang.Compiled(.{
+const FieldCompiled = weft_text.Compiled(.{
     .tokens = 512,
     .tree = 256,
     .names = 16,
@@ -462,7 +464,7 @@ pub const Field = struct {
     hop: weft.Id,
     program: weft.Program,
 
-    /// Compiles `lanes.weft` in place and finds its signals by name.
+    /// Compiles `lanes.jig` in place and finds its signals by name.
     pub fn build(field: *Field) void {
         const compiled = &field.compiled;
         compiled.compile(field_source) catch unreachable;
@@ -483,11 +485,11 @@ pub const Field = struct {
 pub const swarm_count = 48;
 pub const swarm_node_count = 15;
 pub const swarm_slab_count = 1876;
-pub const swarm_source = @embedFile("swarm.weft");
+pub const swarm_source = @embedFile("swarm.jig");
 /// Seconds of checkpoints the swarm's reader keeps: the timeline and a little more.
 pub const swarm_checkpoint_seconds = 604;
 
-const SwarmCompiled = weft.lang.Compiled(.{
+const SwarmCompiled = weft_text.Compiled(.{
     .tokens = 1024,
     .tree = 512,
     .names = 32,
@@ -509,7 +511,7 @@ pub const Swarm = struct {
     gate: weft.Id,
     program: weft.Program,
 
-    /// Compiles `swarm.weft` in place and finds its signals by name.
+    /// Compiles `swarm.jig` in place and finds its signals by name.
     pub fn build(swarm: *Swarm) void {
         const compiled = &swarm.compiled;
         compiled.compile(swarm_source) catch unreachable;
@@ -674,7 +676,7 @@ test "a knob binds a track's plain literals only" {
     for (found[1..]) |knob| try testing.expectEqual(@as(?TrackLiterals, null), knob);
 }
 
-var syntax: weft.lang.Syntax(.{ .tokens = 1024, .tree = 512, .names = 64 }) = undefined;
+var syntax: weft_text.Syntax(.{ .tokens = 1024, .tree = 512, .names = 64 }) = undefined;
 var formatted: [8192]u8 = undefined;
 
 // Locks the round trip: both files are in the canonical format, so formatting gives their bytes.

@@ -1,7 +1,8 @@
 # Weft
 
 A Zig library for composable motion: motion as an object of its own, separate from whatever it
-moves. It has no dependencies and knows nothing about pixels.
+moves. It has no dependencies and knows nothing about pixels. Its text front end, a package of
+its own in `text/`, reads files in [Jig](../jig), the language Weft's motion is written in.
 
 ## What Weft Is
 
@@ -124,10 +125,10 @@ them is a bug or a new minor version, named in this README. 0.1 promised the sam
   format, and the seeds a file's names derive, so a file samples the same values in every 0.2.
 - **The command line's JSON**: the fields of `describe`, `sample`, and `parse --json`. A new field
   may appear; none is renamed or removed.
-- **The rules**: every frame a function of t, no allocation, lock, or I/O in `src/core` and
-  `src/lang`, and the same bits on native and wasm.
+- **The rules**: every frame a function of t, no allocation, lock, or I/O in `src/core`, and
+  the same bits on native and wasm.
 
-Not promised: anything a file of `src/core` or `src/lang` does not export, the layout of the slab
+Not promised: anything a file of `src/core` does not export, the layout of the slab
 and the node array, `Limits`' defaults, diagnostics' wording, Play, and the bench's numbers.
 
 A file that 0.1.0 accepted and should not have is a bug, so 0.1.1 refuses it: a tween from a
@@ -201,6 +202,19 @@ own signals checks with no diagnostic, and `commands.check` prints `ok:` and `no
 (step 57). Five diagnostics are worded anew (a power's range, an sRGB channel's, and the hints
 for a mover, a cue by lane, and a path by lane); the wording of diagnostics is not promised.
 
+**0.5.0** (step 58) moves the language out. It is **Jig**, a repository of its own
+(`../jig`, module `jig`), and Weft's text front end, the table, the back end, `Compiled`, `std`,
+and the `weft` command, is `text/`, a package of its own (module `weft_text`) that depends on
+Weft and on Jig. Weft's root package is the core only and depends on nothing, so `weft.lang` is
+gone. Every name a client read from `weft.lang` is now one of two: `jig.…` for the language's
+(`schema`, `check`, `parse`, `format`, `diagnostic`, `token`, `File`, `FileLimits`, `Source`,
+`CueName`, and what `check` holds: `CueForm`, `TrackForm`, `read_time`, `write_time`), and
+`weft_text.…` for Weft's (`Compiled`, `Limits`, `Syntax`, `table`, `entries_of`, `std_library`).
+No alias is kept. A file's extension is `.jig`. `Compiled.Noun` and `NounIterator` are gone:
+the language's are `jig.file.Noun` and `NounIterator`. A command-line golden changes only where
+a line holds a file name (`bad.weft` is `bad.jig`). Nothing a file means, checks as, or builds
+changed, and `signals.txt` is byte for byte the same.
+
 ## Requirements
 
 | | |
@@ -208,8 +222,9 @@ for a mover, a cue by lane, and a path by lane); the wording of diagnostics is n
 | Zig | **0.17.0** exactly (`minimum_zig_version`). |
 | Node | Only for `zig build regress`, which runs the wasm build. |
 
-The package has an empty dependency list, and the library links nothing, not even libc. Play, in
-`play/`, is a package of its own with its own requirements; see Play below.
+The package has an empty dependency list, and the library links nothing, not even libc. Weft's
+text front end (`text/`) and Play (`play/`) are packages of their own, each with its own
+dependencies (Jig, Patchwork); see Text and Play below.
 
 ## Try It
 
@@ -218,25 +233,26 @@ zig build test                      # unit tests
 zig build regress                   # sampled signals against the golden, native and wasm
 zig build regress -- --bless        # rewrite the golden, if native and wasm agree
 zig build wasm                      # the wasm32-freestanding build
-zig build bench -Doptimize=ReleaseFast   # what reads cost on this machine
+```
+
+The text package is its own, with its own tiers:
+
+```bash
+cd text
+zig build test                      # the front end, the table, the back end, the command
 zig build test-cli                  # the weft command's output against its goldens
-./zig-out/bin/weft check play/signals.weft   # after `zig build`; see The weft Command
+zig build bench -Doptimize=ReleaseFast   # what a compile and a read cost on this machine
+./zig-out/bin/weft check ../play/signals.jig   # after `zig build`; see The weft Command
 ```
 
 ## Layout
 
+The root package is the core: it imports nothing, and `src/weft.zig` is its root. The text front
+end is `text/`, a package of its own that depends on the core (`..`) and on Jig (`../../jig`).
+
 ```txt
-language/             the language: a module of its own that imports only `std`, never the core
-  language.zig        the module's root: what it re-exports
-  token.zig           the tokenizer
-  parse.zig           the parser and its flat tree
-  schema.zig          the types of the table of primitives, and `Vocabulary`, what a back end passes in
-  check.zig           names, order, types, defaults, seeds, and where a number is written
-  format.zig          the canonical format
-  error.zig           diagnostics and suggestions
-  limits.zig          `Limits` and the numbers the language shares with a back end
 src/
-  weft.zig            the library root
+  weft.zig            the library root: the core, and nothing that reads text
   core/
     colour.zig        OKLab and sRGB, both ways, and a gamut map for drawing
     cue.zig           Cues: a sorted, bounded table of times
@@ -254,39 +270,47 @@ src/
     time.zig          Time and Rate: an integer count of flicks
     track.zig         Tracks: timed values a client writes, read as signals, latched from a time
     wave.zig          Wave: sine, triangle, saw, and square, pure functions of time
-  lang/
-    lang.zig          Compiled and Syntax: text to a Program, and the limits
-    table.zig         Weft's vocabulary for the language: the table of primitives and four functions
-    graph.zig         the back end: checked declarations to a Program
-    std.weft          the standard library of modules, `weft.lang.std_library`
-cli/
-  main.zig            the weft command: arguments, files, and one write of the output
-  commands.zig        check, describe, sample, and parse, each a call into the library
 test/
-  catalog.zig         the sampled signals, rendered as text of hex floats
-  lang.zig            the catalog's graphs as text, which compile to its nodes
-  modules.zig         modules against the same graphs written by hand
-  carry.zig           a recompile's carried reader against a fresh one, bit for bit
-  vectors.zig         vectors and colours against the scalar files they stand for
-  lanes.zig           lanes in the language against the builder's region, and the lane errors
-  rules.zig           every file's guide, and no allocator, thread, lock, or I/O in the library
-  cli.zig             the weft command's output against its goldens, and a client's nouns
-  nouns.zig           a score: nouns that only describe beside a program, strings, and their errors
-  score.zig           that score and its nouns, shared with cli.zig's client command
-  division.zig        a quotient by a number against the product with its reciprocal, and refusals
-  functions.zig       the functions of a value, clamp, quantize: building, folding, ranges, refusals
-  chains.zig          a tween chain with `from` left out against the chain written out
-  forms.zig           a cue's form, a track's numbers, and the time literal's reader and writer
+  catalog.zig         the sampled signals, rendered as text of hex floats; also the `catalog`
+                      module the text package's tests compile from text
+  rules.zig           every file's guide, no allocator, thread, lock, or I/O in the core, and
+                      that the core imports only `std` and its own files
   golden/signals.txt  the committed samples
-  golden/cli/         the weft command's committed output
 tools/
-  bench.zig           times reads and a compile, for zig build bench
   regress.zig         compares native and wasm text with the golden, and blesses
   regress_wasm.zig    the catalog on wasm32-freestanding
   regress_wasm.mjs    runs that module under Node and prints its text
-play/                 a package of its own: the Play app, on Weft and Patchwork
+text/                 a package of its own: Weft's text front end (module `weft_text`)
+  text.zig            Compiled and Syntax: text to a Program, and the limits; the module's root
+  src/
+    table.zig         Weft's vocabulary for Jig: the table of primitives and four functions
+    graph.zig         the back end: checked declarations to a Program
+    std.jig           the standard library of modules, `weft_text.std_library`
+  cli/
+    main.zig          the weft command: arguments, files, and one write of the output
+    commands.zig      check, describe, sample, and parse, each a call into the library
+  test/
+    lang.zig          the catalog's graphs as text, which compile to its nodes
+    modules.zig       modules against the same graphs written by hand
+    carry.zig         a recompile's carried reader against a fresh one, bit for bit
+    vectors.zig       vectors and colours against the scalar files they stand for
+    lanes.zig         lanes in the language against the builder's region, and the lane errors
+    rules.zig         every file's guide, and no allocator, thread, lock, or I/O in a compile
+    cli.zig           the weft command's output against its goldens, and a client's nouns
+    nouns.zig         a score: nouns that only describe beside a program, strings, and errors
+    score.zig         that score and its nouns, shared with cli.zig's client command
+    division.zig      a quotient by a number against the product with its reciprocal, and refusals
+    functions.zig     the functions of a value, clamp, quantize: building, folding, ranges, refusals
+    chains.zig        a tween chain with `from` left out against the chain written out
+    forms.zig         a cue's form, a track's numbers, and the time literal's reader and writer
+    golden/cli/       the weft command's committed output
+  tools/bench.zig     times reads and a compile, for `zig build bench` in `text/`
+  examples/starter    the smallest client: a Patchwork app that reads a program
+play/                 a package of its own: the Play app, on the text package and Patchwork
 docs/
   agents.md           for an agent new to Weft: the toolbox, the language, a Play page, a primitive
+  internals.md        how the core and its text front end are built
+  tutorial.md         the library and the language, by example
 ```
 
 Every file starts with a guide for reviewers: `//! … # Deep Architectural Guide for Reviewers:`.
@@ -652,7 +676,25 @@ explains the bounds that hold.
 ## Language
 
 A program can be written as text and compiled once, at init, into the same nodes the builder
-would make, so text costs nothing at `eval`. Play's two signal tables are written in it. A file:
+would make, so text costs nothing at `eval`. Play's two signal tables are written in it. The
+language is [Jig](../jig), a repository of its own; Weft's table of calls, its back end, and
+`Compiled` are the package in `text/` (module `weft_text`), and the core, `weft`, knows nothing of
+either. A client that reads text declares one dependency, `weft_text`, and takes the four modules
+from it, so there is one instance of each (two instances of Jig would be two `jig.schema.Entry`):
+
+```zig
+// build.zig.zon: .dependencies = .{ .weft_text = .{ .path = "../weft/text" } },
+// build.zig
+const text = b.dependency("weft_text", .{});
+const imports = &.{
+    .{ .name = "weft", .module = text.module("weft") },           // the core
+    .{ .name = "jig", .module = text.module("jig") },             // the language
+    .{ .name = "weft_text", .module = text.module("weft_text") }, // Weft's table and back end
+};
+```
+
+A client that needs only the core, and no text, depends on `weft` (`..` from `text/`) as before.
+A file:
 
 ```txt
 # Comments run to the end of the line.
@@ -679,9 +721,9 @@ fb <- loop # a cycle goes through a delay
 ```
 
 ```zig
-var compiled: weft.lang.Compiled(.{ .nodes = 24, .slab = 112, .cues = 6, .tracks = 4 }) = undefined;
+var compiled: weft_text.Compiled(.{ .nodes = 24, .slab = 112, .cues = 6, .tracks = 4 }) = undefined;
 compiled.compile(source) catch {
-    for (compiled.errors()) |found| try found.render(source, "signals.weft", writer);
+    for (compiled.errors()) |found| try found.render(source, "signals.jig", writer);
 };
 const program = compiled.program;
 const chase = compiled.signal("chase").?;    // a node
@@ -737,7 +779,7 @@ const goal = compiled.goal("spring");        // a path and its from, a chase's t
 - **Errors** give a line, a column, a reason, and a hint, as Zig prints its own:
 
 ```txt
-signals.weft:14:22: error: chase has no parameter `tme`
+signals.jig:14:22: error: chase has no parameter `tme`
     chase = chase(noise, tme: chase_s)
                          ^^^
     hint: did you mean `time`?
@@ -750,15 +792,15 @@ signals.weft:14:22: error: chase has no parameter `tme`
   gives the `Limits.slab` the file needs:
 
 ```txt
-plot.weft:4:1: error: the slab needs 1101 values, more than 1024; `plot` needs 1100 of them, at 100 lanes
+plot.jig:4:1: error: the slab needs 1101 values, more than 1024; `plot` needs 1100 of them, at 100 lanes
     plot = lanes(100, wobble(noise(smooth, 1hz)) + wobble(noise(steps, 2hz)))
     ^^^^
     hint: give `plot` fewer lanes, which cost 11 of the slab each, or raise `Limits.slab` to 1101
 ```
 
-There is one canonical format, which `lang.Syntax` writes: one declaration a line, no lining up,
+There is one canonical format, which `weft_text.Syntax` writes: one declaration a line, no lining up,
 named arguments in the table's order, and a call written one argument a line exactly when its last
-argument has a trailing comma, as `zig fmt` does. `src/lang/lang.zig` explains the stages.
+argument has a trailing comma, as `zig fmt` does. `text/text.zig` explains the stages, and Jig's `docs/internals.md` the front end.
 
 ## Modules
 
@@ -780,7 +822,7 @@ h = hop(0.7, c0)
 ```
 
 ```zig
-compiled.compile_with(&.{.{ .name = "std", .text = weft.lang.std_library }}, source) catch { … };
+compiled.compile_with(&.{.{ .name = "std", .text = weft_text.std_library }}, source) catch { … };
 ```
 
 - **Parameters** take arguments by position or by name, and a default is a literal. A parameter's
@@ -901,7 +943,7 @@ parameter is `comptime`), so a client's call that has the name and role of one o
 another of its own, or the name of a number (`pi`) or a keyword (`seed`), stops the build with a
 message naming both. Weft's lookup, its "did you mean" hint, and its formatter all read the one
 joined list, so a client formats its files with
-`weft.lang.format.format(tree, weft.lang.entries_of(&nouns), out)` and its calls' named arguments
+`jig.format.format(tree, weft_text.entries_of(&nouns), out)` and its calls' named arguments
 take their entries' order:
 
 | `op` | What it is | What Weft's back end does | What the client does |
@@ -912,11 +954,11 @@ take their entries' order:
 **Which of the two a client calls** (step 57). `Compiled.compile_client` is for a client whose files
 Weft builds into a program: it checks and then builds. A client that builds its own program from
 `Checked.calls`, and whose file Weft refuses as `refused`, calls the language's own container,
-`weft.lang.File(limits.file(), weft.lang.table.vocabulary)` (the language's `File`), whose
+`jig.File(limits.file(), weft_text.table.vocabulary)` (the language's `File`), whose
 `check_client(entries, libraries, source)` parses and checks and builds nothing, so a file of only
 the client's signals checks with no diagnostic, and `Compiled.check_client` is the same call on a
 `Compiled`. `Limits` stays the flat struct a client writes, `.{ .nodes = 24, .slab = 112 }`;
-`limits.file()` is its part for the language (`weft.lang.FileLimits`). `weft check` on a file with
+`limits.file()` is its part for the language (`jig.FileLimits`). `weft check` on a file with
 a client's signal prints `ok:` with the counts the checker knows, a line that no program was
 built, and the least `FileLimits`, and exits 0; `weft sample` on it says there is nothing to
 sample. A file that mixes a client's signal with Weft's is read the same way by `check`, and
@@ -935,7 +977,7 @@ n1 = say(b1, "Here is a parabola.")
 ```
 
 ```zig
-const nouns = [_]weft.lang.schema.Entry{ axes, plot, say };   // op = .noun
+const nouns = [_]jig.schema.Entry{ axes, plot, say };   // op = .noun
 try compiled.compile_client(&nouns, &.{}, source);
 var each = compiled.nouns();                                  // in the file's order
 while (each.next()) |noun| {
@@ -968,13 +1010,13 @@ while (each.next()) |noun| {
 - **A cue's name from its index**: a noun's `cue` value is an index into the cue table, and
   `compiled.cue_name(index)` gives back `.{ .name = "hit" }`, or for a cue of a series its name
   and place, `.{ .name = "bar", .element = 2 }`; null for an index past the table.
-- **A client's own command** is a few lines on the module `commands` (`cli/commands.zig`):
+- **A client's own command** is a few lines on the module `commands` (`text/cli/commands.zig`):
   `describe`, `check`, and `sample` take the client's entries, and the `weft` command passes
   none. `check` counts the nouns on its `ok:` line; `sample` lists signals only, so a signal a
   noun reads inline is sampled by binding it on a line of its own. `commands.limits` holds two
   libraries, `std` and one of the client's.
 - **A client with checks of its own** (a shape, a position) compiles into its own
-  `lang.Compiled(its limits)`, runs its checks, and then calls `commands.For(its limits)` on that
+  `weft_text.Compiled(its limits)`, runs its checks, and then calls `commands.For(its limits)` on that
   `Compiled` (step 37), so each file compiles once and at the client's limits, larger or smaller
   than the command's:
 
@@ -1018,7 +1060,7 @@ and mirroring the checker's grammar. Weft never edits the text. The loop is four
    digit. `Syntax.track_form(name)` reads the tree alone, so a knob stays bound while another line
    has an error; there `other` is anything the checker would refuse.
 2. **The span.** The client replaces those bytes in its own copy of the text, and nothing else.
-3. **The writer.** `weft.lang.write_time(&buffer, flicks, .ms)` is the shortest literal in a
+3. **The writer.** `jig.check.write_time(&buffer, flicks, .ms)` is the shortest literal in a
    unit that reads back to exactly those flicks: `7s`, `6500ms`, `2.08ms`. It returns null for
    a time no literal holds (one 441 does not divide) and for a negative one. `read_time(text)` is
    the checker's own reader, the inverse. A number literal is written by the client's own
@@ -1028,8 +1070,8 @@ and mirroring the checker's grammar. Weft never edits the text. The loop is four
 
 ```zig
 const offset = compiled.cue_form(b2).?.alone.after.offset;   // `cue b2 = b1 + 6s`
-var literal: [weft.lang.time_text_max]u8 = undefined;
-const written = weft.lang.write_time(&literal, 6500 * ms, .ms).?;   // "6500ms"; ".s" gives "6.5s"
+var literal: [jig.check.time_text_max]u8 = undefined;
+const written = jig.check.write_time(&literal, 6500 * ms, .ms).?;   // "6500ms"; ".s" gives "6.5s"
 // text[0..offset.start] ++ written ++ text[offset.start + offset.len ..], then compile again
 ```
 
@@ -1038,7 +1080,7 @@ text and compiling again is what moves a beat and every cue written against it.
 
 ## The weft Command
 
-`zig build` installs `zig-out/bin/weft`, the tool an agent uses in place of watching motion. It
+`zig build` in `text/` installs `text/zig-out/bin/weft`, the tool an agent uses in place of watching motion. It
 needs no window, no GPU, and no Patchwork, and each command is a thin call into the library:
 
 ```bash
@@ -1050,10 +1092,10 @@ weft parse FILE --json                          # the flat tree, as JSON
 ```
 
 ```txt
-$ weft check play/signals.weft
+$ weft check play/signals.jig
 ok: 21 nodes, a slab of 112, 6 cues, 3 goals, 4 regions, 4 tracks, seekable, stepped
 limits: .{ .tokens = 561, .tree = 268, .names = 29, .nodes = 21, .slab = 112, .cues = 6, .goals = 3, .regions = 4, .tracks = 4, .modules = 0, .libraries = 0 }
-$ weft sample play/signals.weft --to 1 --step 0.5 --signal wave
+$ weft sample play/signals.jig --to 1 --step 0.5 --signal wave
 {"from":0,"to":705600000,"step":352800000,"signals":[{"name":"wave","range":[-1,1],"bounded":true,"values":[0,1,0]}],"events":[{"t":22050000,"source":19,"instance":0,"name":"glide_a","value":0.496…},…]}
 ```
 
@@ -1085,7 +1127,7 @@ $ weft sample play/signals.weft --to 1 --step 0.5 --signal wave
   `commands.sample`, which a client's command calls with its own entries (A Client's Nouns).
 - **JSON** has its keys in a fixed order and no whitespace, and a value that is not finite, such
   as an unbounded range, is `null`. The output of every command is locked by a golden in
-  `test/golden/cli`, so a change to it is a reviewed change.
+  `text/test/golden/cli`, so a change to it is a reviewed change.
 - **Exit codes**: 0 on success, 1 when the file has errors, 2 for bad arguments or a file that
   cannot be read.
 - **A client's nouns**: `Compiled.compile_client` takes comptime entries beside the table of
@@ -1110,13 +1152,13 @@ Bless only for a change the step means to make, in that step's commit.
 
 ## Bench
 
-`zig build bench -Doptimize=ReleaseFast` prints its build mode and one line per case: a pure
+`zig build bench -Doptimize=ReleaseFast` in `text/` prints its build mode and one line per case: a pure
 graph of 16 waves summed, per eval; four chases on a wave plus noise playing forwards at 60 Hz, per
 frame; that graph from a fresh state, the first eval at 60 s and at 600 s; a bounce and cues,
 `events` per 128-frame block at 48 kHz; 16 waves, a bounce, and cues, with and without a chase, a
 6 s window of events around a playhead at 60 Hz and its eval, by `events` and by `events_of` the
 solved sources, and that eval alone (step 23); a track write at the playhead at 600 s, then the
-frame's eval, which is what a knob costs from now on; a compile of Play's `signals.weft`; a
+frame's eval, which is what a knob costs from now on; a compile of Play's `signals.jig`; a
 compile of modules nested 8 deep, 511 instances; and a region of a noise, a staggered tween, a
 map, a product, and a staggered bounce at 1,000 and 100,000 lanes, an eval and a frame's events
 per frame; a spring over 1,000 lanes, staggered and then by lane at uneven cues (step 39), the
@@ -1131,7 +1173,7 @@ no GPU. Its numbers depend on the machine, so it has no thresholds and is not pa
 
 Measured with `zig build bench -Doptimize=ReleaseFast` on an i5-13600K, at step 18; step 19's
 bound adds about 5% to a stepped node's step. The numbers are ReleaseFast: Debug is about ten
-times slower. Play's simulated file is `signals.weft`, 21 nodes: four chases, a follower, a
+times slower. Play's simulated file is `signals.jig`, 21 nodes: four chases, a follower, a
 shift register, an oscillator, tracks, cues, and pure nodes around them. A frame at 60 Hz has
 16.7 ms; an audio block of 128 frames at 48 kHz has 2.667 ms.
 
@@ -1167,7 +1209,7 @@ or a clock.
 ## Play
 
 Play is Weft's first client: a Patchwork app with seven pages on one 600 s clock. Its signals are
-text, `play/signals.weft`, `play/bouncers.weft`, `play/vectors.weft`, `play/lanes.weft`, and `play/swarm.weft`,
+text, `play/signals.jig`, `play/bouncers.jig`, `play/vectors.jig`, `play/lanes.jig`, and `play/swarm.jig`,
 compiled at start, and the first can be edited while it runs.
 
 - **scope** plots eight signals, one or more of each class but live, over a window from one second
@@ -1187,11 +1229,11 @@ compiled at start, and the first can be edited while it runs.
   log lists the last six hits at their exact times, in seconds and flicks. Every hit is read from
   the graph each frame and none is kept, so a pause, a scrub, or a frame rate never changes what
   a time shows.
-- **text** is `signals.weft` in Patchwork's editor, coloured by Weft's own tokenizer, beside the
+- **text** is `signals.jig` in Patchwork's editor, coloured by Weft's own tokenizer, beside the
   scope's rows and four knobs. Each edit recompiles; a text that does not compile keeps the last
   good program running and marks its errors, with the first named under the editor. A program
   that compiles runs from the playhead on, and its readers keep their steps when no simulated
-  node changed (Recompiling and Carry, `src/lang/lang.zig`), so such an edit costs under a
+  node changed (Recompiling and Carry, `text/text.zig`), so such an edit costs under a
   millisecond even at 600 s. A fresh reader would give the same bits, so a spring in flight never
   jumps either way: the carry saves the replay, not the motion. A `seed`, `start`, `use`, or
   `module` line, or a library's text, is global to the carry, so changing one starts every

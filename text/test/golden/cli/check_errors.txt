@@ -1,0 +1,27 @@
+bad.jig:8:13: error: `q` is a parameter of `p` twice
+    module p(q, q) = q
+                ^
+    hint: rename one of them
+bad.jig:2:14: error: chase has no parameter `tme`
+    c = chase(n, tme: 1s)
+                 ^^^
+    hint: did you mean `time`?
+bad.jig:3:16: error: `hz` takes a frequency
+    d = wave(sine, 1)
+                   ^
+    hint: write `1hz`
+bad.jig:5:15: error: the module `a` uses itself
+    module b(x) = a(x)
+                  ^^^^
+    hint: the cycle is a -> b -> a; break it with a parameter or a primitive
+bad.jig:7:5: error: two colours do not multiply
+    f = oklab(0.5, 0, 0) * oklab(0.5, 0, 0)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    hint: scale a colour by a number, or multiply components, such as `a.l * b.l`
+bad.jig:11:1: error: cues are in time order, and this one is before the cue above it
+    cue early = 1s
+    ^^^^^^^^^^^^^^
+    hint: move it above the cues it comes before
+bad.jig:13:5: error: there is no call `print`
+    i = print(1, 2)
+        ^^^^^
