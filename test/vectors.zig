@@ -239,7 +239,7 @@ test "a shape that does not fit is an error where it is written" {
         .{ .text = "a = vec2(1, 2)\nb = a.z\n", .code = .unknown_output, .at = "z" },
         .{ .text = "a = oklab(0.5, 0, 0)\nb = a.x\n", .code = .unknown_output, .at = "x" },
         .{ .text = "a = srgb(1.5, 0, 0)\n", .code = .out_of_range, .at = "1.5" },
-        .{ .text = "a = tween(from: srgb(0, 0, -1), to: 1, at: c0, over: 1s)\n", .code = .out_of_range, .at = "srgb(0, 0, -1)" },
+        .{ .text = "a = tween(from: srgb(0, 0, -1), to: 1, at: c0, over: 1s)\n", .code = .out_of_range, .at = "-1" },
     };
     for (cases) |case| {
         const text = try std.mem.concat(testing.allocator, u8, &.{ prelude, case.text });

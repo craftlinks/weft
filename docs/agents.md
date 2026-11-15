@@ -227,8 +227,8 @@ Step 33 took the short path below for eight functions.
 **A function of one value is shorter.** If the op is pure, reads one signal, and works per
 component and per lane, it is a value of `graph.Function`: its arm in `Function.of` and in
 `function_range` (`src/core/graph.zig`), its range rule in `src/core/range.zig`, and one entry in
-`schema.zig` with `.op = .function` and `.function` set. `Op.apply`, `eval_node`, the checker's
-shape, lanes, and folding, and the back end already handle every function, so of the steps
+`src/lang/table.zig` with `tag(.function)` and `.function` set, `.shape = .{ .of = "input" }`, and
+`.folds = true`. `Op.apply`, `eval_node`, the checker's shape, lanes, and folding, and the back end already handle every function, so of the steps
 below it needs the range rule's test (1), the tests (3), the entry (4), and 7 to 10. A value
 whose bits could differ by target, such as `@min`, `@max`, `@sin`, `@exp`, or `@round`, is
 computed by Weft's own code (`elementary.zig`, `graph.minimum`), never by the builtin; `@sqrt`
@@ -236,7 +236,7 @@ and `@floor` are IEEE operations and may be used. A function must be total: a va
 f64 a signal can hold, infinities included, with NaN passed through and no assert, and its
 range rule must hold for an unbounded input. A function with a whole-number parameter, as
 `pow` has, is a payload of the union and an `integer` parameter the checker bounds
-(`power_in_range`), and `Builder.apply` refuses it by name. A catalog graph named after a call
+(its `range`), and `Builder.apply` refuses it by name. A catalog graph named after a call
 reads as one in `test/lang.zig`, so step 33's are `fn_NAME`.
 
 1. **`src/core/graph.zig`**
@@ -266,24 +266,25 @@ reads as one in `test/lang.zig`, so step 33's are `fn_NAME`.
      own loop at the end of `render`), so no existing golden line moves. Then
      `zig build regress -- --bless`, which blesses only when native and wasm agree, and
      `git diff test/golden/signals.txt` shows added lines only.
-4. **`language/schema.zig` and `src/lang/table.zig`**: a value of `Op` (in `language/schema.zig`)
-   and an entry (in `src/lang/table.zig`), placed where `describe` should list it: its
+4. **`src/lang/table.zig`**: a value of `table.Op` and an entry (stored as `tag(op)`), placed where `describe` should list it: its
    parameters in the builder's order and names, their kinds, defaults, and which are
    `positional`, `live`, or `shaped`, and each parameter's `doc`, one sentence on what it means
    (a test fails on a parameter without one). Fill the entry's `lanes`, which is `describe`'s
    `"lanes"` (`.inputs`, the default, for a pure op reading signals), its `event` sentence if it
    fires events, its `first_output` and `outputs` if it has more than one, and its `fixed_hint`
    if a signal given to a fixed parameter needs a sentence of its own: they are data on the
-   entry, with no switch to extend. Add it to `core_op()` in `src/lang/table.zig`, the core op its call
+   entry, with no switch to extend. So is what the checker acts on: `shape` (`of`, `agree`,
+   `combine`, or `constructor` over named parameters), `fed` and `example` for a call `<-`
+   feeds, `after` for a call that continues another, `folds` for a call of constants that folds
+   (its value is `fold` in the table's vocabulary), `by_lane` on a cue or path parameter, a
+   parameter's `range` and `hint` and `need`, and a constructor's `converts` (its value is
+   `convert`). `schema.assert_entry` refuses an entry that names a parameter it lacks. Add it to `core_op()` in `src/lang/table.zig`, the core op its call
    builds, whose `Op.class` is `describe`'s `"class"`, and a call of it to `class_sample` in
    `test/lang.zig`, which checks the two agree.
-5. **`language/check.zig`**:
-   - `call_shape`: a call is one number unless it has an arm, so an op with a `shaped`
-     parameter needs one, or a vector argument is refused or read as one number. Use `combine`
-     for `+`'s rule, or the argument's own shape for one input;
-   - `call_lanes` follows `lane_rule`, so it needs nothing for `.inputs`;
-   - folding: a pure op given only constants builds a node unless `folded` turns it into one.
-     Fold with the core's own function, so the bits are the node's. Say which in the guide.
+5. **`language/check.zig`**: nothing, for an entry that declares what it needs as step 4 says. The
+   checker holds no list of calls; a call is one value unless its entry's `shape` says more.
+   Fold with the core's own function in the table's `fold`, so the bits are the node's. Say which
+   in the guide.
 6. **`src/lang/graph.zig`**: its arm in `build_call`, and a message in `refuse` for each builder
    error a checked file can still reach.
 7. **The language's tests**: the catalog's new graph as text in `test/lang.zig`; a test file of

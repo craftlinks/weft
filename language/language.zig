@@ -12,10 +12,10 @@
 //!
 //! ## 2. What a Back End Passes In
 //! The language never names a back end's table. The back end gives `check.Memory` a
-//! `schema.Vocabulary`: its entries, and four functions whose bits are its own (a function of a
-//! value at a number, `min` or `max` of two, sRGB to the colour the language keeps, and the seed
-//! hash). Weft's is `src/lang/table.zig`. The functions are function pointers for now, a decided
-//! exception to the style that step 56 removes with comptime vocabularies.
+//! `schema.Vocabulary`: its entries, and three functions whose bits are its own (a folding
+//! call's value, a constructor's conversion, and the seed hash). Weft's is `src/lang/table.zig`.
+//! The functions are function pointers for now, a decided exception to the style that step 56
+//! removes with comptime vocabularies.
 
 pub const token = @import("token.zig");
 pub const parse = @import("parse.zig");
@@ -33,4 +33,5 @@ test {
     _ = schema;
     _ = format;
     _ = check;
+    _ = @import("check_test.zig");
 }

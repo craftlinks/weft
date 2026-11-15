@@ -28,7 +28,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 
 pub const message_len_max = 120;
-pub const hint_len_max = 96;
+pub const hint_len_max = 128;
 pub const note_len_max = 96;
 /// Longer names are never suggested, so the distance's row is fixed.
 pub const name_len_max = 48;

@@ -355,7 +355,7 @@ test "the functions of a value work per component and per lane, and keep the inp
 // power; and `quantize` by a signal or by 0, refused as a divisor at the call, since the module's
 // body divides.
 test "pow and quantize refuse what is not a fixed number" {
-    const power_message = "a power is a whole number from 2 to 8";
+    const power_message = "`n` is a whole number from 2 to 8";
     const power_hint = "for 1 write the signal itself; for more than 8 multiply two, such as `pow(x, 8) * pow(x, 2)`";
     const cases = [_]Expected{
         .{ .source = "x = pow(wave(sine, 1hz), 1)\n", .code = .out_of_range, .message = power_message, .hint = power_hint, .span = "1" },

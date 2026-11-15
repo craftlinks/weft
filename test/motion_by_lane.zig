@@ -525,7 +525,7 @@ test "every refusal of a goal by lane, with its hint" {
         .{ .text = "x = lanes(3, spring([s[0]: 0, s[lane]: 1], time: 1s))\n", .code = .wrong_lanes, .at = "s[lane]", .hint = two_hint },
         .{ .text = "x = lanes(3, newtonian([s[lane]: 1, c: 0], speed: 1, accel: 1, decel: 1))\n", .code = .wrong_lanes, .at = "s[lane]", .hint = two_hint },
         .{ .text = "module two(at) = spring([at: 1, c: 0], time: 1s)\nx = lanes(3, two(s[lane]))\n", .code = .wrong_lanes, .at = "s[lane]", .hint = two_hint },
-        .{ .text = "p = [s[lane]: 1]\nx = lanes(3, spring(p, time: 1s))\n", .code = .wrong_lanes, .at = "s[lane]", .hint = "write the path in the call, as `spring([s[lane]: 1], …)`, inside `lanes(n, …)`" },
+        .{ .text = "p = [s[lane]: 1]\nx = lanes(3, spring(p, time: 1s))\n", .code = .wrong_lanes, .at = "s[lane]", .hint = "write the path in the call, as `[s[lane]: 1]`, inside `lanes(n, …)`" },
         .{ .text = "x = lanes(3, spring([s[lane]: 1], time: 1s, stagger: 10ms))\n", .code = .wrong_lanes, .at = "10ms", .hint = drop_hint },
         .{ .text = "x = lanes(3, newtonian([s[lane]: 1], speed: 1, accel: 1, decel: 1, stagger: 10ms))\n", .code = .wrong_lanes, .at = "10ms", .hint = drop_hint },
         .{ .text = pop_module ++ "x = lanes(3, pop(s[lane], stagger: 10ms))\n", .code = .wrong_lanes, .at = "stagger", .hint = drop_hint },

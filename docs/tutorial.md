@@ -973,7 +973,7 @@ target).
 | `'hz' takes a frequency` | A bare number | Write `2hz`, `500ms`, `1.5s` |
 | `not a whole number of flicks` | A time finer than the grid | Round to 5 places of a second |
 | `4 lanes and 5 lanes do not go together` | Two regions of different sizes | Make the counts equal |
-| `a power is a whole number from 2 to 8` | `pow(x, 1)`, `pow(x, 10)`, `pow(x, 0.5)`, or `pow(x, k)` with k a name | Write `x`, multiply powers, use `sqrt`, or write the number |
+| `` `n` is a whole number from 2 to 8 `` | `pow(x, 1)`, `pow(x, 10)`, `pow(x, 0.5)`, or `pow(x, k)` with k a name | Write `x`, multiply powers, use `sqrt`, or write the number |
 | A `floor` of a chase steps between frames, or at a frame you did not expect | `floor` reads the chase's value interpolated between its fixed steps | Expected: a step falls where the smooth value crosses a whole number |
 | ``there is no call `clamp` `` | `clamp` is a module of `std`, not a primitive | Add `use std`, and pass `--use std=src/lang/std.weft` to `weft` |
 | `` `min` is a primitive, not a module's name ``, or ``the module `clamp` is declared twice`` | A module of your own from before 0.2 named `abs`, `min`, or `max`, or `clamp` beside `use std` | Rename it, or delete it and use the call |

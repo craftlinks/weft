@@ -17,6 +17,10 @@
 //! on an op for any. One rule stays by op: a noun has `apart` whatever `lanes` says, since a
 //! client's noun sets none.
 //!
+//! Step 55b finishes it: `Op` has the three tags the language gives meaning to and a back end's
+//! are the rest, a parameter has a `range` (with a `hint`) and a `need`, an entry `folds` and has
+//! an `example`, and `Vocabulary.fold` and `convert` are the two functions a back end gives for
+//! them. `lanes_entry` is the language's own region.
 //! Step 55a adds what the checker acts on, also data on the entry and defaulted: `shape`, how the
 //! call's value is shaped from its parameters (`ShapeRule`); `fed`, whether `<-` may feed it;
 //! `after`, which parameter names the call it continues and which of its values a left-out
@@ -185,6 +189,29 @@ pub const Param = struct {
     /// What the parameter means, one sentence, which `describe` prints (section 3d). Every
     /// parameter of `entries` has one; a client's entry may leave it empty.
     doc: []const u8 = "",
+    /// A number written, or folding to one, is in [low, high] (kinds `number` and `integer`, and a
+    /// constructor's components).
+    range: ?[2]f64 = null,
+    /// Added to the refusal of a number outside `range`.
+    hint: []const u8 = "",
+    /// The shape a signal given to it must have; the default takes any.
+    need: Need = .{},
+};
+
+/// The shape and lanes a signal argument must have (step 55b).
+pub const Need = struct {
+    /// 0 takes any count of components; otherwise exactly this many.
+    components: u8 = 0,
+    /// A colour is needed, whatever `components` says.
+    colour: bool = false,
+    lanes: NeedLanes = .any,
+};
+
+pub const NeedLanes = enum {
+    any,
+    one,
+    /// At least 2.
+    many,
 };
 
 pub const Role = enum { signal, mover };
@@ -228,42 +255,19 @@ pub const EntryKind = enum {
     noun,
 };
 
-/// What a back end builds for an entry.
-pub const Op = enum {
-    wave,
-    noise,
-    tween,
-    spring,
-    newtonian,
-    chase,
-    oscillator,
-    follow,
-    shift,
-    delay,
-    bounce,
-    crossing,
-    cues,
-    input,
-    map,
-    spring_mover,
-    newtonian_mover,
-    /// `vec2`, `vec3`, and `oklab`: scalars packed into one value (step 16).
-    pack,
-    /// `srgb`: a colour from three numbers, converted to OKLab at compile time.
-    srgb,
-    /// `lanes(n, body)`: its body over a region of n lanes (step 17).
-    lanes,
+/// What an entry is to the language: three tags it gives meaning to, and every other a back end's
+/// (Weft's are `table.Op`, which has these three first). The enum is not exhaustive, so a
+/// back end's tag is a value of it that the language never names.
+pub const Op = enum(u8) {
     /// A client's signal: checked like the rest, refused by Weft's back end, and built by the
     /// client from `Checked.calls`.
-    client,
+    client = 0,
     /// A client's noun that only describes (section 3a): a declaration of its own, whose signal
     /// arguments the back end builds and whose call it skips.
-    noun,
-    /// A function of one value, the entry's `function` (section 3c).
-    function,
-    /// `min` and `max`: the smaller and the larger of two values (section 3c).
-    minimum,
-    maximum,
+    noun = 1,
+    /// `lanes(n, body)`: its body over a region of n lanes (step 17), the language's own form.
+    lanes = 2,
+    _,
 };
 
 /// How a call takes lanes (step 17), which `describe` prints and the checker follows.
@@ -294,16 +298,17 @@ pub const NodeClass = enum { pure, exact, simulated, live };
 /// A function of one value (section 3c). Its tags are the back end's, which gives the bits.
 pub const Function = union(enum) { abs, sin, cos, exp, ln, sqrt, floor, round, pow: u8 };
 
-/// What a back end gives the language: the calls it knows, and the functions whose
-/// bits must be its own, so a constant folds to what its node would give.
+/// What a back end gives the language: the calls it knows, and the functions whose bits must be
+/// its own, so a constant folds to what its node would give.
 pub const Vocabulary = struct {
     entries: []const Entry,
-    /// A function of one value at a number. A function pointer for now (step 56 makes it comptime).
-    fold: *const fn (Function, f64) f64,
-    /// `minimum` or `maximum` of two numbers. A function pointer for now (step 56).
-    fold_pair: *const fn (Op, f64, f64) f64,
-    /// An sRGB colour as the colour the language keeps. A function pointer for now (step 56).
-    from_srgb: *const fn ([3]f64) [3]f64,
+    /// The value of a call of `entry` whose `folds` is set, from its operands in parameter order
+    /// (an integer as a number, the second 0 for an entry of one parameter). A function pointer
+    /// for now (step 56 makes it comptime).
+    fold: *const fn (entry: *const Entry, operands: [2]f64) f64,
+    /// The numbers a call of `entry` whose constructor `converts` is written with, as the
+    /// language keeps them. A function pointer for now (step 56).
+    convert: *const fn (entry: *const Entry, values: [4]f64) [4]f64,
     /// A seed and a number as a new seed. A function pointer for now (step 56).
     seed_hash: *const fn (u64, u64) u64,
 
@@ -347,6 +352,11 @@ pub const Entry = struct {
     /// Which parameter names the call this one continues, and which of that call's values this
     /// one's `.after` default takes. Set exactly when a parameter's default is `.after`.
     after: ?After = null,
+    /// A call of it whose signals are all constants folds, through `Vocabulary.fold`.
+    folds: bool = false,
+    /// A call of it as a hint writes it, such as `delay(0)`; empty for none. The first entry that
+    /// is `fed`, and the first mover, give the hints that name an example.
+    example: []const u8 = "",
 
     /// The index of the parameter `name`, if the entry has one.
     pub fn param(entry: *const Entry, name: []const u8) ?u32 {
@@ -399,7 +409,7 @@ pub const Entry = struct {
     /// 3c). Null for an entry whose `op` is not `function`.
     pub fn function_of(entry: *const Entry, n: u64) ?Function {
         const function = entry.function orelse return null;
-        assert(entry.op == .function);
+        assert(entry.role == .signal);
         return switch (function) {
             .pow => .{ .pow = @intCast(@min(n, std.math.maxInt(u8))) },
             else => function,
@@ -422,6 +432,24 @@ pub const Entry = struct {
     }
 };
 
+/// `lanes(n, body)`, the language's own form: a region is the language's, so every vocabulary has
+/// it, and Weft's table holds this entry by value at its place.
+pub const lanes_entry: Entry = .{
+    .name = "lanes",
+    .op = .lanes,
+    .role = .signal,
+    .lanes = .makes,
+    .shape = .{ .of = "body" },
+    .summary = "its body over n lanes, each with its own `lane`, seeds, and stagger",
+    .params = &.{
+        .{ .name = "count", .kind = .integer, .positional = true, .doc = "how many lanes, numbered from 0 by `lane`" },
+        .{ .name = "body", .kind = .signal, .positional = true, .shaped = true, .doc = "what each lane computes, a name bound outside shared by them all" },
+    },
+};
+
+/// The entries the language defines itself, looked up after a vocabulary's own.
+pub const language_entries = [_]Entry{lanes_entry};
+
 /// The rules every entry keeps, the table's and a client's alike (section 4): at most `params_max`
 /// parameters and `outputs_max` outputs, positional parameters before named ones, distinct
 /// names, words where a parameter takes them, and the fields of section 5 naming parameters the
@@ -442,9 +470,24 @@ pub fn assert_entry(entry: *const Entry) void {
             assert(param_a.kind == .number);
             assert(param_a.shaped);
         }
+        if (param_a.range) |range| {
+            assert(param_a.kind == .number or param_a.kind == .integer or entry.shape == .constructor);
+            assert(range[0] <= range[1]);
+        }
+        if (param_a.need.components != 0 or param_a.need.colour or param_a.need.lanes != .any) {
+            assert(param_a.kind == .signal or param_a.kind == .number);
+        }
         if (param_a.by_lane) {
             by_lane_count += 1;
             assert(param_a.kind == .cue or param_a.kind == .path);
+        }
+    }
+    if (entry.folds) {
+        assert(entry.params.len <= 2);
+        for (entry.params) |param| {
+            assert(param.kind == .signal or param.kind == .integer);
+            // The fold reads every operand, so none may be left out.
+            assert(param.default == .required);
         }
     }
     assert(after_defaults <= 1);
