@@ -418,7 +418,8 @@ pub fn For(comptime client_limits: weft_text.Limits) type {
             const count = compiled.program.nodes.len;
             assert(count <= client_limits.nodes);
             @memset(source_names[0..count], null);
-            for (compiled.checked.bindings) |binding| {
+            var names = compiled.names();
+            while (names.next()) |binding| {
                 if (binding.kind != .signal) continue;
                 var found: [weft.graph.components_max]weft.Id = undefined;
                 for (compiled.event_sources(binding.name, &found)) |id| {
@@ -433,7 +434,8 @@ pub fn For(comptime client_limits: weft_text.Limits) type {
             buffer: *[signals_max][]const u8,
         ) []const []const u8 {
             var count: usize = 0;
-            for (compiled.checked.bindings) |binding| {
+            var names = compiled.names();
+            while (names.next()) |binding| {
                 if (binding.kind != .signal or count == signals_max) continue;
                 buffer[count] = binding.name;
                 count += 1;

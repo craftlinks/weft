@@ -159,16 +159,9 @@ const Back = struct {
     /// The goal source of the last spring, Newtonian move, or chase built.
     goal: GoalSource = .none,
 
-    fn span_of(back: *const Back, index: u32) [2]u32 {
-        const it = back.tree.item(index);
-        const first = back.tree.tokens[it.first];
-        const last = back.tree.tokens[it.last];
-        return .{ first.start, last.start + last.len - first.start };
-    }
-
     fn fail(back: *Back, index: u32, code: error_module.Code, comptime format: []const u8, args: anytype) ?*error_module.Diagnostic {
-        const span = back.span_of(index);
-        return back.diagnostics.add(code, span[0], @max(span[1], 1), format, args);
+        const span = check_module.item_bytes(back.tree, index);
+        return back.diagnostics.add(code, span.start, @max(span.len, 1), format, args);
     }
 
     /// An expression's nodes, built the first time it is asked for.

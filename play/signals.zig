@@ -415,9 +415,7 @@ pub const Vectors = struct {
         vectors.place = compiled.signal("place").?;
         for (&vectors.colours, colour_names) |*id, name| id.* = compiled.signal(name).?;
         const checked = &compiled.checked;
-        const binding = for (checked.bindings) |entry| {
-            if (std.mem.eql(u8, entry.name, "dot")) break entry;
-        } else unreachable;
+        const binding = checked.bindings[compiled.declaration_of("dot").?.binding];
         const expr = checked.exprs[binding.index];
         assert(expr.tag == .call);
         const path = checked.call_values(expr.a)[0].path;
