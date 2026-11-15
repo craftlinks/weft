@@ -378,3 +378,32 @@ test "a declared range allows the analysis's rounding margin" {
     const found = try first_error(&.{}, "module twice(x) in 0..1 = x * 2\nout = twice(0.9)\n");
     try testing.expectEqual(diagnostic.Code.out_of_range, found.code);
 }
+
+// Locks Jig's step 2: a module with a local is the graph written by hand, node for node, and
+// the table of Why is 4 nodes (the wave, the abs, the product, the sum) where the body written
+// twice is 6.
+test "a module's local is one node however often it is read" {
+    try expect_same(
+        "w = wave(sine, 1hz)\nmodule m(x) =\n    a = abs(x)\n    a + a * a\nout = m(w)\n",
+        "w = wave(sine, 1hz)\na = abs(w)\nout = a + a * a\n",
+    );
+    try testing.expectEqual(@as(usize, 4), with_modules.program.nodes.len);
+    try expect_same(
+        "w = wave(sine, 1hz)\nmodule m(x) = abs(x) + abs(x) * abs(x)\nout = m(w)\n",
+        "w = wave(sine, 1hz)\nout = abs(w) + abs(w) * abs(w)\n",
+    );
+    try testing.expectEqual(@as(usize, 6), with_modules.program.nodes.len);
+}
+
+// Locks Jig's step 2 in Weft: a local `bounce` read as `b` and as `b.velocity` is one `bounce`,
+// the nodes of `b = bounce(…)` then `b + b.velocity` written by hand, with two `bounce` nodes.
+test "a local's second output is one bounce" {
+    try expect_same(
+        prelude ++ "module hit(at) =\n    b = bounce(0..1, speed: 0.7, at: at)\n    b + b.velocity\nout = hit(c0)\n",
+        prelude ++ "b = bounce(0..1, speed: 0.7, at: c0)\nout = b + b.velocity\n",
+    );
+    // A `bounce` is two nodes, its position and its velocity, so one is two and twice is four.
+    var bounce_nodes: u32 = 0;
+    for (with_modules.program.nodes) |node| bounce_nodes += @intFromBool(node.op == .bounce);
+    try testing.expectEqual(@as(u32, 2), bounce_nodes);
+}
