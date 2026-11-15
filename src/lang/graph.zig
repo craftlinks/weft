@@ -67,14 +67,15 @@
 //! - The recursion over expressions follows the tree, whose depth the parser bounds.
 
 const std = @import("std");
+const table = @import("table.zig");
 const assert = std.debug.assert;
-const check_module = @import("check.zig");
+const check_module = @import("language").check;
 const Checked = check_module.Checked;
 const Value = check_module.Value;
-const schema = @import("schema.zig");
-const error_module = @import("error.zig");
+const schema = @import("language").schema;
+const error_module = @import("language").diagnostic;
 const Diagnostics = error_module.List;
-const parse_module = @import("parse.zig");
+const parse_module = @import("language").parse;
 const Tree = parse_module.Tree;
 const graph = @import("../core/graph.zig");
 const Builder = graph.Builder;
@@ -596,7 +597,7 @@ const Back = struct {
             .function => {
                 const input = try back.signal_id(v[0]);
                 const n = if (v.len == 2) v[1].integer else 0;
-                const result = builder.apply(entry.function_of(n).?, input);
+                const result = builder.apply(table.core_function(entry.function_of(n).?), input);
                 return .{ .first = try back.attempt(result, item, call) };
             },
             .minimum, .maximum => {

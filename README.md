@@ -210,6 +210,15 @@ zig build test-cli                  # the weft command's output against its gold
 ## Layout
 
 ```txt
+language/             the language: a module of its own that imports only `std`, never the core
+  language.zig        the module's root: what it re-exports
+  token.zig           the tokenizer
+  parse.zig           the parser and its flat tree
+  schema.zig          the types of the table of primitives, and `Vocabulary`, what a back end passes in
+  check.zig           names, order, types, defaults, seeds, and where a number is written
+  format.zig          the canonical format
+  error.zig           diagnostics and suggestions
+  limits.zig          `Limits` and the numbers the language shares with a back end
 src/
   weft.zig            the library root
   core/
@@ -231,13 +240,8 @@ src/
     wave.zig          Wave: sine, triangle, saw, and square, pure functions of time
   lang/
     lang.zig          Compiled and Syntax: text to a Program, and the limits
-    token.zig         the tokenizer
-    parse.zig         the parser and its flat tree
-    schema.zig        the table of primitives
-    check.zig         names, order, types, defaults, seeds, and where a number is written
+    table.zig         Weft's vocabulary for the language: the table of primitives and four functions
     graph.zig         the back end: checked declarations to a Program
-    format.zig        the canonical format
-    error.zig         diagnostics and suggestions
     std.weft          the standard library of modules, `weft.lang.std_library`
 cli/
   main.zig            the weft command: arguments, files, and one write of the output

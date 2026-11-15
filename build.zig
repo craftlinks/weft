@@ -6,7 +6,12 @@ pub fn build(b: *std.Build) void {
     const wasm_target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
 
     // No target of its own, so one module serves a client on any target, and links nothing.
-    const weft = b.addModule("weft", .{ .root_source_file = b.path("src/weft.zig") });
+    // The language: a module of its own, which cannot import Weft's core.
+    const language = b.addModule("language", .{ .root_source_file = b.path("language/language.zig") });
+    const weft = b.addModule("weft", .{
+        .root_source_file = b.path("src/weft.zig"),
+        .imports = &.{.{ .name = "language", .module = language }},
+    });
     const catalog = b.createModule(.{
         .root_source_file = b.path("test/catalog.zig"),
         .imports = &.{.{ .name = "weft", .module = weft }},
@@ -16,6 +21,12 @@ pub fn build(b: *std.Build) void {
     const test_roots = [_]*std.Build.Module{
         b.createModule(.{
             .root_source_file = b.path("src/weft.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "language", .module = language }},
+        }),
+        b.createModule(.{
+            .root_source_file = b.path("language/language.zig"),
             .target = target,
             .optimize = optimize,
         }),

@@ -422,7 +422,7 @@ fn slab_per_lane(program: weft.Program) u64 {
 /// nothing.
 pub fn describe(writer: *std.Io.Writer, libraries: []const lang.Source, nouns: []const schema.Entry) !void {
     try writer.writeAll("{\"primitives\":[");
-    for (&schema.entries, 0..) |*entry, at| {
+    for (&weft.lang.table.entries, 0..) |*entry, at| {
         if (at > 0) try writer.writeAll(",");
         try json_entry(writer, entry);
     }

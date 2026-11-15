@@ -80,12 +80,14 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
-pub const token = @import("token.zig");
-pub const parse = @import("parse.zig");
-pub const diagnostic = @import("error.zig");
-pub const schema = @import("schema.zig");
-pub const format = @import("format.zig");
-pub const check = @import("check.zig");
+const language = @import("language");
+pub const table = @import("table.zig");
+pub const token = language.token;
+pub const parse = language.parse;
+pub const diagnostic = language.diagnostic;
+pub const schema = language.schema;
+pub const format = language.format;
+pub const check = language.check;
 pub const back_end = @import("graph.zig");
 const graph = @import("../core/graph.zig");
 const State = graph.State;
@@ -101,30 +103,7 @@ pub const Diagnostic = diagnostic.Diagnostic;
 pub const GoalSource = back_end.GoalSource;
 pub const Ids = back_end.Ids;
 
-pub const Limits = struct {
-    /// Tokens, comments and newlines included.
-    tokens: u32 = 4096,
-    /// Items of the tree, and the checker's calls and expressions.
-    tree: u32 = 4096,
-    /// Declarations and names.
-    names: u32 = 256,
-    nodes: u32 = 256,
-    /// The f64 of the program's slab.
-    slab: u32 = 4096,
-    cues: u32 = 512,
-    goals: u32 = 256,
-    regions: u32 = 64,
-    tracks: u32 = 8,
-    /// Each track's samples: the writes it can hold.
-    track_samples: u32 = 1024,
-    /// Modules in the file and its libraries.
-    modules: u32 = 32,
-    /// Libraries a file may `use`, passed to `compile_with`. None by default, so a client that
-    /// never uses one pays for no library's tree.
-    libraries: u32 = 0,
-    /// Diagnostics kept; more are counted.
-    errors: u32 = 16,
-};
+pub const Limits = language.Limits;
 
 /// A library's name and its text, for `compile_with`.
 pub const Source = struct { name: []const u8, text: []const u8 };
@@ -230,7 +209,7 @@ pub fn Syntax(comptime limits: Limits) type {
         /// The parsed file in the canonical format, into `out`.
         pub fn format_into(syntax: *const Self, out: []u8) format.Error![]const u8 {
             assert(syntax.diagnostics.total() == 0);
-            return format.format(&syntax.tree, out);
+            return format.format(&syntax.tree, &table.entries, out);
         }
     };
 }
@@ -317,6 +296,7 @@ pub fn Compiled(comptime limits: Limits) type {
             compiled.library_count = @intCast(libraries.len);
             if (!compiled.syntax.parse_source(source) or !compiled.syntax.tree.complete) return error.Invalid;
             compiled.checked = check.check(&compiled.syntax.tree, .{
+                .vocabulary = &table.vocabulary,
                 .modules = &compiled.modules,
                 .frames = &compiled.frames,
                 .libraries = compiled.library_list[0..libraries.len],

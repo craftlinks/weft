@@ -58,7 +58,7 @@ const Token = token_module.Token;
 pub const TokenTag = token_module.Tag;
 const error_module = @import("error.zig");
 /// The fields of `Limits`, so a hint can only name one that exists.
-const LimitField = std.meta.FieldEnum(@import("lang.zig").Limits);
+const LimitField = std.meta.FieldEnum(@import("limits.zig").Limits);
 const Diagnostics = error_module.List;
 
 pub const depth_max = 32;

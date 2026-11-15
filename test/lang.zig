@@ -21,7 +21,7 @@
 //! so bytes would differ where fields do not.
 //!
 //! ## 4. A Call's Class
-//! `describe` gives each call the class of the nodes it builds itself, from `schema.core_op` and
+//! `describe` gives each call the class of the nodes it builds itself, from `table.core_op` and
 //! the core's `Op.class` (step 35). So that the table of core ops cannot drift from the back end,
 //! each entry's call is compiled once, with its signal arguments bound to an `input` on a line of
 //! their own, and the nodes of its own line are read: one is of its core op, and the highest of
@@ -160,9 +160,8 @@ fn class_sample(entry: *const weft.lang.schema.Entry, writer: *std.Io.Writer) !v
 // the table's calls that builds any; `map(x, …)`, `abs(x)`, `vec2(x, x)`, and `lanes(3, x)` of an
 // input are live, as their `inputs` says.
 test "describe's class of a call is the class of the nodes it builds" {
-    const schema = weft.lang.schema;
-    for (&schema.entries) |*entry| {
-        const tag = schema.core_op(entry.op) orelse {
+    for (&weft.lang.table.entries) |*entry| {
+        const tag = weft.lang.table.core_op(entry.op) orelse {
             try std.testing.expectEqual(null, entry.class());
             continue;
         };
