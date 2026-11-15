@@ -193,7 +193,9 @@ runs one scenario.
 ## 3a. A Client With Nouns of Its Own
 
 A client such as Tapestry registers nouns, calls that describe what it owns, and compiles a file
-with `compile_client`. In such a file you will meet two things plain Weft does not have:
+with `compile_client`, whose entries are a comptime list: a name that two entries share is a
+compile error, and the formatter, the hint for a misspelt call, and lookup read the one joined
+list (`lang.entries_of`). In such a file you will meet two things plain Weft does not have:
 
 ```txt
 ax = axes(x: -3..3, y: -1..9)            # a noun: a line of its own, bound to a name

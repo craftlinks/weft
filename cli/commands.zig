@@ -165,7 +165,7 @@ pub fn For(comptime client_limits: lang.Limits) type {
             writer: *std.Io.Writer,
             source: Source,
             libraries: []const lang.Source,
-            clients: []const schema.Entry,
+            comptime clients: []const schema.Entry,
         ) !bool {
             if (!try libraries_fit(writer, libraries, client_limits.libraries)) return false;
             compiled.compile_client(clients, libraries, source.text) catch {
@@ -249,7 +249,7 @@ pub fn For(comptime client_limits: lang.Limits) type {
             writer: *std.Io.Writer,
             source: Source,
             libraries: []const lang.Source,
-            clients: []const schema.Entry,
+            comptime clients: []const schema.Entry,
             names: []const []const u8,
             window: Window,
             filter: Filter,
@@ -420,7 +420,7 @@ fn slab_per_lane(program: weft.Program) u64 {
 /// and a client's nouns, as JSON. Each call's class, each parameter's sentence, and each number
 /// come from the table (`schema.zig`, sections 3d, 3e, and 3f), so this prints them and decides
 /// nothing.
-pub fn describe(writer: *std.Io.Writer, libraries: []const lang.Source, nouns: []const schema.Entry) !void {
+pub fn describe(writer: *std.Io.Writer, libraries: []const lang.Source, comptime nouns: []const schema.Entry) !void {
     try writer.writeAll("{\"primitives\":[");
     for (&weft.lang.table.entries, 0..) |*entry, at| {
         if (at > 0) try writer.writeAll(",");

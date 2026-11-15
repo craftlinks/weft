@@ -97,6 +97,14 @@
 //! parameter, of the same name shadows it. The table is these two and stays small: a constant
 //! a file needs is a literal, or a binding where a signal goes.
 //!
+//! ## 3g. One List (step 56)
+//! A client's entries are a comptime parameter, and `join` makes the one list a file is checked
+//! against: the vocabulary's entries, the language's own that it lacks, then the client's. Lookup,
+//! the formatter's order, and the hint for a misspelt call read that list, so a client's call is
+//! as much a call as Weft's. A clash is a compile error: the same name and role twice, a name of
+//! a number the language knows (`pi`, `tau`), or a keyword (`reserved`). A defaulted integer
+//! reads as a written one, and a frequency marked `live` takes a signal.
+//!
 //! ## 4. TigerStyle Invariants
 //! - The table is comptime and checked: positional parameters come first, names are unique in an
 //!   entry, a default suits its kind, and an entry has at most `params_max` parameters.
@@ -299,27 +307,86 @@ pub const NodeClass = enum { pure, exact, simulated, live };
 pub const Function = union(enum) { abs, sin, cos, exp, ln, sqrt, floor, round, pow: u8 };
 
 /// What a back end gives the language: the calls it knows, and the functions whose bits must be
-/// its own, so a constant folds to what its node would give.
+/// its own, so a constant folds to what its node would give. It exists at compile time only: its
+/// fields are functions, which a checker is built over (`join`), and no value of it is kept.
 pub const Vocabulary = struct {
     entries: []const Entry,
     /// The value of a call of `entry` whose `folds` is set, from its operands in parameter order
-    /// (an integer as a number, the second 0 for an entry of one parameter). A function pointer
-    /// for now (step 56 makes it comptime).
-    fold: *const fn (entry: *const Entry, operands: [2]f64) f64,
+    /// (an integer as a number, the second 0 for an entry of one parameter).
+    fold: fn (entry: *const Entry, operands: [2]f64) f64,
     /// The numbers a call of `entry` whose constructor `converts` is written with, as the
-    /// language keeps them. A function pointer for now (step 56).
-    convert: *const fn (entry: *const Entry, values: [4]f64) [4]f64,
-    /// A seed and a number as a new seed. A function pointer for now (step 56).
-    seed_hash: *const fn (u64, u64) u64,
-
-    /// The entry called `name` in `role`.
-    pub fn find(vocabulary: *const Vocabulary, name: []const u8, role: Role) ?*const Entry {
-        for (vocabulary.entries) |*entry| {
-            if (entry.role == role and std.mem.eql(u8, entry.name, name)) return entry;
-        }
-        return null;
-    }
+    /// language keeps them.
+    convert: fn (entry: *const Entry, values: [4]f64) [4]f64,
+    /// A seed and a number as a new seed.
+    seed_hash: fn (u64, u64) u64,
 };
+
+/// The names a file may not give to a declaration, and no call may have (the checker's keywords).
+pub const reserved = [_][]const u8{ "seed", "start", "cue", "track", "module", "use", "lane" };
+
+/// The one list a file is checked against: the vocabulary's entries, the language's own that it
+/// lacks (`lanes`), then the client's. It is built at compile time, and a clash stops the build
+/// with a message naming both entries: the same name and role in two places, or a call named
+/// like a number the language knows or like a keyword. Every client entry keeps `assert_entry`.
+/// `spring` and `newtonian` are each a signal and a mover, which is not a clash.
+pub fn join(comptime vocabulary: Vocabulary, comptime clients: []const Entry) []const Entry {
+    return comptime joined_list(vocabulary, clients);
+}
+
+fn joined_list(comptime vocabulary: Vocabulary, comptime clients: []const Entry) []const Entry {
+    @setEvalBranchQuota(1_000_000);
+    var joined: []const Entry = vocabulary.entries;
+    for (&language_entries) |own| {
+        if (listed(joined, own.name, own.role) == null) joined = joined ++ [1]Entry{own};
+    }
+    const own_count = joined.len;
+    for (clients, 0..) |entry, at| {
+        assert_entry(&entry);
+        refuse_name(entry.name);
+        if (listed(joined[0..own_count], entry.name, entry.role) != null) {
+            @compileError(std.fmt.comptimePrint(
+                "`{s}` is a {s} call of the vocabulary and of the client's entries",
+                .{ entry.name, @tagName(entry.role) },
+            ));
+        }
+        if (listed(clients[0..at], entry.name, entry.role) != null) {
+            @compileError(std.fmt.comptimePrint(
+                "`{s}` is a {s} call twice in the client's entries",
+                .{ entry.name, @tagName(entry.role) },
+            ));
+        }
+    }
+    const result = joined ++ clients;
+    return result;
+}
+
+/// The index of the entry of `list` called `name` in `role`.
+fn listed(list: []const Entry, name: []const u8, role: Role) ?usize {
+    for (list, 0..) |entry, at| {
+        if (entry.role == role and std.mem.eql(u8, entry.name, name)) return at;
+    }
+    return null;
+}
+
+/// Stops the build for a call named like a number the language knows, or like a keyword.
+fn refuse_name(comptime name: []const u8) void {
+    comptime {
+        if (number_named(name) != null) {
+            @compileError(std.fmt.comptimePrint(
+                "a call cannot be named `{s}`, a number the language knows",
+                .{name},
+            ));
+        }
+        for (reserved) |keyword| {
+            if (std.mem.eql(u8, keyword, name)) {
+                @compileError(std.fmt.comptimePrint(
+                    "a call cannot be named `{s}`, a keyword",
+                    .{name},
+                ));
+            }
+        }
+    }
+}
 
 pub const Entry = struct {
     name: []const u8,
@@ -447,7 +514,7 @@ pub const lanes_entry: Entry = .{
     },
 };
 
-/// The entries the language defines itself, looked up after a vocabulary's own.
+/// The entries the language defines itself, which `join` adds to a vocabulary that lacks them.
 pub const language_entries = [_]Entry{lanes_entry};
 
 /// The rules every entry keeps, the table's and a client's alike (section 4): at most `params_max`
@@ -470,6 +537,15 @@ pub fn assert_entry(entry: *const Entry) void {
             assert(param_a.kind == .number);
             assert(param_a.shaped);
         }
+        if (param_a.kind == .integer) switch (param_a.default) {
+            // A defaulted integer is read as a written one is (step 56), a whole number in range.
+            .number => |number| {
+                assert(number >= 0);
+                assert(number <= 0x1p32);
+                assert(@floor(number) == number);
+            },
+            else => {},
+        };
         if (param_a.range) |range| {
             assert(param_a.kind == .number or param_a.kind == .integer or entry.shape == .constructor);
             assert(range[0] <= range[1]);

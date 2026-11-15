@@ -248,8 +248,7 @@ var checked: check.Checked = undefined;
 fn run(source: []const u8) void {
     tree = fixture.run(source);
     assert(fixture.diagnostics.total() == 0);
-    checked = check.check(&tree, .{
-        .vocabulary = &vocabulary,
+    checked = check.check(vocabulary, &.{}, &tree, .{
         .modules = &modules,
         .frames = &frames,
         .instances = &instances,

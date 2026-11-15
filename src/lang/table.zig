@@ -345,6 +345,8 @@ comptime {
         assert((op_of(entry) == .function) == (entry.function != null));
         // Weft's own entries also keep a default to its kind, which a client's need not.
         for (entry.params) |param_a| {
+            // Weft's `wave` and `noise` take no node for `hz`, so no frequency of its own is live.
+            if (param_a.kind == .frequency) assert(!param_a.live);
             switch (param_a.default) {
                 .word => |word| assert((param_a.kind == .word or param_a.kind == .ease) and word < param_a.words.len),
                 .number => assert(param_a.kind == .number),
@@ -419,7 +421,10 @@ pub const vocabulary: schema.Vocabulary = .{
 
 /// The entry called `name` in `role`.
 pub fn find(name: []const u8, role: Role) ?*const Entry {
-    return vocabulary.find(name, role);
+    for (&entries) |*entry| {
+        if (entry.role == role and std.mem.eql(u8, entry.name, name)) return entry;
+    }
+    return null;
 }
 
 const testing = std.testing;

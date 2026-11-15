@@ -45,7 +45,9 @@
 //! items are in its own tree. A module may declare the range its output stays in; that is
 //! checked after the build, against the instance's node, for an instance bound to a name.
 //!
-//! A client's entries join the table of primitives through `compile_client`. A `client` entry
+//! A client's entries join the table of primitives through `compile_client`, which takes them as
+//! a comptime parameter (step 56), so a name clash is a compile error; `entries_of` is the joined
+//! list a client formats its files with. A `client` entry
 //! (step 14) is a signal the checker accepts and the back end refuses, so the client builds it
 //! from `checked`. A `noun` entry (step 27) only describes: the file compiles, and the client
 //! walks `nouns()` for each one's name, entry, and values, with `node_of` for a signal's node.
@@ -106,6 +108,14 @@ pub const Ids = back_end.Ids;
 pub const Limits = language.Limits;
 
 /// A library's name and its text, for `compile_with`.
+/// The one list a file is checked and formatted against: Weft's table, then a client's entries. A
+/// clash between them is a compile error (`schema.join`). A client formats its files with
+/// `format.format(tree, entries_of(&clients), out)`, so its calls' named arguments take their
+/// entries' order.
+pub fn entries_of(comptime clients: []const schema.Entry) []const schema.Entry {
+    return schema.join(table.vocabulary, clients);
+}
+
 pub const Source = struct { name: []const u8, text: []const u8 };
 
 /// What `Compiled.cue_name` gives for a cue (section 3): the name it was declared with, or for a
@@ -279,7 +289,7 @@ pub fn Compiled(comptime limits: Limits) type {
         /// Compiles `source` with a client's nouns beside the primitives. A client noun is checked
         /// like a primitive, and the back end refuses it: the client builds it from `checked`, which
         /// is set even when the back end refuses.
-        pub fn compile_client(compiled: *Self, clients: []const schema.Entry, libraries: []const Source, source: []const u8) error{Invalid}!void {
+        pub fn compile_client(compiled: *Self, comptime clients: []const schema.Entry, libraries: []const Source, source: []const u8) error{Invalid}!void {
             compiled.ok = false;
             compiled.failed_library = null;
             assert(libraries.len <= limits.libraries);
@@ -295,13 +305,11 @@ pub fn Compiled(comptime limits: Limits) type {
             }
             compiled.library_count = @intCast(libraries.len);
             if (!compiled.syntax.parse_source(source) or !compiled.syntax.tree.complete) return error.Invalid;
-            compiled.checked = check.check(&compiled.syntax.tree, .{
-                .vocabulary = &table.vocabulary,
+            compiled.checked = check.check(table.vocabulary, clients, &compiled.syntax.tree, .{
                 .modules = &compiled.modules,
                 .frames = &compiled.frames,
                 .libraries = compiled.library_list[0..libraries.len],
                 .instances = &compiled.instances,
-                .clients = clients,
                 .bindings = &compiled.bindings,
                 .declarations = &compiled.checked_declarations,
                 .calls = &compiled.calls,
