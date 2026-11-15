@@ -215,6 +215,14 @@ the language's are `jig.file.Noun` and `NounIterator`. A command-line golden cha
 a line holds a file name (`bad.weft` is `bad.jig`). Nothing a file means, checks as, or builds
 changed, and `signals.txt` is byte for byte the same.
 
+**0.5.1** follows Jig 0.2.0 (Jig's steps 1 to 3) in the text package; the core is unchanged. A
+`tempo` line counts in a binding's fingerprint, so a changed tempo recompiles what it times
+(Jig's step 1). `Compiled` mirrors Jig's source map (`argument_of`, `constructor_parts`,
+`declaration_of`, `names`, `setting_of`, `readers_of`, and the rest), and Weft's own command and
+Play use it (Jig's step 3). A call that two expressions share, a module's local read as `b` and
+as `b.velocity`, is built once (`call_ids`), and `weft parse --json` lists a module body's
+locals (Jig's step 2). No program of 0.5.0 builds differently.
+
 ## Requirements
 
 | | |
