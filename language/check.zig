@@ -138,7 +138,10 @@
 //! - An instance's seed base hashes its caller's base, the module's name, and how many instances
 //!   the caller has expanded in this declaration, so section 5 holds inside modules.
 //!
-//! A client's nouns (step 14) are entries looked up after the table of primitives (`lookup`).
+//! A client's nouns (step 14) are entries beside the table of primitives. The checker is built
+//! over a vocabulary and a client's entries known at compile time (step 56), and `lookup`, the
+//! hint for a misspelt call, and the formatter all read the one list `schema.join` makes of
+//! them, so a name that two entries share is a compile error and not a silent shadow.
 //!
 //! ## 6a. Nouns That Only Describe
 //! A call to an entry whose op is `noun` (step 27, `schema.zig` section 3a) is not an expression:
@@ -225,7 +228,7 @@ const token_module = @import("token.zig");
 const schema = @import("schema.zig");
 /// The most modules a "did you mean" looks through.
 const modules_suggested_max = 256;
-/// The most call names a hint is chosen from; a vocabulary and a client's entries past it are not offered.
+/// The most call names a hint is chosen from; the joined list's distinct names must fit.
 const calls_suggested_max = 128;
 
 /// The fields of `Limits`, so a hint can only name one that exists.
@@ -510,11 +513,6 @@ pub const Memory = struct {
     frames: []Frame,
     libraries: []const Library = &.{},
     instances: []Instance = &.{},
-    /// A client's nouns, checked after the table of primitives (step 14), each with at most
-    /// `schema.params_max` parameters, as the table's are.
-    clients: []const schema.Entry = &.{},
-    /// The back end's table of calls and the functions whose bits are its own.
-    vocabulary: *const schema.Vocabulary,
 };
 
 pub const Checked = struct {
@@ -600,2044 +598,2064 @@ pub const Instance = struct { binding: u32, low: f64, high: f64, item: u32 };
 /// The most items one path or one list of regions holds, compared before it enters its table.
 pub const run_max = 256;
 
-const reserved = [_][]const u8{ "seed", "start", "cue", "track", "module", "use", "lane" };
+const reserved = schema.reserved;
 
 /// The most lanes a region has (section 9), the core's own limit.
 pub const lanes_max = limits_module.lanes_max;
 
-const Checker = struct {
-    tree: *const Tree,
-    memory: Memory,
-    diagnostics: *Diagnostics,
-    binding_count: u32 = 0,
-    declaration_count: u32 = 0,
-    call_count: u32 = 0,
-    value_count: u32 = 0,
-    expr_count: u32 = 0,
-    cue_count: u32 = 0,
-    goal_count: u32 = 0,
-    path_count: u32 = 0,
-    region_count: u32 = 0,
-    run_count: u32 = 0,
-    track_count: u32 = 0,
-    seed: ?u64 = null,
-    start_item: ?u32 = null,
-    /// The file's tree, and the frame whose tree `tree` is.
-    root: *const Tree = undefined,
-    frame: u32 = 0,
-    frame_count: u32 = 1,
-    module_count: u32 = 0,
-    instance_count: u32 = 0,
-    /// The declared range of the outermost module instance last expanded.
-    declared_last: ?[2]f64 = null,
-    /// The count of the lane region being checked, or null outside one (section 9).
-    region: ?u32 = null,
-    /// Delay calls checked so far, so a delay that is not a declaration's whole value, which no
-    /// feed could reach, is refused (section 2).
-    delay_calls: u32 = 0,
-    stopped: bool = false,
+/// The checker over one vocabulary and one list of a client's entries, both known at compile
+/// time (step 56): the calls it looks up are `entries`, the one list `schema.join` builds, so a
+/// clash is a compile error and the formatter and the hint read the same list.
+fn CheckerOf(comptime vocabulary: schema.Vocabulary, comptime clients: []const Entry) type {
+    return struct {
+        tree: *const Tree,
+        memory: Memory,
+        diagnostics: *Diagnostics,
+        binding_count: u32 = 0,
+        declaration_count: u32 = 0,
+        call_count: u32 = 0,
+        value_count: u32 = 0,
+        expr_count: u32 = 0,
+        cue_count: u32 = 0,
+        goal_count: u32 = 0,
+        path_count: u32 = 0,
+        region_count: u32 = 0,
+        run_count: u32 = 0,
+        track_count: u32 = 0,
+        seed: ?u64 = null,
+        start_item: ?u32 = null,
+        /// The file's tree, and the frame whose tree `tree` is.
+        root: *const Tree = undefined,
+        frame: u32 = 0,
+        frame_count: u32 = 1,
+        module_count: u32 = 0,
+        instance_count: u32 = 0,
+        /// The declared range of the outermost module instance last expanded.
+        declared_last: ?[2]f64 = null,
+        /// The count of the lane region being checked, or null outside one (section 9).
+        region: ?u32 = null,
+        /// Delay calls checked so far, so a delay that is not a declaration's whole value, which no
+        /// feed could reach, is refused (section 2).
+        delay_calls: u32 = 0,
+        stopped: bool = false,
 
-    fn source(checker: *const Checker) []const u8 {
-        return checker.tree.source;
-    }
+        const Checker = @This();
+        const entries = schema.join(vocabulary, clients);
 
-    fn item(checker: *const Checker, index: u32) Item {
-        return checker.tree.item(index);
-    }
-
-    fn text(checker: *const Checker, index: u32) []const u8 {
-        return checker.tree.text(index);
-    }
-
-    /// The bytes an item covers.
-    fn span_of(checker: *const Checker, index: u32) [2]u32 {
-        const at = checker.located(index);
-        const it = at.tree.item(at.index);
-        const first = at.tree.tokens[it.first];
-        const last = at.tree.tokens[it.last];
-        return .{ first.start, last.start + last.len - first.start };
-    }
-
-    /// Where an item of the current frame is reported: a library's items at their call site.
-    fn located(checker: *const Checker, index: u32) struct { tree: *const Tree, index: u32 } {
-        if (checker.is_library(checker.frame)) return .{ .tree = checker.root, .index = checker.memory.frames[checker.frame].site };
-        return .{ .tree = checker.tree, .index = index };
-    }
-
-    fn is_library(checker: *const Checker, frame: u32) bool {
-        return checker.memory.frames[frame].tree != checker.root;
-    }
-
-    fn in_module(checker: *const Checker) bool {
-        return checker.memory.frames[checker.frame].module != null;
-    }
-
-    /// The item an expression or a call reports at: the file's call site inside a library.
-    fn site_of(checker: *const Checker, index: u32) u32 {
-        if (checker.is_library(checker.frame)) return checker.memory.frames[checker.frame].site;
-        return index;
-    }
-
-    /// Makes `frame` the one items are read from.
-    fn focus(checker: *Checker, frame: u32) void {
-        checker.frame = frame;
-        checker.tree = checker.memory.frames[frame].tree;
-    }
-
-    fn fail(
-        checker: *Checker,
-        index: u32,
-        code: Code,
-        comptime format: []const u8,
-        args: anytype,
-    ) ?*error_module.Diagnostic {
-        const span = checker.span_of(index);
-        const diagnostic = checker.diagnostics.add(code, span[0], @max(span[1], 1), format, args);
-        checker.note_library(diagnostic);
-        return diagnostic;
-    }
-
-    /// Notes which library module an error inside one is in, since it is reported at the call.
-    fn note_library(checker: *const Checker, diagnostic: ?*error_module.Diagnostic) void {
-        if (!checker.is_library(checker.frame)) return;
-        const frame = checker.memory.frames[checker.frame];
-        const module = checker.memory.modules[frame.module.?];
-        for (checker.memory.libraries) |library| {
-            if (library.tree != frame.tree) continue;
-            error_module.note(diagnostic, "in `{s}`, a module of the library `{s}`", .{ module.name, library.name });
-            return;
+        comptime {
+            // The hint for an unknown call keeps each name of the list once, so every one fits.
+            assert(distinct_names(entries) <= calls_suggested_max);
         }
-    }
 
-    /// An error on an item's main token rather than all of it.
-    fn fail_token(
-        checker: *Checker,
-        index: u32,
-        code: Code,
-        comptime format: []const u8,
-        args: anytype,
-    ) ?*error_module.Diagnostic {
-        const at = checker.located(index);
-        const token = at.tree.tokens[at.tree.item(at.index).token];
-        const diagnostic = checker.diagnostics.add(code, token.start, @max(token.len, 1), format, args);
-        checker.note_library(diagnostic);
-        return diagnostic;
-    }
+        fn source(checker: *const Checker) []const u8 {
+            return checker.tree.source;
+        }
 
-    /// A table of `Limits.field` is full. The field is an enum, so a hint names one that exists.
-    fn limit(checker: *Checker, index: u32, noun: []const u8, comptime field: LimitField, count: usize) Fail {
-        const diagnostic = checker.fail(index, .limit, "the file needs more than {d} {s}", .{ count, noun });
-        error_module.hint(diagnostic, "raise `Limits.{s}`", .{@tagName(field)});
-        checker.stopped = true;
-        return error.Checked;
-    }
+        fn item(checker: *const Checker, index: u32) Item {
+            return checker.tree.item(index);
+        }
 
-    /// A fixed bound that no `Limits` field raises was passed.
-    fn fixed_limit(checker: *Checker, index: u32, noun: []const u8, count: usize) Fail {
-        const diagnostic = checker.fail(index, .limit, "more than {d} {s}", .{ count, noun });
-        error_module.hint(diagnostic, "that is fixed, not a `Limits` field; split it", .{});
-        return error.Checked;
-    }
+        fn text(checker: *const Checker, index: u32) []const u8 {
+            return checker.tree.text(index);
+        }
 
-    /// A module sees its parameters only, so the file's names are not found from its body.
-    fn find(checker: *const Checker, name: []const u8) ?u32 {
-        if (checker.in_module()) return null;
-        for (checker.memory.bindings[0..checker.binding_count], 0..) |binding, index| {
-            if (std.mem.eql(u8, binding.name, name)) return @intCast(index);
+        /// The bytes an item covers.
+        fn span_of(checker: *const Checker, index: u32) [2]u32 {
+            const at = checker.located(index);
+            const it = at.tree.item(at.index);
+            const first = at.tree.tokens[it.first];
+            const last = at.tree.tokens[it.last];
+            return .{ first.start, last.start + last.len - first.start };
         }
-        return null;
-    }
 
-    /// The names declared so far, for suggestions, at most `candidates_max`.
-    fn names_so_far(checker: *const Checker, out: [][]const u8) [][]const u8 {
-        const count = @min(out.len, checker.binding_count);
-        for (out[0..count], checker.memory.bindings[0..count]) |*slot, binding| slot.* = binding.name;
-        return out[0..count];
-    }
+        /// Where an item of the current frame is reported: a library's items at their call site.
+        fn located(checker: *const Checker, index: u32) struct { tree: *const Tree, index: u32 } {
+            if (checker.is_library(checker.frame)) return .{ .tree = checker.root, .index = checker.memory.frames[checker.frame].site };
+            return .{ .tree = checker.tree, .index = index };
+        }
 
-    /// Whether `name` is declared on a later line, for the error of section 2.
-    fn declared_later(checker: *const Checker, name: []const u8) ?u32 {
-        for (checker.tree.declarations) |index| {
-            const it = checker.item(index);
-            switch (it.tag) {
-                .cue, .cue_series, .track, .bind => {},
-                else => continue,
-            }
-            if (!std.mem.eql(u8, checker.tree.token_text(it.token), name)) continue;
-            if (checker.find(name) == null) return index;
+        fn is_library(checker: *const Checker, frame: u32) bool {
+            return checker.memory.frames[frame].tree != checker.root;
         }
-        return null;
-    }
 
-    fn declare(checker: *Checker, index: u32, binding: Binding) Fail!u32 {
-        const name = binding.name;
-        for (reserved) |word| {
-            if (std.mem.eql(u8, word, name)) {
-                const diagnostic = checker.fail_token(index, .reserved_name, "`{s}` is a keyword, not a name", .{name});
-                error_module.hint(diagnostic, "choose another name, such as `{s}_1`", .{name});
-                return error.Checked;
-            }
+        fn in_module(checker: *const Checker) bool {
+            return checker.memory.frames[checker.frame].module != null;
         }
-        if (checker.find(name)) |previous| {
-            const line = error_module.locate(checker.source(), checker.span_of(checker.memory.bindings[previous].item)[0]).line;
-            const diagnostic = checker.fail_token(index, .duplicate_name, "`{s}` is already declared", .{name});
-            error_module.hint(diagnostic, "it was declared on line {d}", .{line});
-            return error.Checked;
-        }
-        if (checker.binding_count == checker.memory.bindings.len) {
-            return checker.limit(index, "names", .names, checker.memory.bindings.len);
-        }
-        const at = checker.binding_count;
-        checker.memory.bindings[at] = binding;
-        checker.binding_count += 1;
-        return at;
-    }
 
-    fn declaration(checker: *Checker, index: u32) Fail!void {
-        const it = checker.item(index);
-        const name = checker.tree.token_text(it.token);
-        checker.focus(0);
-        checker.memory.frames[0].seed_base = std.hash.Fnv1a_64.hash(name);
-        checker.memory.frames[0].seeded = 0;
-        checker.memory.frames[0].instances = 0;
-        switch (it.tag) {
-            .module, .use => {},
-            .seed => {
-                if (checker.seed != null) {
-                    _ = checker.fail(index, .duplicate_setting, "the file's seed is set twice", .{});
-                    return error.Checked;
-                }
-                checker.seed = std.fmt.parseInt(u64, name, 10) catch {
-                    const diagnostic = checker.fail_token(index, .out_of_range, "a seed is a whole number from 0 to 2^64 - 1", .{});
-                    error_module.hint(diagnostic, "write digits only, such as `seed 7`", .{});
-                    return error.Checked;
-                };
-            },
-            .start => {
-                if (checker.start_item != null) {
-                    _ = checker.fail(index, .duplicate_setting, "the start cue is set twice", .{});
-                    return error.Checked;
-                }
-                checker.start_item = index;
-            },
-            .cue => {
-                if (checker.item(it.a).tag == .list) return checker.cue_list(index);
-                const timed = try checker.cue_time(it.a);
-                const cue = try checker.add_cue(index, timed.flicks, .{ .alone = timed.written });
-                _ = try checker.declare(index, .{ .name = name, .item = index, .kind = .cue, .index = cue });
-            },
-            .cue_series => try checker.cue_series(index),
-            .track => {
-                const initial = try checker.fixed_number(it.a, "a track's initial value");
-                const bounds = try checker.number_range(it.b);
-                if (!(bounds[0] <= initial and initial <= bounds[1])) {
-                    const diagnostic = checker.fail(it.a, .out_of_range, "the initial value {d} is outside the bounds {d}..{d}", .{ initial, bounds[0], bounds[1] });
-                    error_module.hint(diagnostic, "a track starts inside its bounds", .{});
-                    return error.Checked;
-                }
-                if (checker.track_count == checker.memory.tracks.len) {
-                    return checker.limit(index, "tracks", .tracks, checker.memory.tracks.len);
-                }
-                // What the checker folded, `number_form` reads as a number: the form a client
-                // is given (section 3c) agrees with the value, and is never `other`.
-                const form = track_form(checker.root, index).?;
-                assert(form.value.kind != .other);
-                assert(form.low.kind != .other);
-                assert(form.high.kind != .other);
-                const track = checker.track_count;
-                checker.memory.tracks[track] = .{ .initial = initial, .low = bounds[0], .high = bounds[1], .item = index };
-                checker.track_count += 1;
-                _ = try checker.declare(index, .{ .name = name, .item = index, .kind = .track, .index = track });
-            },
-            .bind => try checker.bind(index),
-            .feed => try checker.feed(index),
-            else => unreachable,
+        /// The item an expression or a call reports at: the file's call site inside a library.
+        fn site_of(checker: *const Checker, index: u32) u32 {
+            if (checker.is_library(checker.frame)) return checker.memory.frames[checker.frame].site;
+            return index;
         }
-    }
 
-    fn add_cue(checker: *Checker, index: u32, time: i64, form: CueForm) Fail!u32 {
-        assert(checker.frame == 0);
-        assert(checker.cue_count <= checker.memory.cue_forms.len);
-        if (checker.cue_count > 0) {
-            const previous = checker.memory.cue_times[checker.cue_count - 1];
-            if (time < previous) {
-                const diagnostic = checker.fail(index, .cue_out_of_order, "cues are in time order, and this one is before the cue above it", .{});
-                error_module.hint(diagnostic, "move it above the cues it comes before", .{});
-                return error.Checked;
-            }
+        /// Makes `frame` the one items are read from.
+        fn focus(checker: *Checker, frame: u32) void {
+            checker.frame = frame;
+            checker.tree = checker.memory.frames[frame].tree;
         }
-        if (checker.cue_count == checker.memory.cue_times.len) {
-            return checker.limit(index, "cues", .cues, checker.memory.cue_times.len);
-        }
-        const cue = checker.cue_count;
-        checker.memory.cue_times[cue] = time;
-        checker.memory.cue_forms[cue] = form;
-        checker.cue_count += 1;
-        return cue;
-    }
 
-    /// A cue's time (section 4a): a time literal, an earlier cue, or that cue plus a time
-    /// literal, with how it is written.
-    fn cue_time(checker: *Checker, index: u32) Fail!Timed {
-        assert(checker.frame == 0);
-        const it = checker.item(index);
-        switch (it.tag) {
-            .name, .element => {
-                const cue = try checker.cue_of(index);
-                return .{ .flicks = checker.memory.cue_times[cue], .written = .{ .cue = cue } };
-            },
-            .subtract => {
-                const diagnostic = checker.fail(index, .cue_out_of_order, "a cue comes at or after the cue it names, so there is no minus", .{});
-                error_module.hint(diagnostic, "declare this cue first, and write the other as this one plus a time", .{});
-                return error.Checked;
-            },
-            .add => {
-                const base_tag = checker.item(it.a).tag;
-                if (base_tag != .name and base_tag != .element) {
-                    const diagnostic = checker.fail(it.a, .wrong_type, "a cue's time is a time, or a cue and a time after it", .{});
-                    error_module.hint(diagnostic, "for example `cue hit = beat + 500ms`", .{});
-                    return error.Checked;
-                }
-                const base = try checker.cue_of(it.a);
-                const offset = try checker.time_literal(it.b);
-                const base_flicks = checker.memory.cue_times[base];
-                const flicks = std.math.add(i64, base_flicks, offset.signed()) catch {
-                    _ = checker.fail(index, .out_of_range, "this cue's time is past what a time holds", .{});
-                    return error.Checked;
-                };
-                const after: CueTime.After = .{ .base = base, .offset = offset };
-                return .{ .flicks = flicks, .written = .{ .after = after } };
-            },
-            else => {
-                const literal = try checker.time_literal(index);
-                return .{ .flicks = literal.signed(), .written = .{ .literal = literal } };
-            },
+        fn fail(
+            checker: *Checker,
+            index: u32,
+            code: Code,
+            comptime format: []const u8,
+            args: anytype,
+        ) ?*error_module.Diagnostic {
+            const span = checker.span_of(index);
+            const diagnostic = checker.diagnostics.add(code, span[0], @max(span[1], 1), format, args);
+            checker.note_library(diagnostic);
+            return diagnostic;
         }
-    }
 
-    /// A time literal of a cue's declaration (section 4a), with its token's bytes, so a client
-    /// can find it again: `literal_time`'s flicks, split from the parser's minus.
-    fn time_literal(checker: *Checker, index: u32) Fail!TimeLiteral {
-        assert(checker.frame == 0);
-        assert(checker.tree == checker.root);
-        const flicks = try checker.literal_time(index);
-        const it = checker.item(index);
-        assert(it.tag == .literal);
-        const token = checker.tree.tokens[it.token];
-        assert(token.tag == .time);
-        const in_ms = token_module.unit_of(token, checker.source()) == .ms;
-        const unit: TimeUnit = if (in_ms) .ms else .s;
-        const negative = it.a == 1;
-        const literal: TimeLiteral = .{
-            .flicks = if (negative) -flicks else flicks,
-            .start = token.start,
-            .len = token.len,
-            .unit = unit,
-            .negative = negative,
-        };
-        assert(literal.flicks >= 0);
-        assert(literal.signed() == flicks);
-        return literal;
-    }
-
-    /// A series written as a list (step 28): each item a cue's time as `cue_time` reads it, in
-    /// time order, bound as a series of as many cues.
-    fn cue_list(checker: *Checker, index: u32) Fail!void {
-        const it = checker.item(index);
-        const children = checker.tree.children(it.a);
-        if (children.len == 0) {
-            const diagnostic = checker.fail(it.a, .bad_series, "a series written as a list has at least one cue", .{});
-            error_module.hint(diagnostic, "for example `cue title = [1s, 1080ms, 1560ms]`", .{});
-            return error.Checked;
-        }
-        if (children.len > checker.memory.cue_times.len - checker.cue_count) {
-            return checker.limit(index, "cues", .cues, checker.memory.cue_times.len);
-        }
-        const first = checker.cue_count;
-        for (children, 0..) |child, at| {
-            const timed = try checker.cue_time(child);
-            const time = timed.flicks;
-            if (at > 0 and time < checker.memory.cue_times[checker.cue_count - 1]) {
-                const diagnostic = checker.fail(child, .cue_out_of_order, "a series' cues are in time order, and this one is before the one before it", .{});
-                error_module.hint(diagnostic, "write the list in time order", .{});
-                return error.Checked;
-            }
-            const listed: CueForm.Listed = .{ .element = @intCast(at), .time = timed.written };
-            _ = try checker.add_cue(child, time, .{ .listed = listed });
-        }
-        assert(checker.cue_count - first == children.len);
-        _ = try checker.declare(index, .{
-            .name = checker.tree.token_text(it.token),
-            .item = index,
-            .kind = .series,
-            .index = first,
-            .count = @intCast(children.len),
-        });
-    }
-
-    fn cue_series(checker: *Checker, index: u32) Fail!void {
-        const it = checker.item(index);
-        const from_timed = try checker.cue_time(it.a);
-        const to_timed = try checker.cue_time(checker.tree.extra[it.b]);
-        const step = try checker.time_literal(checker.tree.extra[it.b + 1]);
-        const from = from_timed.flicks;
-        const to = to_timed.flicks;
-        const every = step.signed();
-        if (every <= 0 or to < from or @rem(to - from, every) != 0) {
-            const diagnostic = checker.fail(index, .bad_series, "a series' step must be above 0s and divide its span exactly", .{});
-            error_module.hint(diagnostic, "for example `0s..600s every 2s`, which is 301 cues", .{});
-            return error.Checked;
-        }
-        const count_wide = @divExact(to - from, every) + 1;
-        if (count_wide > checker.memory.cue_times.len - checker.cue_count) {
-            return checker.limit(index, "cues", .cues, checker.memory.cue_times.len);
-        }
-        const count: u32 = @intCast(count_wide);
-        var form: CueForm.Every = .{
-            .element = 0,
-            .from = from_timed.written,
-            .to = to_timed.written,
-            .step = step,
-        };
-        const first = try checker.add_cue(index, from, .{ .every = form });
-        for (1..count) |element| {
-            form.element = @intCast(element);
-            const time = from + every * @as(i64, @intCast(element));
-            _ = try checker.add_cue(index, time, .{ .every = form });
-        }
-        _ = try checker.declare(index, .{
-            .name = checker.tree.token_text(it.token),
-            .item = index,
-            .kind = .series,
-            .index = first,
-            .count = count,
-        });
-    }
-
-    fn bind(checker: *Checker, index: u32) Fail!void {
-        const it = checker.item(index);
-        const name = checker.tree.token_text(it.token);
-        const value = checker.item(it.a);
-        if (value.tag == .list) {
-            const children = checker.tree.children(it.a);
-            if (children.len > 0 and checker.item(children[0]).tag == .goal) {
-                const path = try checker.path_of(it.a, true, false);
-                _ = try checker.declare(index, .{ .name = name, .item = index, .kind = .path, .index = path });
+        /// Notes which library module an error inside one is in, since it is reported at the call.
+        fn note_library(checker: *const Checker, diagnostic: ?*error_module.Diagnostic) void {
+            if (!checker.is_library(checker.frame)) return;
+            const frame = checker.memory.frames[checker.frame];
+            const module = checker.memory.modules[frame.module.?];
+            for (checker.memory.libraries) |library| {
+                if (library.tree != frame.tree) continue;
+                error_module.note(diagnostic, "in `{s}`, a module of the library `{s}`", .{ module.name, library.name });
                 return;
             }
-            const run = try checker.region_list(it.a, true);
-            _ = try checker.declare(index, .{ .name = name, .item = index, .kind = .regions, .index = run });
-            return;
         }
-        if (value.tag == .range or value.tag == .goal or value.tag == .named) {
-            _ = checker.fail(it.a, .wrong_type, "a name holds a signal, a path, or regions", .{});
+
+        /// An error on an item's main token rather than all of it.
+        fn fail_token(
+            checker: *Checker,
+            index: u32,
+            code: Code,
+            comptime format: []const u8,
+            args: anytype,
+        ) ?*error_module.Diagnostic {
+            const at = checker.located(index);
+            const token = at.tree.tokens[at.tree.item(at.index).token];
+            const diagnostic = checker.diagnostics.add(code, token.start, @max(token.len, 1), format, args);
+            checker.note_library(diagnostic);
+            return diagnostic;
+        }
+
+        /// A table of `Limits.field` is full. The field is an enum, so a hint names one that
+        /// exists.
+        fn limit(checker: *Checker, index: u32, noun: []const u8, comptime field: LimitField, count: usize) Fail {
+            const diagnostic = checker.fail(index, .limit, "the file needs more than {d} {s}", .{ count, noun });
+            error_module.hint(diagnostic, "raise `Limits.{s}`", .{@tagName(field)});
+            checker.stopped = true;
             return error.Checked;
         }
-        if (value.tag == .call) if (checker.lookup(checker.text(it.a), .signal)) |entry| if (entry.kind() == .noun) {
+
+        /// A fixed bound that no `Limits` field raises was passed.
+        fn fixed_limit(checker: *Checker, index: u32, noun: []const u8, count: usize) Fail {
+            const diagnostic = checker.fail(index, .limit, "more than {d} {s}", .{ count, noun });
+            error_module.hint(diagnostic, "that is fixed, not a `Limits` field; split it", .{});
+            return error.Checked;
+        }
+
+        /// A module sees its parameters only, so the file's names are not found from its body.
+        fn find(checker: *const Checker, name: []const u8) ?u32 {
+            if (checker.in_module()) return null;
+            for (checker.memory.bindings[0..checker.binding_count], 0..) |binding, index| {
+                if (std.mem.eql(u8, binding.name, name)) return @intCast(index);
+            }
+            return null;
+        }
+
+        /// The names declared so far, for suggestions, at most `candidates_max`.
+        fn names_so_far(checker: *const Checker, out: [][]const u8) [][]const u8 {
+            const count = @min(out.len, checker.binding_count);
+            for (out[0..count], checker.memory.bindings[0..count]) |*slot, binding| slot.* = binding.name;
+            return out[0..count];
+        }
+
+        /// Whether `name` is declared on a later line, for the error of section 2.
+        fn declared_later(checker: *const Checker, name: []const u8) ?u32 {
+            for (checker.tree.declarations) |index| {
+                const it = checker.item(index);
+                switch (it.tag) {
+                    .cue, .cue_series, .track, .bind => {},
+                    else => continue,
+                }
+                if (!std.mem.eql(u8, checker.tree.token_text(it.token), name)) continue;
+                if (checker.find(name) == null) return index;
+            }
+            return null;
+        }
+
+        fn declare(checker: *Checker, index: u32, binding: Binding) Fail!u32 {
+            const name = binding.name;
+            for (reserved) |word| {
+                if (std.mem.eql(u8, word, name)) {
+                    const diagnostic = checker.fail_token(index, .reserved_name, "`{s}` is a keyword, not a name", .{name});
+                    error_module.hint(diagnostic, "choose another name, such as `{s}_1`", .{name});
+                    return error.Checked;
+                }
+            }
+            if (checker.find(name)) |previous| {
+                const line = error_module.locate(checker.source(), checker.span_of(checker.memory.bindings[previous].item)[0]).line;
+                const diagnostic = checker.fail_token(index, .duplicate_name, "`{s}` is already declared", .{name});
+                error_module.hint(diagnostic, "it was declared on line {d}", .{line});
+                return error.Checked;
+            }
+            if (checker.binding_count == checker.memory.bindings.len) {
+                return checker.limit(index, "names", .names, checker.memory.bindings.len);
+            }
+            const at = checker.binding_count;
+            checker.memory.bindings[at] = binding;
+            checker.binding_count += 1;
+            return at;
+        }
+
+        fn declaration(checker: *Checker, index: u32) Fail!void {
+            const it = checker.item(index);
+            const name = checker.tree.token_text(it.token);
+            checker.focus(0);
+            checker.memory.frames[0].seed_base = std.hash.Fnv1a_64.hash(name);
+            checker.memory.frames[0].seeded = 0;
+            checker.memory.frames[0].instances = 0;
+            switch (it.tag) {
+                .module, .use => {},
+                .seed => {
+                    if (checker.seed != null) {
+                        _ = checker.fail(index, .duplicate_setting, "the file's seed is set twice", .{});
+                        return error.Checked;
+                    }
+                    checker.seed = std.fmt.parseInt(u64, name, 10) catch {
+                        const diagnostic = checker.fail_token(index, .out_of_range, "a seed is a whole number from 0 to 2^64 - 1", .{});
+                        error_module.hint(diagnostic, "write digits only, such as `seed 7`", .{});
+                        return error.Checked;
+                    };
+                },
+                .start => {
+                    if (checker.start_item != null) {
+                        _ = checker.fail(index, .duplicate_setting, "the start cue is set twice", .{});
+                        return error.Checked;
+                    }
+                    checker.start_item = index;
+                },
+                .cue => {
+                    if (checker.item(it.a).tag == .list) return checker.cue_list(index);
+                    const timed = try checker.cue_time(it.a);
+                    const cue = try checker.add_cue(index, timed.flicks, .{ .alone = timed.written });
+                    _ = try checker.declare(index, .{ .name = name, .item = index, .kind = .cue, .index = cue });
+                },
+                .cue_series => try checker.cue_series(index),
+                .track => {
+                    const initial = try checker.fixed_number(it.a, "a track's initial value");
+                    const bounds = try checker.number_range(it.b);
+                    if (!(bounds[0] <= initial and initial <= bounds[1])) {
+                        const diagnostic = checker.fail(it.a, .out_of_range, "the initial value {d} is outside the bounds {d}..{d}", .{ initial, bounds[0], bounds[1] });
+                        error_module.hint(diagnostic, "a track starts inside its bounds", .{});
+                        return error.Checked;
+                    }
+                    if (checker.track_count == checker.memory.tracks.len) {
+                        return checker.limit(index, "tracks", .tracks, checker.memory.tracks.len);
+                    }
+                    // What the checker folded, `number_form` reads as a number: the form a client
+                    // is given (section 3c) agrees with the value, and is never `other`.
+                    const form = track_form(checker.root, index).?;
+                    assert(form.value.kind != .other);
+                    assert(form.low.kind != .other);
+                    assert(form.high.kind != .other);
+                    const track = checker.track_count;
+                    checker.memory.tracks[track] = .{ .initial = initial, .low = bounds[0], .high = bounds[1], .item = index };
+                    checker.track_count += 1;
+                    _ = try checker.declare(index, .{ .name = name, .item = index, .kind = .track, .index = track });
+                },
+                .bind => try checker.bind(index),
+                .feed => try checker.feed(index),
+                else => unreachable,
+            }
+        }
+
+        fn add_cue(checker: *Checker, index: u32, time: i64, form: CueForm) Fail!u32 {
+            assert(checker.frame == 0);
+            assert(checker.cue_count <= checker.memory.cue_forms.len);
+            if (checker.cue_count > 0) {
+                const previous = checker.memory.cue_times[checker.cue_count - 1];
+                if (time < previous) {
+                    const diagnostic = checker.fail(index, .cue_out_of_order, "cues are in time order, and this one is before the cue above it", .{});
+                    error_module.hint(diagnostic, "move it above the cues it comes before", .{});
+                    return error.Checked;
+                }
+            }
+            if (checker.cue_count == checker.memory.cue_times.len) {
+                return checker.limit(index, "cues", .cues, checker.memory.cue_times.len);
+            }
+            const cue = checker.cue_count;
+            checker.memory.cue_times[cue] = time;
+            checker.memory.cue_forms[cue] = form;
+            checker.cue_count += 1;
+            return cue;
+        }
+
+        /// A cue's time (section 4a): a time literal, an earlier cue, or that cue plus a time
+        /// literal, with how it is written.
+        fn cue_time(checker: *Checker, index: u32) Fail!Timed {
+            assert(checker.frame == 0);
+            const it = checker.item(index);
+            switch (it.tag) {
+                .name, .element => {
+                    const cue = try checker.cue_of(index);
+                    return .{ .flicks = checker.memory.cue_times[cue], .written = .{ .cue = cue } };
+                },
+                .subtract => {
+                    const diagnostic = checker.fail(index, .cue_out_of_order, "a cue comes at or after the cue it names, so there is no minus", .{});
+                    error_module.hint(diagnostic, "declare this cue first, and write the other as this one plus a time", .{});
+                    return error.Checked;
+                },
+                .add => {
+                    const base_tag = checker.item(it.a).tag;
+                    if (base_tag != .name and base_tag != .element) {
+                        const diagnostic = checker.fail(it.a, .wrong_type, "a cue's time is a time, or a cue and a time after it", .{});
+                        error_module.hint(diagnostic, "for example `cue hit = beat + 500ms`", .{});
+                        return error.Checked;
+                    }
+                    const base = try checker.cue_of(it.a);
+                    const offset = try checker.time_literal(it.b);
+                    const base_flicks = checker.memory.cue_times[base];
+                    const flicks = std.math.add(i64, base_flicks, offset.signed()) catch {
+                        _ = checker.fail(index, .out_of_range, "this cue's time is past what a time holds", .{});
+                        return error.Checked;
+                    };
+                    const after: CueTime.After = .{ .base = base, .offset = offset };
+                    return .{ .flicks = flicks, .written = .{ .after = after } };
+                },
+                else => {
+                    const literal = try checker.time_literal(index);
+                    return .{ .flicks = literal.signed(), .written = .{ .literal = literal } };
+                },
+            }
+        }
+
+        /// A time literal of a cue's declaration (section 4a), with its token's bytes, so a client
+        /// can find it again: `literal_time`'s flicks, split from the parser's minus.
+        fn time_literal(checker: *Checker, index: u32) Fail!TimeLiteral {
+            assert(checker.frame == 0);
+            assert(checker.tree == checker.root);
+            const flicks = try checker.literal_time(index);
+            const it = checker.item(index);
+            assert(it.tag == .literal);
+            const token = checker.tree.tokens[it.token];
+            assert(token.tag == .time);
+            const in_ms = token_module.unit_of(token, checker.source()) == .ms;
+            const unit: TimeUnit = if (in_ms) .ms else .s;
+            const negative = it.a == 1;
+            const literal: TimeLiteral = .{
+                .flicks = if (negative) -flicks else flicks,
+                .start = token.start,
+                .len = token.len,
+                .unit = unit,
+                .negative = negative,
+            };
+            assert(literal.flicks >= 0);
+            assert(literal.signed() == flicks);
+            return literal;
+        }
+
+        /// A series written as a list (step 28): each item a cue's time as `cue_time` reads it, in
+        /// time order, bound as a series of as many cues.
+        fn cue_list(checker: *Checker, index: u32) Fail!void {
+            const it = checker.item(index);
+            const children = checker.tree.children(it.a);
+            if (children.len == 0) {
+                const diagnostic = checker.fail(it.a, .bad_series, "a series written as a list has at least one cue", .{});
+                error_module.hint(diagnostic, "for example `cue title = [1s, 1080ms, 1560ms]`", .{});
+                return error.Checked;
+            }
+            if (children.len > checker.memory.cue_times.len - checker.cue_count) {
+                return checker.limit(index, "cues", .cues, checker.memory.cue_times.len);
+            }
+            const first = checker.cue_count;
+            for (children, 0..) |child, at| {
+                const timed = try checker.cue_time(child);
+                const time = timed.flicks;
+                if (at > 0 and time < checker.memory.cue_times[checker.cue_count - 1]) {
+                    const diagnostic = checker.fail(child, .cue_out_of_order, "a series' cues are in time order, and this one is before the one before it", .{});
+                    error_module.hint(diagnostic, "write the list in time order", .{});
+                    return error.Checked;
+                }
+                const listed: CueForm.Listed = .{ .element = @intCast(at), .time = timed.written };
+                _ = try checker.add_cue(child, time, .{ .listed = listed });
+            }
+            assert(checker.cue_count - first == children.len);
+            _ = try checker.declare(index, .{
+                .name = checker.tree.token_text(it.token),
+                .item = index,
+                .kind = .series,
+                .index = first,
+                .count = @intCast(children.len),
+            });
+        }
+
+        fn cue_series(checker: *Checker, index: u32) Fail!void {
+            const it = checker.item(index);
+            const from_timed = try checker.cue_time(it.a);
+            const to_timed = try checker.cue_time(checker.tree.extra[it.b]);
+            const step = try checker.time_literal(checker.tree.extra[it.b + 1]);
+            const from = from_timed.flicks;
+            const to = to_timed.flicks;
+            const every = step.signed();
+            if (every <= 0 or to < from or @rem(to - from, every) != 0) {
+                const diagnostic = checker.fail(index, .bad_series, "a series' step must be above 0s and divide its span exactly", .{});
+                error_module.hint(diagnostic, "for example `0s..600s every 2s`, which is 301 cues", .{});
+                return error.Checked;
+            }
+            const count_wide = @divExact(to - from, every) + 1;
+            if (count_wide > checker.memory.cue_times.len - checker.cue_count) {
+                return checker.limit(index, "cues", .cues, checker.memory.cue_times.len);
+            }
+            const count: u32 = @intCast(count_wide);
+            var form: CueForm.Every = .{
+                .element = 0,
+                .from = from_timed.written,
+                .to = to_timed.written,
+                .step = step,
+            };
+            const first = try checker.add_cue(index, from, .{ .every = form });
+            for (1..count) |element| {
+                form.element = @intCast(element);
+                const time = from + every * @as(i64, @intCast(element));
+                _ = try checker.add_cue(index, time, .{ .every = form });
+            }
+            _ = try checker.declare(index, .{
+                .name = checker.tree.token_text(it.token),
+                .item = index,
+                .kind = .series,
+                .index = first,
+                .count = count,
+            });
+        }
+
+        fn bind(checker: *Checker, index: u32) Fail!void {
+            const it = checker.item(index);
+            const name = checker.tree.token_text(it.token);
+            const value = checker.item(it.a);
+            if (value.tag == .list) {
+                const children = checker.tree.children(it.a);
+                if (children.len > 0 and checker.item(children[0]).tag == .goal) {
+                    const path = try checker.path_of(it.a, true, false);
+                    _ = try checker.declare(index, .{ .name = name, .item = index, .kind = .path, .index = path });
+                    return;
+                }
+                const run = try checker.region_list(it.a, true);
+                _ = try checker.declare(index, .{ .name = name, .item = index, .kind = .regions, .index = run });
+                return;
+            }
+            if (value.tag == .range or value.tag == .goal or value.tag == .named) {
+                _ = checker.fail(it.a, .wrong_type, "a name holds a signal, a path, or regions", .{});
+                return error.Checked;
+            }
+            if (value.tag == .call) if (checker.lookup(checker.text(it.a), .signal)) |entry| if (entry.kind() == .noun) {
+                const delays_before = checker.delay_calls;
+                const call = try checker.check_call(entry, it.a);
+                if (checker.delay_calls != delays_before) return checker.unreachable_delay(it.a);
+                const at = try checker.declare(index, .{ .name = name, .item = index, .kind = .noun, .index = call, .entry = entry });
+                try checker.push_declaration(index, .{ .noun = .{ .binding = at, .call = call } });
+                return;
+            };
+            checker.declared_last = null;
             const delays_before = checker.delay_calls;
-            const call = try checker.check_call(entry, it.a);
+            const expr = try checker.signal(it.a);
+            const declared = checker.declared_last;
+            var binding: Binding = .{ .name = name, .item = index, .kind = .signal, .index = expr };
+            const node = checker.memory.exprs[expr];
+            if (node.tag == .call and node.b == 0) {
+                const entry = checker.memory.calls[node.a].entry;
+                binding.entry = entry;
+                binding.delay = entry.fed;
+                // A region of delays is a delay, fed as one (section 9).
+                if (entry.op == .lanes) {
+                    const body = checker.memory.exprs[checker.memory.values[checker.memory.calls[node.a].values + 1].signal];
+                    binding.delay = body.tag == .call and body.b == 0 and checker.memory.calls[body.a].entry.fed;
+                    binding.entry = null;
+                }
+            }
+            if (checker.delay_calls - delays_before > @intFromBool(binding.delay)) return checker.unreachable_delay(it.a);
+            const at = try checker.declare(index, binding);
+            if (declared) |range| if (value.tag == .call and checker.find_module(checker.text(it.a)) != null) {
+                if (checker.instance_count == checker.memory.instances.len) {
+                    return checker.limit(index, "names", .names, checker.memory.instances.len);
+                }
+                checker.memory.instances[checker.instance_count] = .{ .binding = at, .low = range[0], .high = range[1], .item = it.a };
+                checker.instance_count += 1;
+            };
+            try checker.push_declaration(index, .{ .signal = .{ .binding = at, .expr = expr } });
+        }
+
+        fn feed(checker: *Checker, index: u32) Fail!void {
+            const it = checker.item(index);
+            const name = checker.tree.token_text(it.token);
+            const target = checker.find(name) orelse {
+                const diagnostic = checker.fail_token(index, .unknown_name, "`{s}` is not declared", .{name});
+                if (checker.first_example(.fed)) |example| error_module.hint(diagnostic, "declare it above, such as `{s} = {s}`", .{ name, example });
+                return error.Checked;
+            };
+            const binding = &checker.memory.bindings[target];
+            if (binding.kind == .failed) return checker.reported();
+            if (!binding.delay) {
+                const diagnostic = checker.fail_token(index, .not_a_delay, "only a delay is fed with `<-`, and `{s}` is not one", .{name});
+                if (checker.first_example(.fed)) |example| error_module.hint(diagnostic, "declare it as `{s} = {s}`", .{ name, example });
+                return error.Checked;
+            }
+            if (binding.fed) {
+                _ = checker.fail(index, .delay_fed_twice, "the delay `{s}` is already fed", .{name});
+                return error.Checked;
+            }
+            binding.fed = true;
+            const delays_before = checker.delay_calls;
+            const expr = try checker.signal(it.a);
             if (checker.delay_calls != delays_before) return checker.unreachable_delay(it.a);
-            const at = try checker.declare(index, .{ .name = name, .item = index, .kind = .noun, .index = call, .entry = entry });
-            try checker.push_declaration(index, .{ .noun = .{ .binding = at, .call = call } });
-            return;
-        };
-        checker.declared_last = null;
-        const delays_before = checker.delay_calls;
-        const expr = try checker.signal(it.a);
-        const declared = checker.declared_last;
-        var binding: Binding = .{ .name = name, .item = index, .kind = .signal, .index = expr };
-        const node = checker.memory.exprs[expr];
-        if (node.tag == .call and node.b == 0) {
-            const entry = checker.memory.calls[node.a].entry;
-            binding.entry = entry;
-            binding.delay = entry.fed;
-            // A region of delays is a delay, fed as one (section 9).
-            if (entry.op == .lanes) {
-                const body = checker.memory.exprs[checker.memory.values[checker.memory.calls[node.a].values + 1].signal];
-                binding.delay = body.tag == .call and body.b == 0 and checker.memory.calls[body.a].entry.fed;
-                binding.entry = null;
+            try checker.expect_scalar(it.a, expr, name);
+            const delay_lanes = checker.memory.exprs[binding.index].lanes;
+            const lanes = checker.memory.exprs[expr].lanes;
+            if (lanes != 1 and lanes != delay_lanes) {
+                const diagnostic = if (delay_lanes == 1)
+                    checker.fail(it.a, .wrong_lanes, "the delay `{s}` has one lane, and this {d}", .{ name, lanes })
+                else
+                    checker.fail(it.a, .wrong_lanes, "the delay `{s}` has {d} lanes, and this {d}", .{ name, delay_lanes, lanes });
+                error_module.hint(diagnostic, "feed a delay one lane, or as many lanes as it has", .{});
+                return error.Checked;
             }
+            try checker.push_declaration(index, .{ .feed = .{ .binding = target, .expr = expr, .item = index } });
         }
-        if (checker.delay_calls - delays_before > @intFromBool(binding.delay)) return checker.unreachable_delay(it.a);
-        const at = try checker.declare(index, binding);
-        if (declared) |range| if (value.tag == .call and checker.find_module(checker.text(it.a)) != null) {
-            if (checker.instance_count == checker.memory.instances.len) {
-                return checker.limit(index, "names", .names, checker.memory.instances.len);
+
+        /// The example of the first entry that is `fed`, or the first mover, of the vocabulary and
+        /// then the client's entries; null where none has one, so a hint that needs it is left out.
+        fn first_example(checker: *const Checker, which: enum { fed, mover }) ?[]const u8 {
+            _ = checker;
+            for (entries) |entry| {
+                if (entry.example.len > 0 and example_wanted(&entry, which == .fed)) return entry.example;
             }
-            checker.memory.instances[checker.instance_count] = .{ .binding = at, .low = range[0], .high = range[1], .item = it.a };
-            checker.instance_count += 1;
-        };
-        try checker.push_declaration(index, .{ .signal = .{ .binding = at, .expr = expr } });
-    }
+            return null;
+        }
 
-    fn feed(checker: *Checker, index: u32) Fail!void {
-        const it = checker.item(index);
-        const name = checker.tree.token_text(it.token);
-        const target = checker.find(name) orelse {
-            const diagnostic = checker.fail_token(index, .unknown_name, "`{s}` is not declared", .{name});
-            if (checker.first_example(.fed)) |example| error_module.hint(diagnostic, "declare it above, such as `{s} = {s}`", .{ name, example });
-            return error.Checked;
-        };
-        const binding = &checker.memory.bindings[target];
-        if (binding.kind == .failed) return checker.reported();
-        if (!binding.delay) {
-            const diagnostic = checker.fail_token(index, .not_a_delay, "only a delay is fed with `<-`, and `{s}` is not one", .{name});
-            if (checker.first_example(.fed)) |example| error_module.hint(diagnostic, "declare it as `{s} = {s}`", .{ name, example });
-            return error.Checked;
-        }
-        if (binding.fed) {
-            _ = checker.fail(index, .delay_fed_twice, "the delay `{s}` is already fed", .{name});
-            return error.Checked;
-        }
-        binding.fed = true;
-        const delays_before = checker.delay_calls;
-        const expr = try checker.signal(it.a);
-        if (checker.delay_calls != delays_before) return checker.unreachable_delay(it.a);
-        try checker.expect_scalar(it.a, expr, name);
-        const delay_lanes = checker.memory.exprs[binding.index].lanes;
-        const lanes = checker.memory.exprs[expr].lanes;
-        if (lanes != 1 and lanes != delay_lanes) {
-            const diagnostic = if (delay_lanes == 1)
-                checker.fail(it.a, .wrong_lanes, "the delay `{s}` has one lane, and this {d}", .{ name, lanes })
-            else
-                checker.fail(it.a, .wrong_lanes, "the delay `{s}` has {d} lanes, and this {d}", .{ name, delay_lanes, lanes });
-            error_module.hint(diagnostic, "feed a delay one lane, or as many lanes as it has", .{});
-            return error.Checked;
-        }
-        try checker.push_declaration(index, .{ .feed = .{ .binding = target, .expr = expr, .item = index } });
-    }
-
-    /// The example of the first entry that is `fed`, or the first mover, of the vocabulary and then
-    /// the client's entries; null where none has one, so a hint that needs it is left out.
-    fn first_example(checker: *const Checker, which: enum { fed, mover }) ?[]const u8 {
-        for (checker.memory.vocabulary.entries) |entry| {
-            if (entry.example.len > 0 and example_wanted(&entry, which == .fed)) return entry.example;
-        }
-        for (checker.memory.clients) |entry| {
-            if (entry.example.len > 0 and example_wanted(&entry, which == .fed)) return entry.example;
-        }
-        return null;
-    }
-
-    /// The example of every mover entry, in backquotes and joined by " or ", as far as `buffer`
-    /// holds them.
-    fn mover_examples(checker: *const Checker, buffer: *[hint_list_size]u8) []const u8 {
-        var stream = std.Io.Writer.fixed(buffer);
-        var count: u32 = 0;
-        const lists = [2][]const Entry{ checker.memory.vocabulary.entries, checker.memory.clients };
-        for (lists) |list| {
-            for (list) |entry| {
+        /// The example of every mover entry, in backquotes and joined by " or ", as far as `buffer`
+        /// holds them.
+        fn mover_examples(checker: *const Checker, buffer: *[hint_list_size]u8) []const u8 {
+            var stream = std.Io.Writer.fixed(buffer);
+            var count: u32 = 0;
+            _ = checker;
+            for (entries) |entry| {
                 if (entry.role != .mover or entry.example.len == 0) continue;
                 const joiner: []const u8 = if (count > 0) " or " else "";
                 stream.print("{s}`{s}`", .{ joiner, entry.example }) catch return stream.buffered();
                 count += 1;
             }
+            return stream.buffered();
         }
-        return stream.buffered();
-    }
 
-    /// A delay inside an expression has no name, so no `<-` can feed it (section 2).
-    fn unreachable_delay(checker: *Checker, index: u32) Fail {
-        const diagnostic = checker.fail(index, .not_a_delay, "a delay is fed by its name, so it is a declaration's whole value", .{});
-        if (checker.first_example(.fed)) |example| {
-            error_module.hint(diagnostic, "declare it alone, such as `fb = {s}`, feed it with `fb <- …`, then use `fb`", .{example});
-        }
-        return error.Checked;
-    }
-
-    fn push_declaration(checker: *Checker, index: u32, declaration_value: Declaration) Fail!void {
-        if (checker.declaration_count == checker.memory.declarations.len) {
-            return checker.limit(index, "declarations", .names, checker.memory.declarations.len);
-        }
-        checker.memory.declarations[checker.declaration_count] = declaration_value;
-        checker.declaration_count += 1;
-    }
-
-    fn push_expr(checker: *Checker, expr: Expr) Fail!u32 {
-        if (checker.expr_count == checker.memory.exprs.len) {
-            return checker.limit(expr.item, "expressions", .tree, checker.memory.exprs.len);
-        }
-        const at = checker.expr_count;
-        var placed = expr;
-        placed.item = checker.site_of(expr.item);
-        placed.region = checker.region orelse 0;
-        if (checker.region) |count| if (placed.lanes != 1 and placed.lanes != count) {
-            const diagnostic = checker.fail(expr.item, .wrong_lanes, "this has {d} lanes, inside `lanes({d}, …)`", .{ placed.lanes, count });
-            error_module.hint(diagnostic, "a region reads signals of one lane, or of its own count", .{});
+        /// A delay inside an expression has no name, so no `<-` can feed it (section 2).
+        fn unreachable_delay(checker: *Checker, index: u32) Fail {
+            const diagnostic = checker.fail(index, .not_a_delay, "a delay is fed by its name, so it is a declaration's whole value", .{});
+            if (checker.first_example(.fed)) |example| {
+                error_module.hint(diagnostic, "declare it alone, such as `fb = {s}`, feed it with `fb <- …`, then use `fb`", .{example});
+            }
             return error.Checked;
-        };
-        checker.memory.exprs[at] = placed;
-        checker.expr_count += 1;
-        return at;
-    }
-
-    fn constant(checker: *Checker, number: f64, index: u32) Fail!u32 {
-        return checker.push_expr(.{ .tag = .constant, .number = number, .item = index });
-    }
-
-    fn is_constant(checker: *const Checker, expr: u32) ?f64 {
-        const node = checker.memory.exprs[expr];
-        return if (node.tag == .constant) node.number else null;
-    }
-
-    /// A signal expression (section 3).
-    fn signal(checker: *Checker, index: u32) Fail!u32 {
-        if (checker.bound_slot(index)) |slot| {
-            const frame = checker.frame;
-            if (checker.memory.frames[frame].arg_exprs[slot]) |expr| return expr;
-            const expr = try checker.signal_in(checker.memory.frames[frame].args[slot]);
-            checker.memory.frames[frame].arg_exprs[slot] = expr;
-            return expr;
         }
-        const it = checker.item(index);
-        switch (it.tag) {
-            .literal => {
-                const token = checker.tree.tokens[it.token];
-                if (token.tag != .number) {
-                    const diagnostic = checker.fail(index, .wrong_type, "a {s} is not a signal", .{literal_kind(token.tag)});
-                    error_module.hint(diagnostic, "a signal here is a name, a call, arithmetic, or a plain number", .{});
-                    return error.Checked;
-                }
-                return checker.constant(try checker.fixed_number(index, "a number"), index);
-            },
-            .name => {
-                if (std.mem.eql(u8, checker.text(index), "lane")) return checker.lane_index(index);
-                if (checker.known_number(index)) |number| return checker.constant(number, index);
-                return checker.signal_name(index, 0);
-            },
-            .call => {
-                const name = checker.text(index);
-                if (checker.lookup(name, .signal)) |entry| {
-                    if (entry.kind() == .noun) {
-                        const diagnostic = checker.fail_token(index, .wrong_type, "`{s}` describes a thing, and is not a signal", .{name});
-                        error_module.hint(diagnostic, "give it a line of its own, such as `name = {s}(…)`", .{name});
+
+        fn push_declaration(checker: *Checker, index: u32, declaration_value: Declaration) Fail!void {
+            if (checker.declaration_count == checker.memory.declarations.len) {
+                return checker.limit(index, "declarations", .names, checker.memory.declarations.len);
+            }
+            checker.memory.declarations[checker.declaration_count] = declaration_value;
+            checker.declaration_count += 1;
+        }
+
+        fn push_expr(checker: *Checker, expr: Expr) Fail!u32 {
+            if (checker.expr_count == checker.memory.exprs.len) {
+                return checker.limit(expr.item, "expressions", .tree, checker.memory.exprs.len);
+            }
+            const at = checker.expr_count;
+            var placed = expr;
+            placed.item = checker.site_of(expr.item);
+            placed.region = checker.region orelse 0;
+            if (checker.region) |count| if (placed.lanes != 1 and placed.lanes != count) {
+                const diagnostic = checker.fail(expr.item, .wrong_lanes, "this has {d} lanes, inside `lanes({d}, …)`", .{ placed.lanes, count });
+                error_module.hint(diagnostic, "a region reads signals of one lane, or of its own count", .{});
+                return error.Checked;
+            };
+            checker.memory.exprs[at] = placed;
+            checker.expr_count += 1;
+            return at;
+        }
+
+        fn constant(checker: *Checker, number: f64, index: u32) Fail!u32 {
+            return checker.push_expr(.{ .tag = .constant, .number = number, .item = index });
+        }
+
+        fn is_constant(checker: *const Checker, expr: u32) ?f64 {
+            const node = checker.memory.exprs[expr];
+            return if (node.tag == .constant) node.number else null;
+        }
+
+        /// A signal expression (section 3).
+        fn signal(checker: *Checker, index: u32) Fail!u32 {
+            if (checker.bound_slot(index)) |slot| {
+                const frame = checker.frame;
+                if (checker.memory.frames[frame].arg_exprs[slot]) |expr| return expr;
+                const expr = try checker.signal_in(checker.memory.frames[frame].args[slot]);
+                checker.memory.frames[frame].arg_exprs[slot] = expr;
+                return expr;
+            }
+            const it = checker.item(index);
+            switch (it.tag) {
+                .literal => {
+                    const token = checker.tree.tokens[it.token];
+                    if (token.tag != .number) {
+                        const diagnostic = checker.fail(index, .wrong_type, "a {s} is not a signal", .{literal_kind(token.tag)});
+                        error_module.hint(diagnostic, "a signal here is a name, a call, arithmetic, or a plain number", .{});
                         return error.Checked;
                     }
-                    // `lanes` opens its region when its count is checked, and closes it here.
-                    const region = checker.region;
-                    defer checker.region = region;
-                    const call = try checker.check_call(entry, index);
-                    checker.region = region;
-                    if (entry.fed) checker.delay_calls += 1;
-                    const shape = try checker.call_shape(call, index);
-                    const lanes = try checker.call_lanes(call, index);
-                    if (checker.folded(call)) |number| return checker.constant(number, index);
-                    return checker.push_expr(.{ .tag = .call, .a = call, .item = index, .shape = shape, .lanes = lanes });
-                }
-                if (checker.find_module(name)) |module| return checker.expand_signal(module, index);
-                return checker.unknown_call(index);
-            },
-            .paren => return checker.signal(it.a),
-            .add, .multiply => {
-                const left = try checker.signal(it.a);
-                const right = try checker.signal(it.b);
-                if (checker.is_constant(left)) |a| if (checker.is_constant(right)) |b| {
-                    return checker.constant(arithmetic(it.tag, a, b), index);
-                };
-                const tag: Expr.Tag = if (it.tag == .add) .add else .multiply;
-                const shape = try checker.combine(index, left, right, tag == .multiply);
-                const lanes = try checker.join_lanes(index, left, right);
-                return checker.push_expr(.{ .tag = tag, .a = left, .b = right, .item = index, .shape = shape, .lanes = lanes });
-            },
-            .subtract => {
-                const left = try checker.signal(it.a);
-                const right = try checker.signal(it.b);
-                if (checker.is_constant(right)) |b| {
-                    if (checker.is_constant(left)) |a| {
-                        return checker.constant(arithmetic(.subtract, a, b), index);
+                    return checker.constant(try checker.fixed_number(index, "a number"), index);
+                },
+                .name => {
+                    if (std.mem.eql(u8, checker.text(index), "lane")) return checker.lane_index(index);
+                    if (checker.known_number(index)) |number| return checker.constant(number, index);
+                    return checker.signal_name(index, 0);
+                },
+                .call => {
+                    const name = checker.text(index);
+                    if (checker.lookup(name, .signal)) |entry| {
+                        if (entry.kind() == .noun) {
+                            const diagnostic = checker.fail_token(index, .wrong_type, "`{s}` describes a thing, and is not a signal", .{name});
+                            error_module.hint(diagnostic, "give it a line of its own, such as `name = {s}(…)`", .{name});
+                            return error.Checked;
+                        }
+                        // `lanes` opens its region when its count is checked, and closes it here.
+                        const region = checker.region;
+                        defer checker.region = region;
+                        const call = try checker.check_call(entry, index);
+                        checker.region = region;
+                        if (entry.fed) checker.delay_calls += 1;
+                        const shape = try checker.call_shape(call, index);
+                        const lanes = try checker.call_lanes(call, index);
+                        if (checker.folded(call)) |number| return checker.constant(number, index);
+                        return checker.push_expr(.{ .tag = .call, .a = call, .item = index, .shape = shape, .lanes = lanes });
                     }
-                    const negative = try checker.constant(-b, it.b);
-                    return checker.push_expr(.{ .tag = .add, .a = left, .b = negative, .item = index, .shape = checker.shape_of(left), .lanes = checker.lanes_of(left) });
-                }
-                const shape = try checker.combine(index, left, right, false);
-                const lanes = try checker.join_lanes(index, left, right);
-                const minus_one = try checker.constant(-1, index);
-                const negated = try checker.push_expr(.{ .tag = .multiply, .a = right, .b = minus_one, .item = it.b, .shape = checker.shape_of(right), .lanes = checker.lanes_of(right) });
-                return checker.push_expr(.{ .tag = .add, .a = left, .b = negated, .item = index, .shape = shape, .lanes = lanes });
-            },
-            .divide => {
-                const left = try checker.signal(it.a);
-                const by = try checker.divisor(it.b);
-                if (checker.is_constant(left)) |a| {
-                    return checker.constant(arithmetic(.divide, a, by), index);
-                }
-                const reciprocal = try checker.constant(1 / by, it.b);
-                return checker.push_expr(.{ .tag = .multiply, .a = left, .b = reciprocal, .item = index, .shape = checker.shape_of(left), .lanes = checker.lanes_of(left) });
-            },
-            .negate => {
-                const operand = try checker.signal(it.a);
-                if (checker.is_constant(operand)) |a| return checker.constant(-a, index);
-                const minus_one = try checker.constant(-1, index);
-                return checker.push_expr(.{ .tag = .multiply, .a = operand, .b = minus_one, .item = index, .shape = checker.shape_of(operand), .lanes = checker.lanes_of(operand) });
-            },
-            .output => return checker.output(index, it.a, checker.text(index)),
-            .list, .range, .goal, .named, .element => {
-                _ = checker.fail(index, .wrong_type, "expected a signal, found {s}", .{item_kind(it.tag)});
-                return error.Checked;
-            },
-            else => unreachable,
-        }
-    }
-
-    /// The constant a call of an entry that `folds` given only numbers folds to (section 3), or
-    /// null for any other call. The operands go in parameter order, an integer as a number.
-    fn folded(checker: *const Checker, call: u32) ?f64 {
-        const entry = checker.memory.calls[call].entry;
-        if (!entry.folds) return null;
-        const first = checker.memory.calls[call].values;
-        const values = checker.memory.values[first..][0..entry.params.len];
-        assert(values.len <= 2);
-        var operands: [2]f64 = .{ 0, 0 };
-        for (values, 0..) |value, at| {
-            operands[at] = switch (value) {
-                .signal => |expr| checker.is_constant(expr) orelse return null,
-                .integer => |whole| @floatFromInt(whole),
+                    if (checker.find_module(name)) |module| return checker.expand_signal(module, index);
+                    return checker.unknown_call(index);
+                },
+                .paren => return checker.signal(it.a),
+                .add, .multiply => {
+                    const left = try checker.signal(it.a);
+                    const right = try checker.signal(it.b);
+                    if (checker.is_constant(left)) |a| if (checker.is_constant(right)) |b| {
+                        return checker.constant(arithmetic(it.tag, a, b), index);
+                    };
+                    const tag: Expr.Tag = if (it.tag == .add) .add else .multiply;
+                    const shape = try checker.combine(index, left, right, tag == .multiply);
+                    const lanes = try checker.join_lanes(index, left, right);
+                    return checker.push_expr(.{ .tag = tag, .a = left, .b = right, .item = index, .shape = shape, .lanes = lanes });
+                },
+                .subtract => {
+                    const left = try checker.signal(it.a);
+                    const right = try checker.signal(it.b);
+                    if (checker.is_constant(right)) |b| {
+                        if (checker.is_constant(left)) |a| {
+                            return checker.constant(arithmetic(.subtract, a, b), index);
+                        }
+                        const negative = try checker.constant(-b, it.b);
+                        return checker.push_expr(.{ .tag = .add, .a = left, .b = negative, .item = index, .shape = checker.shape_of(left), .lanes = checker.lanes_of(left) });
+                    }
+                    const shape = try checker.combine(index, left, right, false);
+                    const lanes = try checker.join_lanes(index, left, right);
+                    const minus_one = try checker.constant(-1, index);
+                    const negated = try checker.push_expr(.{ .tag = .multiply, .a = right, .b = minus_one, .item = it.b, .shape = checker.shape_of(right), .lanes = checker.lanes_of(right) });
+                    return checker.push_expr(.{ .tag = .add, .a = left, .b = negated, .item = index, .shape = shape, .lanes = lanes });
+                },
+                .divide => {
+                    const left = try checker.signal(it.a);
+                    const by = try checker.divisor(it.b);
+                    if (checker.is_constant(left)) |a| {
+                        return checker.constant(arithmetic(.divide, a, by), index);
+                    }
+                    const reciprocal = try checker.constant(1 / by, it.b);
+                    return checker.push_expr(.{ .tag = .multiply, .a = left, .b = reciprocal, .item = index, .shape = checker.shape_of(left), .lanes = checker.lanes_of(left) });
+                },
+                .negate => {
+                    const operand = try checker.signal(it.a);
+                    if (checker.is_constant(operand)) |a| return checker.constant(-a, index);
+                    const minus_one = try checker.constant(-1, index);
+                    return checker.push_expr(.{ .tag = .multiply, .a = operand, .b = minus_one, .item = index, .shape = checker.shape_of(operand), .lanes = checker.lanes_of(operand) });
+                },
+                .output => return checker.output(index, it.a, checker.text(index)),
+                .list, .range, .goal, .named, .element => {
+                    _ = checker.fail(index, .wrong_type, "expected a signal, found {s}", .{item_kind(it.tag)});
+                    return error.Checked;
+                },
                 else => unreachable,
+            }
+        }
+
+        /// The constant a call of an entry that `folds` given only numbers folds to (section 3), or
+        /// null for any other call. The operands go in parameter order, an integer as a number.
+        fn folded(checker: *const Checker, call: u32) ?f64 {
+            const entry = checker.memory.calls[call].entry;
+            if (!entry.folds) return null;
+            const first = checker.memory.calls[call].values;
+            const values = checker.memory.values[first..][0..entry.params.len];
+            assert(values.len <= 2);
+            var operands: [2]f64 = .{ 0, 0 };
+            for (values, 0..) |value, at| {
+                operands[at] = switch (value) {
+                    .signal => |expr| checker.is_constant(expr) orelse return null,
+                    .integer => |whole| @floatFromInt(whole),
+                    else => unreachable,
+                };
+            }
+            return vocabulary.fold(entry, operands);
+        }
+
+        /// The number `index` divides by (section 3): a constant with a finite reciprocal.
+        fn divisor(checker: *Checker, index: u32) Fail!f64 {
+            assert(index < checker.tree.items.len);
+            assert(checker.frame < checker.frame_count);
+            if (checker.unit_literal(index)) |kind| {
+                const diagnostic = checker.fail(index, .wrong_type, "a divisor is a number, and this is a {s}", .{kind});
+                if (!std.mem.eql(u8, kind, "string")) error_module.hint(diagnostic, "drop the unit", .{});
+                return error.Checked;
+            }
+            const expr = try checker.signal(index);
+            const shape = checker.shape_of(expr);
+            if (!shape.eql(Shape.scalar)) {
+                const diagnostic = checker.fail(index, .wrong_shape, "a divisor is a number, and this is {s}", .{shape.noun()});
+                error_module.hint(diagnostic, "divide by a number, or take a component, such as `.{s}`", .{shape.component_names()[0]});
+                return error.Checked;
+            }
+            const number = checker.is_constant(expr) orelse {
+                const diagnostic = checker.fail(index, .not_live, "a divisor is a number, fixed when the program is built", .{});
+                error_module.hint(diagnostic, "to scale by a signal, multiply by one", .{});
+                return error.Checked;
+            };
+            return checker.nonzero_divisor(index, number);
+        }
+
+        /// `number`, the divisor at `index`, when it is one (section 3): not 0, and with a finite
+        /// reciprocal. A signal's quotient and a number folded where one is due both ask here.
+        fn nonzero_divisor(checker: *Checker, index: u32, number: f64) Fail!f64 {
+            assert(index < checker.tree.items.len);
+            assert(!std.math.isNan(number));
+            if (number == 0) {
+                const diagnostic = checker.fail(index, .out_of_range, "there is no division by 0", .{});
+                error_module.hint(diagnostic, "a divisor is a number other than 0", .{});
+                return error.Checked;
+            }
+            if (!std.math.isFinite(1 / number)) {
+                const diagnostic = checker.fail(index, .out_of_range, "1 / {e} is past what a number holds", .{number});
+                error_module.hint(diagnostic, "divide by a number further from 0", .{});
+                return error.Checked;
+            }
+            assert(std.math.isFinite(number));
+            return number;
+        }
+
+        /// The kind of literal with a unit, or string, that `index` is, in parentheses or through a
+        /// parameter bound to one, so a divisor's error names it rather than calling it a signal.
+        fn unit_literal(checker: *Checker, index: u32) ?[]const u8 {
+            assert(index < checker.tree.items.len);
+            assert(checker.frame < checker.frame_count);
+            if (checker.bound(index)) |arg| {
+                const saved = checker.frame;
+                checker.focus(arg.frame);
+                defer checker.focus(saved);
+                return checker.unit_literal(arg.item);
+            }
+            const it = checker.item(index);
+            if (it.tag == .paren) return checker.unit_literal(it.a);
+            if (it.tag != .literal) return null;
+            const tag = checker.tree.tokens[it.token].tag;
+            if (tag == .number) return null;
+            return literal_kind(tag);
+        }
+
+        /// `base.name`: an output of a call, or of a name bound to one (section 3). `index` is the
+        /// output's item, and `base_index` the item it is taken from.
+        fn output(checker: *Checker, index: u32, base_index: u32, output_name: []const u8) Fail!u32 {
+            if (checker.bound(base_index)) |arg| {
+                const saved = checker.frame;
+                checker.focus(arg.frame);
+                defer checker.focus(saved);
+                return checker.output(arg.item, arg.item, output_name);
+            }
+            const base = checker.item(base_index);
+            const entry: *const Entry = switch (base.tag) {
+                .name => entry: {
+                    const base_name = checker.text(base_index);
+                    const found = try checker.resolve(base_index, base_name);
+                    const bound_to = checker.memory.bindings[found];
+                    if (bound_to.kind == .signal and checker.shape_of(bound_to.index).components > 1) {
+                        return checker.component_of(index, try checker.signal_name(base_index, 0), output_name);
+                    }
+                    if (bound_to.kind == .noun) {
+                        _ = checker.fail_token(index, .unknown_output, "`{s}` is a noun, `{s}`, and a noun has no outputs", .{ base_name, bound_to.entry.?.name });
+                        return error.Checked;
+                    }
+                    if (checker.memory.bindings[found].entry) |entry| break :entry entry;
+                    const diagnostic = checker.fail_token(index, .unknown_output, "`{s}` has no output `{s}`", .{ base_name, output_name });
+                    error_module.hint(diagnostic, "only a call such as `bounce` has outputs", .{});
+                    return error.Checked;
+                },
+                .call => checker.lookup(checker.text(base_index), .signal) orelse {
+                    const diagnostic = checker.fail(index, .unknown_output, "a module's call has no outputs until it has a name", .{});
+                    error_module.hint(diagnostic, "bind it first, such as `x = {s}(…)`, then `x.{s}`", .{ checker.text(base_index), output_name });
+                    return error.Checked;
+                },
+                else => {
+                    _ = checker.fail(index, .unknown_output, "only a name or a call has outputs", .{});
+                    return error.Checked;
+                },
+            };
+            const output_slot = entry.output(output_name) orelse {
+                if (base.tag == .call and entry.outputs.len == 0 and entry.first_output.len == 0) {
+                    const vector = try checker.signal(base_index);
+                    if (checker.shape_of(vector).components > 1) return checker.component_of(index, vector, output_name);
+                }
+                const diagnostic = checker.fail_token(index, .unknown_output, "{s} has no output `{s}`", .{ entry.name, output_name });
+                if (entry.outputs.len > 0) {
+                    var buffer: [outputs_hint_size]u8 = undefined;
+                    error_module.hint(diagnostic, "its outputs are {s}", .{outputs_list(entry, &buffer)});
+                } else if (entry.first_output.len > 0) {
+                    error_module.hint(diagnostic, "its only output is `{s}`", .{entry.first_output});
+                }
+                return error.Checked;
+            };
+            if (base.tag == .name) return checker.signal_name(base_index, output_slot);
+            const call = try checker.check_call(entry, base_index);
+            const lanes = try checker.call_lanes(call, base_index);
+            return checker.push_expr(.{ .tag = .call, .a = call, .b = output_slot, .item = index, .lanes = lanes });
+        }
+
+        fn signal_name(checker: *Checker, index: u32, output_index: u32) Fail!u32 {
+            const name = checker.text(index);
+            const found = try checker.resolve(index, name);
+            const binding = checker.memory.bindings[found];
+            switch (binding.kind) {
+                .signal => {
+                    const shape = if (output_index == 0) checker.shape_of(binding.index) else Shape.scalar;
+                    const lanes = checker.lanes_of(binding.index);
+                    return checker.push_expr(.{ .tag = .binding, .a = found, .b = output_index, .item = index, .shape = shape, .lanes = lanes });
+                },
+                .track => return checker.push_expr(.{ .tag = .track, .a = binding.index, .item = index }),
+                .noun => {
+                    const diagnostic = checker.fail(index, .wrong_type, "`{s}` is a noun, `{s}`, not a signal", .{ name, binding.entry.?.name });
+                    error_module.hint(diagnostic, "a noun is named only where a parameter takes one", .{});
+                    return error.Checked;
+                },
+                else => {
+                    _ = checker.fail(index, .wrong_type, "`{s}` is a {s}, not a signal", .{ name, kind_name(binding.kind) });
+                    return error.Checked;
+                },
+            }
+        }
+
+        /// The binding of `name`, or the error for a name not declared. A name whose declaration
+        /// was refused fails with nothing more to say (section 2).
+        fn resolve(checker: *Checker, index: u32, name: []const u8) Fail!u32 {
+            const found = checker.find(name) orelse return checker.unknown_name(index, name);
+            if (checker.memory.bindings[found].kind == .failed) return checker.reported();
+            return found;
+        }
+
+        /// Whether `name` is a module declared in the file or a library it uses that `register`
+        /// refused, so a call of it reports nothing more (section 2).
+        fn module_refused(checker: *const Checker, name: []const u8) bool {
+            if (checker.find_module(name) != null) return false;
+            if (declares_module(checker.root, name)) return true;
+            for (checker.root.declarations) |index| {
+                const it = checker.root.item(index);
+                if (it.tag != .use) continue;
+                const used = checker.root.token_text(it.token);
+                for (checker.memory.libraries) |library| {
+                    if (!std.mem.eql(u8, library.name, used)) continue;
+                    if (declares_module(library.tree, name)) return true;
+                }
+            }
+            return false;
+        }
+
+        /// The failure of a use whose cause was already reported.
+        fn reported(checker: *const Checker) Fail {
+            assert(checker.diagnostics.total() > 0);
+            return error.Checked;
+        }
+
+        /// After `declaration` refused the declaration `index`, binds its name as `failed`, when it
+        /// has one that is free, so its uses are not reported again (section 2).
+        fn bind_failed(checker: *Checker, index: u32) void {
+            const it = checker.item(index);
+            switch (it.tag) {
+                .cue, .cue_series, .track, .bind => {},
+                else => return,
+            }
+            const name = checker.tree.token_text(it.token);
+            for (reserved) |word| if (std.mem.eql(u8, word, name)) return;
+            if (checker.find(name) != null) return;
+            if (checker.binding_count == checker.memory.bindings.len) return;
+            checker.memory.bindings[checker.binding_count] = .{ .name = name, .item = index, .kind = .failed, .index = 0 };
+            checker.binding_count += 1;
+        }
+
+        fn unknown_name(checker: *Checker, index: u32, name: []const u8) Fail {
+            // `pi` and `tau` reach here only where a number is no answer: a cue, a noun, a path.
+            if (checker.item(index).tag == .name) if (checker.known_number(index)) |_| {
+                const diagnostic = checker.fail(index, .wrong_type, "`{s}` is a number, and not a name this file declares", .{name});
+                error_module.hint(diagnostic, "a number goes where a number or a signal is due", .{});
+                return error.Checked;
+            };
+            if (checker.in_module()) {
+                const module = checker.memory.modules[checker.memory.frames[checker.frame].module.?];
+                const diagnostic = checker.fail(index, .not_a_parameter, "`{s}` is not a parameter of {s}", .{ name, module.name });
+                error_module.hint(diagnostic, "a module sees its parameters, the primitives, and the modules; pass `{s}` in", .{name});
+                return error.Checked;
+            }
+            if (checker.declared_later(name)) |later| {
+                const line = error_module.locate(checker.source(), checker.span_of(later)[0]).line;
+                const diagnostic = checker.fail(index, .used_before_declared, "`{s}` is used before it is declared, on line {d}", .{ name, line });
+                error_module.hint(diagnostic, "move it up, or go through a delay", .{});
+                return error.Checked;
+            }
+            var buffer: [256][]const u8 = undefined;
+            const diagnostic = checker.fail(index, .unknown_name, "`{s}` is not declared", .{name});
+            if (error_module.nearest(name, checker.names_so_far(&buffer))) |near| {
+                error_module.hint(diagnostic, "did you mean `{s}`?", .{near});
+            }
+            return error.Checked;
+        }
+
+        fn unknown_call(checker: *Checker, index: u32) Fail {
+            const name = checker.text(index);
+            if (checker.module_refused(name)) return checker.reported();
+            const diagnostic = checker.fail_token(index, .unknown_call, "there is no call `{s}`", .{name});
+            // Every call of the joined list, each name once, then the modules in the table, the
+            // file's and its libraries'.
+            var buffer: [calls_suggested_max + modules_suggested_max][]const u8 = undefined;
+            var count: usize = 0;
+            for (entries) |*entry| {
+                var seen = false;
+                for (buffer[0..count]) |known| seen = seen or std.mem.eql(u8, known, entry.name);
+                if (seen) continue;
+                buffer[count] = entry.name;
+                count += 1;
+            }
+            const modules = @min(checker.module_count, modules_suggested_max);
+            for (buffer[count..][0..modules], checker.memory.modules[0..modules]) |*slot, module| {
+                slot.* = module.name;
+            }
+            if (error_module.nearest(name, buffer[0 .. count + modules])) |near| {
+                error_module.hint(diagnostic, "did you mean `{s}`?", .{near});
+            }
+            return error.Checked;
+        }
+
+        /// Checks a call's arguments against its entry, and returns the call.
+        fn check_call(checker: *Checker, entry: *const Entry, index: u32) Fail!u32 {
+            const children = checker.tree.children(index);
+            var given: [schema.params_max]?u32 = @splat(null);
+            var positional: u32 = 0;
+            var named = false;
+            const positional_max = entry.positional_count();
+            for (children) |child| {
+                const it = checker.item(child);
+                if (it.tag == .named) {
+                    named = true;
+                    const name = checker.text(child);
+                    const param = entry.param(name) orelse {
+                        var buffer: [schema.params_max][]const u8 = undefined;
+                        for (entry.params, 0..) |candidate, at| buffer[at] = candidate.name;
+                        const diagnostic = checker.fail_token(child, .unknown_parameter, "{s} has no parameter `{s}`", .{ entry.name, name });
+                        if (error_module.nearest(name, buffer[0..entry.params.len])) |near| {
+                            error_module.hint(diagnostic, "did you mean `{s}`?", .{near});
+                        }
+                        return error.Checked;
+                    };
+                    if (given[param] != null) {
+                        _ = checker.fail_token(child, .duplicate_argument, "`{s}` is given twice", .{name});
+                        return error.Checked;
+                    }
+                    given[param] = it.a;
+                    continue;
+                }
+                if (named) {
+                    const diagnostic = checker.fail(child, .positional_after_named, "an argument without a name comes after a named one", .{});
+                    error_module.hint(diagnostic, "write it first, or give it its name", .{});
+                    return error.Checked;
+                }
+                if (positional == positional_max) {
+                    const diagnostic = checker.fail(child, .too_many_positional, "{s} takes {d} arguments without a name", .{ entry.name, positional_max });
+                    error_module.hint(diagnostic, "name the others, such as `{s}: …`", .{entry.params[@min(positional_max, entry.params.len - 1)].name});
+                    return error.Checked;
+                }
+                given[positional] = child;
+                positional += 1;
+            }
+            if (checker.value_count + entry.params.len > checker.memory.values.len) {
+                return checker.limit(index, "values", .tree, checker.memory.values.len);
+            }
+            if (checker.call_count == checker.memory.calls.len) {
+                return checker.limit(index, "calls", .tree, checker.memory.calls.len);
+            }
+            const first = checker.value_count;
+            checker.value_count += @intCast(entry.params.len);
+            // A `from` left out is the `to` of the tween `after` names, read once `after` is
+            // checked.
+            var from_after: ?u32 = null;
+            for (entry.params, 0..) |*param, at| {
+                const slot = first + at;
+                checker.memory.value_items[slot] = checker.site_of(given[at] orelse index);
+                if (given[at] == null and param.default == .after) {
+                    checker.memory.values[slot] = .absent;
+                    from_after = @intCast(at);
+                    continue;
+                }
+                checker.memory.values[slot] = if (given[at]) |child|
+                    try checker.argument(entry, param, child)
+                else
+                    try checker.default_of(entry, param, index);
+            }
+            if (from_after) |at| {
+                checker.memory.values[first + at] = try checker.after_to(entry, index, &given, first, at);
+            }
+            const at = checker.call_count;
+            checker.memory.calls[at] = .{ .entry = entry, .values = first, .item = checker.site_of(index) };
+            checker.call_count += 1;
+            return at;
+        }
+
+        fn default_of(checker: *Checker, entry: *const Entry, param: *const schema.Param, index: u32) Fail!Value {
+            return switch (param.default) {
+                .required => {
+                    const diagnostic = checker.fail_token(index, .missing_argument, "{s} needs `{s}`", .{ entry.name, param.name });
+                    error_module.hint(diagnostic, "add `{s}: {s}`", .{ param.name, example_of(checker, param) });
+                    return error.Checked;
+                },
+                .absent => .absent,
+                .number => |number| if (param.kind == .integer) .{ .integer = @intFromFloat(number) } else .{ .number = number },
+                .time => |flicks| .{ .time = flicks },
+                .word => |word| .{ .word = word },
+                .time_range => |range| .{ .time_range = range },
+                .unbounded => .{ .number_range = .{ -std.math.inf(f64), std.math.inf(f64) } },
+                .seed => .{ .seed = checker.derived_seed() },
+                .whole => .absent,
+                .text => |string| .{ .string = string },
+                // `check_call` fills it in from `after`, once `after` is checked (section 6b).
+                .after => unreachable,
             };
         }
-        return checker.memory.vocabulary.fold(entry, operands);
-    }
 
-    /// The number `index` divides by (section 3): a constant with a finite reciprocal.
-    fn divisor(checker: *Checker, index: u32) Fail!f64 {
-        assert(index < checker.tree.items.len);
-        assert(checker.frame < checker.frame_count);
-        if (checker.unit_literal(index)) |kind| {
-            const diagnostic = checker.fail(index, .wrong_type, "a divisor is a number, and this is a {s}", .{kind});
-            if (!std.mem.eql(u8, kind, "string")) error_module.hint(diagnostic, "drop the unit", .{});
-            return error.Checked;
+        /// The `to` of the tween a call's `after` names, for the `from` it leaves out (section 6b).
+        fn after_to(checker: *Checker, entry: *const Entry, index: u32, given: *const [schema.params_max]?u32, first: u32, from_at: u32) Fail!Value {
+            assert(checker.value_count >= first + entry.params.len);
+            const rule = entry.after.?;
+            const from = entry.params[from_at].name;
+            const after_at = entry.param(rule.by).?;
+            const after_item = given[after_at] orelse {
+                const diagnostic = checker.fail_token(index, .missing_argument, "{s} needs `{s}`", .{ entry.name, from });
+                error_module.hint(diagnostic, "`{s}` may be left out only when `{s}` names a {s}", .{ from, rule.by, entry.name });
+                return error.Checked;
+            };
+            // A client's entry may give `.after` to a parameter whose `by` is not a signal.
+            const after = checker.memory.values[first + after_at];
+            const named = if (after == .signal) checker.tween_named(entry, after.signal) else null;
+            const call = named orelse {
+                const diagnostic = checker.fail(after_item, .missing_argument, "{s} needs `{s}`, since `{s}` is not a name bound to a {s}", .{ entry.name, from, rule.by, entry.name });
+                error_module.hint(diagnostic, "`{s}` may be left out only when `{s}` names a {s}", .{ from, rule.by, entry.name });
+                return error.Checked;
+            };
+            const before = checker.memory.calls[call];
+            const to = checker.memory.values[before.values + before.entry.param(rule.takes).?];
+            assert(to == .number or to == .vector);
+            return to;
         }
-        const expr = try checker.signal(index);
-        const shape = checker.shape_of(expr);
-        if (!shape.eql(Shape.scalar)) {
-            const diagnostic = checker.fail(index, .wrong_shape, "a divisor is a number, and this is {s}", .{shape.noun()});
-            error_module.hint(diagnostic, "divide by a number, or take a component, such as `.{s}`", .{shape.component_names()[0]});
-            return error.Checked;
-        }
-        const number = checker.is_constant(expr) orelse {
-            const diagnostic = checker.fail(index, .not_live, "a divisor is a number, fixed when the program is built", .{});
-            error_module.hint(diagnostic, "to scale by a signal, multiply by one", .{});
-            return error.Checked;
-        };
-        return checker.nonzero_divisor(index, number);
-    }
 
-    /// `number`, the divisor at `index`, when it is one (section 3): not 0, and with a finite
-    /// reciprocal. A signal's quotient and a number folded where one is due both ask here.
-    fn nonzero_divisor(checker: *Checker, index: u32, number: f64) Fail!f64 {
-        assert(index < checker.tree.items.len);
-        assert(!std.math.isNan(number));
-        if (number == 0) {
-            const diagnostic = checker.fail(index, .out_of_range, "there is no division by 0", .{});
-            error_module.hint(diagnostic, "a divisor is a number other than 0", .{});
-            return error.Checked;
+        /// The tween call that `expr` names (section 6b): a name bound to a tween, or to a region
+        /// of one tween, or null. It reads two expressions and no more, so a chain costs nothing
+        /// per link.
+        fn tween_named(checker: *const Checker, entry: *const Entry, expr: u32) ?u32 {
+            const name = checker.memory.exprs[expr];
+            if (name.tag != .binding or name.b != 0) return null;
+            const binding = checker.memory.bindings[name.a];
+            if (binding.kind != .signal) return null;
+            const node = checker.memory.exprs[binding.index];
+            if (node.tag != .call or node.b != 0) return null;
+            const call = checker.memory.calls[node.a];
+            if (same_call(call.entry, entry)) return node.a;
+            if (call.entry.op != .lanes) return null;
+            const body = checker.memory.exprs[checker.memory.values[call.values + 1].signal];
+            if (body.tag != .call or body.b != 0) return null;
+            if (!same_call(checker.memory.calls[body.a].entry, entry)) return null;
+            return body.a;
         }
-        if (!std.math.isFinite(1 / number)) {
-            const diagnostic = checker.fail(index, .out_of_range, "1 / {e} is past what a number holds", .{number});
-            error_module.hint(diagnostic, "divide by a number further from 0", .{});
-            return error.Checked;
-        }
-        assert(std.math.isFinite(number));
-        return number;
-    }
 
-    /// The kind of literal with a unit, or string, that `index` is, in parentheses or through a
-    /// parameter bound to one, so a divisor's error names it rather than calling it a signal.
-    fn unit_literal(checker: *Checker, index: u32) ?[]const u8 {
-        assert(index < checker.tree.items.len);
-        assert(checker.frame < checker.frame_count);
-        if (checker.bound(index)) |arg| {
+        /// Whether `found` is a call of the entry `wanted` names: the same name and role.
+        fn same_call(found: *const Entry, wanted: *const Entry) bool {
+            return found.role == wanted.role and std.mem.eql(u8, found.name, wanted.name);
+        }
+
+        /// The parameter `index` names in the current frame, bound to its argument (section 6).
+        fn bound(checker: *const Checker, index: u32) ?Arg {
+            const slot = checker.bound_slot(index) orelse return null;
+            return checker.memory.frames[checker.frame].args[slot];
+        }
+
+        /// Which parameter of the current frame `index` names, if it is a parameter's name.
+        fn bound_slot(checker: *const Checker, index: u32) ?u32 {
+            const frame = &checker.memory.frames[checker.frame];
+            assert(checker.frame < checker.frame_count);
+            assert(frame.tree == checker.tree);
+            if (frame.module == null) return null;
+            const it = checker.tree.item(index);
+            if (it.tag != .name) return null;
+            const name = checker.tree.text(index);
+            for (0..frame.params) |at| {
+                if (std.mem.eql(u8, frame.tree.text(frame.param_items[at]), name)) return @intCast(at);
+            }
+            return null;
+        }
+
+        /// Checks a bound argument's signal in the frame it came from.
+        fn signal_in(checker: *Checker, arg: Arg) Fail!u32 {
             const saved = checker.frame;
             checker.focus(arg.frame);
             defer checker.focus(saved);
-            return checker.unit_literal(arg.item);
+            return checker.signal(arg.item);
         }
-        const it = checker.item(index);
-        if (it.tag == .paren) return checker.unit_literal(it.a);
-        if (it.tag != .literal) return null;
-        const tag = checker.tree.tokens[it.token].tag;
-        if (tag == .number) return null;
-        return literal_kind(tag);
-    }
 
-    /// `base.name`: an output of a call, or of a name bound to one (section 3). `index` is the
-    /// output's item, and `base_index` the item it is taken from.
-    fn output(checker: *Checker, index: u32, base_index: u32, output_name: []const u8) Fail!u32 {
-        if (checker.bound(base_index)) |arg| {
-            const saved = checker.frame;
-            checker.focus(arg.frame);
-            defer checker.focus(saved);
-            return checker.output(arg.item, arg.item, output_name);
-        }
-        const base = checker.item(base_index);
-        const entry: *const Entry = switch (base.tag) {
-            .name => entry: {
-                const base_name = checker.text(base_index);
-                const found = try checker.resolve(base_index, base_name);
-                const bound_to = checker.memory.bindings[found];
-                if (bound_to.kind == .signal and checker.shape_of(bound_to.index).components > 1) {
-                    return checker.component_of(index, try checker.signal_name(base_index, 0), output_name);
+        /// The entry called `name` in `role`, which `join` has made sure is one: a primitive, a
+        /// language entry, or one of the client's nouns. It is found in the list it came from, not
+        /// in the joined copy, so a client that tells its entries apart by address (Tapestry's
+        /// `kind_of`) finds the entry it gave.
+        fn lookup(checker: *const Checker, name: []const u8, role: schema.Role) ?*const Entry {
+            _ = checker;
+            const lists = [3][]const Entry{ vocabulary.entries, &schema.language_entries, clients };
+            for (lists) |list| {
+                for (list) |*entry| {
+                    if (entry.role == role and std.mem.eql(u8, entry.name, name)) return entry;
                 }
-                if (bound_to.kind == .noun) {
-                    _ = checker.fail_token(index, .unknown_output, "`{s}` is a noun, `{s}`, and a noun has no outputs", .{ base_name, bound_to.entry.?.name });
+            }
+            return null;
+        }
+
+        fn find_module(checker: *const Checker, name: []const u8) ?u32 {
+            for (checker.memory.modules[0..checker.module_count], 0..) |module, at| {
+                if (std.mem.eql(u8, module.name, name)) return @intCast(at);
+            }
+            return null;
+        }
+
+        /// Records a module of `tree`, declared at `index`. Errors are reported at `report`, the
+        /// file's `use` line for a library's module, so they point into the file.
+        fn add_module(checker: *Checker, tree: *const Tree, index: u32, report: u32) Fail!void {
+            const name = tree.token_text(tree.item(index).token);
+            for (reserved) |word| {
+                if (std.mem.eql(u8, word, name)) {
+                    const diagnostic = checker.fail(report, .reserved_name, "`{s}` is a keyword, not a module's name", .{name});
+                    error_module.hint(diagnostic, "choose another name, such as `{s}_1`", .{name});
                     return error.Checked;
                 }
-                if (checker.memory.bindings[found].entry) |entry| break :entry entry;
-                const diagnostic = checker.fail_token(index, .unknown_output, "`{s}` has no output `{s}`", .{ base_name, output_name });
-                error_module.hint(diagnostic, "only a call such as `bounce` has outputs", .{});
-                return error.Checked;
-            },
-            .call => checker.lookup(checker.text(base_index), .signal) orelse {
-                const diagnostic = checker.fail(index, .unknown_output, "a module's call has no outputs until it has a name", .{});
-                error_module.hint(diagnostic, "bind it first, such as `x = {s}(…)`, then `x.{s}`", .{ checker.text(base_index), output_name });
-                return error.Checked;
-            },
-            else => {
-                _ = checker.fail(index, .unknown_output, "only a name or a call has outputs", .{});
-                return error.Checked;
-            },
-        };
-        const output_slot = entry.output(output_name) orelse {
-            if (base.tag == .call and entry.outputs.len == 0 and entry.first_output.len == 0) {
-                const vector = try checker.signal(base_index);
-                if (checker.shape_of(vector).components > 1) return checker.component_of(index, vector, output_name);
             }
-            const diagnostic = checker.fail_token(index, .unknown_output, "{s} has no output `{s}`", .{ entry.name, output_name });
-            if (entry.outputs.len > 0) {
-                var buffer: [outputs_hint_size]u8 = undefined;
-                error_module.hint(diagnostic, "its outputs are {s}", .{outputs_list(entry, &buffer)});
-            } else if (entry.first_output.len > 0) {
-                error_module.hint(diagnostic, "its only output is `{s}`", .{entry.first_output});
-            }
-            return error.Checked;
-        };
-        if (base.tag == .name) return checker.signal_name(base_index, output_slot);
-        const call = try checker.check_call(entry, base_index);
-        const lanes = try checker.call_lanes(call, base_index);
-        return checker.push_expr(.{ .tag = .call, .a = call, .b = output_slot, .item = index, .lanes = lanes });
-    }
-
-    fn signal_name(checker: *Checker, index: u32, output_index: u32) Fail!u32 {
-        const name = checker.text(index);
-        const found = try checker.resolve(index, name);
-        const binding = checker.memory.bindings[found];
-        switch (binding.kind) {
-            .signal => {
-                const shape = if (output_index == 0) checker.shape_of(binding.index) else Shape.scalar;
-                const lanes = checker.lanes_of(binding.index);
-                return checker.push_expr(.{ .tag = .binding, .a = found, .b = output_index, .item = index, .shape = shape, .lanes = lanes });
-            },
-            .track => return checker.push_expr(.{ .tag = .track, .a = binding.index, .item = index }),
-            .noun => {
-                const diagnostic = checker.fail(index, .wrong_type, "`{s}` is a noun, `{s}`, not a signal", .{ name, binding.entry.?.name });
-                error_module.hint(diagnostic, "a noun is named only where a parameter takes one", .{});
-                return error.Checked;
-            },
-            else => {
-                _ = checker.fail(index, .wrong_type, "`{s}` is a {s}, not a signal", .{ name, kind_name(binding.kind) });
-                return error.Checked;
-            },
-        }
-    }
-
-    /// The binding of `name`, or the error for a name not declared. A name whose declaration was
-    /// refused fails with nothing more to say (section 2).
-    fn resolve(checker: *Checker, index: u32, name: []const u8) Fail!u32 {
-        const found = checker.find(name) orelse return checker.unknown_name(index, name);
-        if (checker.memory.bindings[found].kind == .failed) return checker.reported();
-        return found;
-    }
-
-    /// Whether `name` is a module declared in the file or a library it uses that `register`
-    /// refused, so a call of it reports nothing more (section 2).
-    fn module_refused(checker: *const Checker, name: []const u8) bool {
-        if (checker.find_module(name) != null) return false;
-        if (declares_module(checker.root, name)) return true;
-        for (checker.root.declarations) |index| {
-            const it = checker.root.item(index);
-            if (it.tag != .use) continue;
-            const used = checker.root.token_text(it.token);
-            for (checker.memory.libraries) |library| {
-                if (!std.mem.eql(u8, library.name, used)) continue;
-                if (declares_module(library.tree, name)) return true;
-            }
-        }
-        return false;
-    }
-
-    /// The failure of a use whose cause was already reported.
-    fn reported(checker: *const Checker) Fail {
-        assert(checker.diagnostics.total() > 0);
-        return error.Checked;
-    }
-
-    /// After `declaration` refused the declaration `index`, binds its name as `failed`, when it
-    /// has one that is free, so its uses are not reported again (section 2).
-    fn bind_failed(checker: *Checker, index: u32) void {
-        const it = checker.item(index);
-        switch (it.tag) {
-            .cue, .cue_series, .track, .bind => {},
-            else => return,
-        }
-        const name = checker.tree.token_text(it.token);
-        for (reserved) |word| if (std.mem.eql(u8, word, name)) return;
-        if (checker.find(name) != null) return;
-        if (checker.binding_count == checker.memory.bindings.len) return;
-        checker.memory.bindings[checker.binding_count] = .{ .name = name, .item = index, .kind = .failed, .index = 0 };
-        checker.binding_count += 1;
-    }
-
-    fn unknown_name(checker: *Checker, index: u32, name: []const u8) Fail {
-        // `pi` and `tau` reach here only where a number is no answer: a cue, a noun, a path.
-        if (checker.item(index).tag == .name) if (checker.known_number(index)) |_| {
-            const diagnostic = checker.fail(index, .wrong_type, "`{s}` is a number, and not a name this file declares", .{name});
-            error_module.hint(diagnostic, "a number goes where a number or a signal is due", .{});
-            return error.Checked;
-        };
-        if (checker.in_module()) {
-            const module = checker.memory.modules[checker.memory.frames[checker.frame].module.?];
-            const diagnostic = checker.fail(index, .not_a_parameter, "`{s}` is not a parameter of {s}", .{ name, module.name });
-            error_module.hint(diagnostic, "a module sees its parameters, the primitives, and the modules; pass `{s}` in", .{name});
-            return error.Checked;
-        }
-        if (checker.declared_later(name)) |later| {
-            const line = error_module.locate(checker.source(), checker.span_of(later)[0]).line;
-            const diagnostic = checker.fail(index, .used_before_declared, "`{s}` is used before it is declared, on line {d}", .{ name, line });
-            error_module.hint(diagnostic, "move it up, or go through a delay", .{});
-            return error.Checked;
-        }
-        var buffer: [256][]const u8 = undefined;
-        const diagnostic = checker.fail(index, .unknown_name, "`{s}` is not declared", .{name});
-        if (error_module.nearest(name, checker.names_so_far(&buffer))) |near| {
-            error_module.hint(diagnostic, "did you mean `{s}`?", .{near});
-        }
-        return error.Checked;
-    }
-
-    fn unknown_call(checker: *Checker, index: u32) Fail {
-        const name = checker.text(index);
-        if (checker.module_refused(name)) return checker.reported();
-        const diagnostic = checker.fail_token(index, .unknown_call, "there is no call `{s}`", .{name});
-        // The vocabulary's calls, each name once, then the modules in the table, the file's and
-        // its libraries'.
-        var buffer: [calls_suggested_max + modules_suggested_max][]const u8 = undefined;
-        var count: usize = 0;
-        for (checker.memory.vocabulary.entries) |*entry| {
-            var seen = false;
-            for (buffer[0..count]) |known| seen = seen or std.mem.eql(u8, known, entry.name);
-            if (seen or count == calls_suggested_max) continue;
-            buffer[count] = entry.name;
-            count += 1;
-        }
-        const modules = @min(checker.module_count, modules_suggested_max);
-        for (buffer[count..][0..modules], checker.memory.modules[0..modules]) |*slot, module| {
-            slot.* = module.name;
-        }
-        if (error_module.nearest(name, buffer[0 .. count + modules])) |near| {
-            error_module.hint(diagnostic, "did you mean `{s}`?", .{near});
-        }
-        return error.Checked;
-    }
-
-    /// Checks a call's arguments against its entry, and returns the call.
-    fn check_call(checker: *Checker, entry: *const Entry, index: u32) Fail!u32 {
-        const children = checker.tree.children(index);
-        var given: [schema.params_max]?u32 = @splat(null);
-        var positional: u32 = 0;
-        var named = false;
-        const positional_max = entry.positional_count();
-        for (children) |child| {
-            const it = checker.item(child);
-            if (it.tag == .named) {
-                named = true;
-                const name = checker.text(child);
-                const param = entry.param(name) orelse {
-                    var buffer: [schema.params_max][]const u8 = undefined;
-                    for (entry.params, 0..) |candidate, at| buffer[at] = candidate.name;
-                    const diagnostic = checker.fail_token(child, .unknown_parameter, "{s} has no parameter `{s}`", .{ entry.name, name });
-                    if (error_module.nearest(name, buffer[0..entry.params.len])) |near| {
-                        error_module.hint(diagnostic, "did you mean `{s}`?", .{near});
-                    }
-                    return error.Checked;
-                };
-                if (given[param] != null) {
-                    _ = checker.fail_token(child, .duplicate_argument, "`{s}` is given twice", .{name});
-                    return error.Checked;
-                }
-                given[param] = it.a;
-                continue;
-            }
-            if (named) {
-                const diagnostic = checker.fail(child, .positional_after_named, "an argument without a name comes after a named one", .{});
-                error_module.hint(diagnostic, "write it first, or give it its name", .{});
-                return error.Checked;
-            }
-            if (positional == positional_max) {
-                const diagnostic = checker.fail(child, .too_many_positional, "{s} takes {d} arguments without a name", .{ entry.name, positional_max });
-                error_module.hint(diagnostic, "name the others, such as `{s}: …`", .{entry.params[@min(positional_max, entry.params.len - 1)].name});
-                return error.Checked;
-            }
-            given[positional] = child;
-            positional += 1;
-        }
-        if (checker.value_count + entry.params.len > checker.memory.values.len) {
-            return checker.limit(index, "values", .tree, checker.memory.values.len);
-        }
-        if (checker.call_count == checker.memory.calls.len) {
-            return checker.limit(index, "calls", .tree, checker.memory.calls.len);
-        }
-        const first = checker.value_count;
-        checker.value_count += @intCast(entry.params.len);
-        // A `from` left out is the `to` of the tween `after` names, read once `after` is checked.
-        var from_after: ?u32 = null;
-        for (entry.params, 0..) |*param, at| {
-            const slot = first + at;
-            checker.memory.value_items[slot] = checker.site_of(given[at] orelse index);
-            if (given[at] == null and param.default == .after) {
-                checker.memory.values[slot] = .absent;
-                from_after = @intCast(at);
-                continue;
-            }
-            checker.memory.values[slot] = if (given[at]) |child|
-                try checker.argument(entry, param, child)
-            else
-                try checker.default_of(entry, param, index);
-        }
-        if (from_after) |at| {
-            checker.memory.values[first + at] = try checker.after_to(entry, index, &given, first, at);
-        }
-        const at = checker.call_count;
-        checker.memory.calls[at] = .{ .entry = entry, .values = first, .item = checker.site_of(index) };
-        checker.call_count += 1;
-        return at;
-    }
-
-    fn default_of(checker: *Checker, entry: *const Entry, param: *const schema.Param, index: u32) Fail!Value {
-        return switch (param.default) {
-            .required => {
-                const diagnostic = checker.fail_token(index, .missing_argument, "{s} needs `{s}`", .{ entry.name, param.name });
-                error_module.hint(diagnostic, "add `{s}: {s}`", .{ param.name, example_of(checker, param) });
-                return error.Checked;
-            },
-            .absent => .absent,
-            .number => |number| .{ .number = number },
-            .time => |flicks| .{ .time = flicks },
-            .word => |word| .{ .word = word },
-            .time_range => |range| .{ .time_range = range },
-            .unbounded => .{ .number_range = .{ -std.math.inf(f64), std.math.inf(f64) } },
-            .seed => .{ .seed = checker.derived_seed() },
-            .whole => .absent,
-            .text => |string| .{ .string = string },
-            // `check_call` fills it in from `after`, once `after` is checked (section 6b).
-            .after => unreachable,
-        };
-    }
-
-    /// The `to` of the tween a call's `after` names, for the `from` it leaves out (section 6b).
-    fn after_to(checker: *Checker, entry: *const Entry, index: u32, given: *const [schema.params_max]?u32, first: u32, from_at: u32) Fail!Value {
-        assert(checker.value_count >= first + entry.params.len);
-        const rule = entry.after.?;
-        const from = entry.params[from_at].name;
-        const after_at = entry.param(rule.by).?;
-        const after_item = given[after_at] orelse {
-            const diagnostic = checker.fail_token(index, .missing_argument, "{s} needs `{s}`", .{ entry.name, from });
-            error_module.hint(diagnostic, "`{s}` may be left out only when `{s}` names a {s}", .{ from, rule.by, entry.name });
-            return error.Checked;
-        };
-        // A client's entry may give `.after` to a parameter whose `by` is not a signal.
-        const after = checker.memory.values[first + after_at];
-        const named = if (after == .signal) checker.tween_named(entry, after.signal) else null;
-        const call = named orelse {
-            const diagnostic = checker.fail(after_item, .missing_argument, "{s} needs `{s}`, since `{s}` is not a name bound to a {s}", .{ entry.name, from, rule.by, entry.name });
-            error_module.hint(diagnostic, "`{s}` may be left out only when `{s}` names a {s}", .{ from, rule.by, entry.name });
-            return error.Checked;
-        };
-        const before = checker.memory.calls[call];
-        const to = checker.memory.values[before.values + before.entry.param(rule.takes).?];
-        assert(to == .number or to == .vector);
-        return to;
-    }
-
-    /// The tween call that `expr` names (section 6b): a name bound to a tween, or to a region of
-    /// one tween, or null. It reads two expressions and no more, so a chain costs nothing per link.
-    fn tween_named(checker: *const Checker, entry: *const Entry, expr: u32) ?u32 {
-        const name = checker.memory.exprs[expr];
-        if (name.tag != .binding or name.b != 0) return null;
-        const binding = checker.memory.bindings[name.a];
-        if (binding.kind != .signal) return null;
-        const node = checker.memory.exprs[binding.index];
-        if (node.tag != .call or node.b != 0) return null;
-        const call = checker.memory.calls[node.a];
-        if (same_call(call.entry, entry)) return node.a;
-        if (call.entry.op != .lanes) return null;
-        const body = checker.memory.exprs[checker.memory.values[call.values + 1].signal];
-        if (body.tag != .call or body.b != 0) return null;
-        if (!same_call(checker.memory.calls[body.a].entry, entry)) return null;
-        return body.a;
-    }
-
-    /// Whether `found` is a call of the entry `wanted` names: the same name and role.
-    fn same_call(found: *const Entry, wanted: *const Entry) bool {
-        return found.role == wanted.role and std.mem.eql(u8, found.name, wanted.name);
-    }
-
-    /// The parameter `index` names in the current frame, bound to its argument (section 6).
-    fn bound(checker: *const Checker, index: u32) ?Arg {
-        const slot = checker.bound_slot(index) orelse return null;
-        return checker.memory.frames[checker.frame].args[slot];
-    }
-
-    /// Which parameter of the current frame `index` names, if it is a parameter's name.
-    fn bound_slot(checker: *const Checker, index: u32) ?u32 {
-        const frame = &checker.memory.frames[checker.frame];
-        assert(checker.frame < checker.frame_count);
-        assert(frame.tree == checker.tree);
-        if (frame.module == null) return null;
-        const it = checker.tree.item(index);
-        if (it.tag != .name) return null;
-        const name = checker.tree.text(index);
-        for (0..frame.params) |at| {
-            if (std.mem.eql(u8, frame.tree.text(frame.param_items[at]), name)) return @intCast(at);
-        }
-        return null;
-    }
-
-    /// Checks a bound argument's signal in the frame it came from.
-    fn signal_in(checker: *Checker, arg: Arg) Fail!u32 {
-        const saved = checker.frame;
-        checker.focus(arg.frame);
-        defer checker.focus(saved);
-        return checker.signal(arg.item);
-    }
-
-    /// The entry called `name` in `role`: a primitive, else one of the client's nouns.
-    fn lookup(checker: *const Checker, name: []const u8, role: schema.Role) ?*const Entry {
-        if (checker.memory.vocabulary.find(name, role)) |entry| return entry;
-        for (&schema.language_entries) |*entry| {
-            if (entry.role == role and std.mem.eql(u8, entry.name, name)) return entry;
-        }
-        for (checker.memory.clients) |*entry| {
-            if (entry.role == role and std.mem.eql(u8, entry.name, name)) return entry;
-        }
-        return null;
-    }
-
-    fn find_module(checker: *const Checker, name: []const u8) ?u32 {
-        for (checker.memory.modules[0..checker.module_count], 0..) |module, at| {
-            if (std.mem.eql(u8, module.name, name)) return @intCast(at);
-        }
-        return null;
-    }
-
-    /// Records a module of `tree`, declared at `index`. Errors are reported at `report`, the
-    /// file's `use` line for a library's module, so they point into the file.
-    fn add_module(checker: *Checker, tree: *const Tree, index: u32, report: u32) Fail!void {
-        const name = tree.token_text(tree.item(index).token);
-        for (reserved) |word| {
-            if (std.mem.eql(u8, word, name)) {
-                const diagnostic = checker.fail(report, .reserved_name, "`{s}` is a keyword, not a module's name", .{name});
+            if (checker.lookup(name, .signal) != null or checker.lookup(name, .mover) != null) {
+                const diagnostic = checker.fail(report, .reserved_name, "`{s}` is a primitive, not a module's name", .{name});
                 error_module.hint(diagnostic, "choose another name, such as `{s}_1`", .{name});
                 return error.Checked;
             }
-        }
-        if (checker.lookup(name, .signal) != null or checker.lookup(name, .mover) != null) {
-            const diagnostic = checker.fail(report, .reserved_name, "`{s}` is a primitive, not a module's name", .{name});
-            error_module.hint(diagnostic, "choose another name, such as `{s}_1`", .{name});
-            return error.Checked;
-        }
-        if (checker.find_module(name) != null) {
-            const diagnostic = checker.fail(report, .duplicate_name, "the module `{s}` is declared twice", .{name});
-            error_module.hint(diagnostic, "rename one of them, or remove the `use` that brings it in", .{});
-            return error.Checked;
-        }
-        const params = tree.children(tree.item(index).a);
-        for (params, 0..) |param, at| {
-            const param_name = tree.token_text(tree.item(param).token);
-            for (params[0..at]) |earlier| {
-                if (!std.mem.eql(u8, tree.token_text(tree.item(earlier).token), param_name)) continue;
-                // At the second one in the file; at the `use` for a library's module.
-                const at_item = if (tree == checker.root) param else report;
-                const diagnostic = checker.fail_token(at_item, .duplicate_name, "`{s}` is a parameter of `{s}` twice", .{ param_name, name });
-                error_module.hint(diagnostic, "rename one of them", .{});
+            if (checker.find_module(name) != null) {
+                const diagnostic = checker.fail(report, .duplicate_name, "the module `{s}` is declared twice", .{name});
+                error_module.hint(diagnostic, "rename one of them, or remove the `use` that brings it in", .{});
                 return error.Checked;
             }
-        }
-        for (params) |param| {
-            const default = tree.item(param).a;
-            if (default == 0 or tree.item(default - 1).tag == .literal) continue;
-            if (folds_alone(tree, default - 1, params, false, 0)) continue;
-            const diagnostic = checker.fail(report, .wrong_type, "the default of `{s}` in {s} is not a literal", .{ tree.text(param), name });
-            error_module.hint(diagnostic, "a default is a number, a time, or a frequency, such as `0.25s`", .{});
-            return error.Checked;
-        }
-        if (tree.children(tree.item(index).a).len > schema.params_max) {
-            const diagnostic = checker.fail(report, .limit, "`{s}` has more than {d} parameters", .{ name, schema.params_max });
-            error_module.hint(diagnostic, "a module takes at most {d}; split it", .{schema.params_max});
-            return error.Checked;
-        }
-        if (checker.module_count == checker.memory.modules.len) {
-            return checker.limit(report, "modules", .modules, checker.memory.modules.len);
-        }
-        checker.memory.modules[checker.module_count] = .{ .name = name, .tree = tree, .item = index };
-        checker.module_count += 1;
-    }
-
-    /// `use name`: every module of the library `name` joins the file's table.
-    fn use_library(checker: *Checker, index: u32) Fail!void {
-        const name = checker.tree.token_text(checker.item(index).token);
-        for (checker.memory.libraries) |library| {
-            if (!std.mem.eql(u8, library.name, name)) continue;
-            for (library.tree.declarations) |declaration_index| {
-                if (library.tree.item(declaration_index).tag != .module) continue;
-                try checker.add_module(library.tree, declaration_index, index);
+            const params = tree.children(tree.item(index).a);
+            for (params, 0..) |param, at| {
+                const param_name = tree.token_text(tree.item(param).token);
+                for (params[0..at]) |earlier| {
+                    if (!std.mem.eql(u8, tree.token_text(tree.item(earlier).token), param_name)) continue;
+                    // At the second one in the file; at the `use` for a library's module.
+                    const at_item = if (tree == checker.root) param else report;
+                    const diagnostic = checker.fail_token(at_item, .duplicate_name, "`{s}` is a parameter of `{s}` twice", .{ param_name, name });
+                    error_module.hint(diagnostic, "rename one of them", .{});
+                    return error.Checked;
+                }
             }
-            return;
-        }
-        const diagnostic = checker.fail_token(index, .unknown_library, "there is no library `{s}`", .{name});
-        error_module.hint(diagnostic, "pass it to `compile_with` under its name", .{});
-        return error.Checked;
-    }
-
-    /// Records the file's modules and its `use` lines, before any declaration is checked, so a
-    /// module can be used above or below its declaration.
-    fn register(checker: *Checker, tree: *const Tree) void {
-        for (tree.declarations) |index| {
-            switch (tree.item(index).tag) {
-                .module => checker.add_module(tree, index, index) catch {},
-                .use => checker.use_library(index) catch {},
-                else => {},
-            }
-        }
-    }
-
-    /// Expands the module `module` for `call` (an item of the current frame): binds each
-    /// parameter, and returns the new frame. The caller checks the body there, then frees the
-    /// frame by resetting `frame_count`.
-    fn enter_module(checker: *Checker, module: u32, call: u32) Fail!u32 {
-        const found = checker.memory.modules[module];
-        assert(module < checker.module_count);
-        assert(checker.frame < checker.frame_count);
-        var chain = checker.frame;
-        for (0..checker.frame_count) |_| {
-            if (checker.memory.frames[chain].module == module) return checker.module_cycle(module, call);
-            if (chain == 0) break;
-            chain = checker.memory.frames[chain].parent;
-        }
-        if (checker.frame_count == checker.memory.frames.len) {
-            const diagnostic = checker.fail(call, .limit, "the modules nest deeper than {d}", .{module_depth_max});
-            error_module.hint(diagnostic, "a module that calls a module nests one deeper; flatten the patch", .{});
-            return error.Checked;
-        }
-        const caller = checker.frame;
-        const module_tree = found.tree;
-        const module_item = module_tree.item(found.item);
-        const params = module_tree.children(module_item.a);
-        var given: [schema.params_max]?u32 = @splat(null);
-        try checker.match_module(module_tree, found.name, params, call, &given);
-        const frame_index = checker.frame_count;
-        const caller_frame = &checker.memory.frames[caller];
-        const ordinal = caller_frame.instances;
-        caller_frame.instances += 1;
-        var frame: Frame = .{
-            .tree = module_tree,
-            .site = if (checker.is_library(caller)) caller_frame.site else call,
-            .module = module,
-            .parent = caller,
-            .body = module_item.b,
-            .seed_base = checker.memory.vocabulary.seed_hash(caller_frame.seed_base, std.hash.Fnv1a_64.hash(found.name) +% ordinal),
-            .params = @intCast(params.len),
-        };
-        for (params, 0..) |param, at| {
-            const param_item = module_tree.item(param);
-            frame.param_items[at] = param;
-            if (given[at]) |child| {
-                frame.args[at] = .{ .item = child, .frame = caller };
-            } else if (param_item.a != 0) {
-                frame.args[at] = .{ .item = param_item.a - 1, .frame = frame_index };
-            } else {
-                const diagnostic = checker.fail(call, .missing_argument, "{s} needs `{s}`", .{ found.name, module_tree.text(param) });
-                error_module.hint(diagnostic, "add `{s}: …`", .{module_tree.text(param)});
+            for (params) |param| {
+                const default = tree.item(param).a;
+                if (default == 0 or tree.item(default - 1).tag == .literal) continue;
+                if (folds_alone(tree, default - 1, params, false, 0)) continue;
+                const diagnostic = checker.fail(report, .wrong_type, "the default of `{s}` in {s} is not a literal", .{ tree.text(param), name });
+                error_module.hint(diagnostic, "a default is a number, a time, or a frequency, such as `0.25s`", .{});
                 return error.Checked;
             }
+            if (tree.children(tree.item(index).a).len > schema.params_max) {
+                const diagnostic = checker.fail(report, .limit, "`{s}` has more than {d} parameters", .{ name, schema.params_max });
+                error_module.hint(diagnostic, "a module takes at most {d}; split it", .{schema.params_max});
+                return error.Checked;
+            }
+            if (checker.module_count == checker.memory.modules.len) {
+                return checker.limit(report, "modules", .modules, checker.memory.modules.len);
+            }
+            checker.memory.modules[checker.module_count] = .{ .name = name, .tree = tree, .item = index };
+            checker.module_count += 1;
         }
-        checker.memory.frames[frame_index] = frame;
-        checker.frame_count += 1;
-        if (module_item.c != 0) {
-            const saved = checker.frame;
-            checker.focus(frame_index);
-            defer checker.focus(saved);
-            checker.memory.frames[frame_index].declared = checker.number_range(module_item.c - 1) catch |err| {
-                checker.frame_count = frame_index;
-                return err;
+
+        /// `use name`: every module of the library `name` joins the file's table.
+        fn use_library(checker: *Checker, index: u32) Fail!void {
+            const name = checker.tree.token_text(checker.item(index).token);
+            for (checker.memory.libraries) |library| {
+                if (!std.mem.eql(u8, library.name, name)) continue;
+                for (library.tree.declarations) |declaration_index| {
+                    if (library.tree.item(declaration_index).tag != .module) continue;
+                    try checker.add_module(library.tree, declaration_index, index);
+                }
+                return;
+            }
+            const diagnostic = checker.fail_token(index, .unknown_library, "there is no library `{s}`", .{name});
+            error_module.hint(diagnostic, "pass it to `compile_with` under its name", .{});
+            return error.Checked;
+        }
+
+        /// Records the file's modules and its `use` lines, before any declaration is checked, so a
+        /// module can be used above or below its declaration.
+        fn register(checker: *Checker, tree: *const Tree) void {
+            for (tree.declarations) |index| {
+                switch (tree.item(index).tag) {
+                    .module => checker.add_module(tree, index, index) catch {},
+                    .use => checker.use_library(index) catch {},
+                    else => {},
+                }
+            }
+        }
+
+        /// Expands the module `module` for `call` (an item of the current frame): binds each
+        /// parameter, and returns the new frame. The caller checks the body there, then frees the
+        /// frame by resetting `frame_count`.
+        fn enter_module(checker: *Checker, module: u32, call: u32) Fail!u32 {
+            const found = checker.memory.modules[module];
+            assert(module < checker.module_count);
+            assert(checker.frame < checker.frame_count);
+            var chain = checker.frame;
+            for (0..checker.frame_count) |_| {
+                if (checker.memory.frames[chain].module == module) return checker.module_cycle(module, call);
+                if (chain == 0) break;
+                chain = checker.memory.frames[chain].parent;
+            }
+            if (checker.frame_count == checker.memory.frames.len) {
+                const diagnostic = checker.fail(call, .limit, "the modules nest deeper than {d}", .{module_depth_max});
+                error_module.hint(diagnostic, "a module that calls a module nests one deeper; flatten the patch", .{});
+                return error.Checked;
+            }
+            const caller = checker.frame;
+            const module_tree = found.tree;
+            const module_item = module_tree.item(found.item);
+            const params = module_tree.children(module_item.a);
+            var given: [schema.params_max]?u32 = @splat(null);
+            try checker.match_module(module_tree, found.name, params, call, &given);
+            const frame_index = checker.frame_count;
+            const caller_frame = &checker.memory.frames[caller];
+            const ordinal = caller_frame.instances;
+            caller_frame.instances += 1;
+            var frame: Frame = .{
+                .tree = module_tree,
+                .site = if (checker.is_library(caller)) caller_frame.site else call,
+                .module = module,
+                .parent = caller,
+                .body = module_item.b,
+                .seed_base = vocabulary.seed_hash(caller_frame.seed_base, std.hash.Fnv1a_64.hash(found.name) +% ordinal),
+                .params = @intCast(params.len),
             };
-        }
-        return frame_index;
-    }
-
-    /// Matches a module call's arguments to its parameters, as a primitive's are matched.
-    fn match_module(
-        checker: *Checker,
-        module_tree: *const Tree,
-        name: []const u8,
-        params: []const u32,
-        call: u32,
-        given: *[schema.params_max]?u32,
-    ) Fail!void {
-        var positional: u32 = 0;
-        var named = false;
-        for (checker.tree.children(call)) |child| {
-            const it = checker.item(child);
-            if (it.tag == .named) {
-                named = true;
-                const argument_name = checker.text(child);
-                var slot: ?usize = null;
-                for (params, 0..) |param, at| {
-                    if (std.mem.eql(u8, module_tree.text(param), argument_name)) {
-                        slot = at;
-                        break;
-                    }
-                }
-                const at = slot orelse {
-                    var names: [schema.params_max][]const u8 = undefined;
-                    for (params, 0..) |param, k| names[k] = module_tree.text(param);
-                    const diagnostic = checker.fail_token(child, .unknown_parameter, "{s} has no parameter `{s}`", .{ name, argument_name });
-                    if (error_module.nearest(argument_name, names[0..params.len])) |near| {
-                        error_module.hint(diagnostic, "did you mean `{s}`?", .{near});
-                    }
-                    return error.Checked;
-                };
-                if (given[at] != null) {
-                    _ = checker.fail_token(child, .duplicate_argument, "`{s}` is given twice", .{argument_name});
-                    return error.Checked;
-                }
-                given[at] = it.a;
-                continue;
-            }
-            if (named) {
-                const diagnostic = checker.fail(child, .positional_after_named, "an argument without a name comes after a named one", .{});
-                error_module.hint(diagnostic, "write it first, or give it its name", .{});
-                return error.Checked;
-            }
-            if (positional == params.len) {
-                const diagnostic = checker.fail(child, .too_many_positional, "{s} takes {d} arguments", .{ name, params.len });
-                if (params.len == 0) {
-                    error_module.hint(diagnostic, "call it with none, `{s}()`", .{name});
+            for (params, 0..) |param, at| {
+                const param_item = module_tree.item(param);
+                frame.param_items[at] = param;
+                if (given[at]) |child| {
+                    frame.args[at] = .{ .item = child, .frame = caller };
+                } else if (param_item.a != 0) {
+                    frame.args[at] = .{ .item = param_item.a - 1, .frame = frame_index };
                 } else {
-                    error_module.hint(diagnostic, "remove the extra ones", .{});
+                    const diagnostic = checker.fail(call, .missing_argument, "{s} needs `{s}`", .{ found.name, module_tree.text(param) });
+                    error_module.hint(diagnostic, "add `{s}: …`", .{module_tree.text(param)});
+                    return error.Checked;
                 }
-                return error.Checked;
             }
-            given[positional] = child;
-            positional += 1;
-        }
-    }
-
-    /// The error for a module that reaches itself: the modules on the chain of callers, from the
-    /// first time it was called, then itself again.
-    fn module_cycle(checker: *Checker, module: u32, call: u32) Fail!u32 {
-        var chain_modules: [frames_max]u32 = undefined;
-        var count: usize = 0;
-        var chain = checker.frame;
-        for (0..checker.frame_count) |_| {
-            const frame = checker.memory.frames[chain];
-            const of = frame.module orelse break;
-            chain_modules[count] = of;
-            count += 1;
-            if (of == module) break;
-            chain = frame.parent;
-        }
-        assert(count > 0);
-        assert(chain_modules[count - 1] == module);
-        var path: [error_module.hint_len_max]u8 = undefined;
-        var length: usize = 0;
-        var at = count;
-        while (at > 0) {
-            at -= 1;
-            length = append_name(&path, length, checker.memory.modules[chain_modules[at]].name);
-            length = append_name(&path, length, " -> ");
-        }
-        length = append_name(&path, length, checker.memory.modules[module].name);
-        const diagnostic = checker.fail(call, .module_cycle, "the module `{s}` uses itself", .{checker.memory.modules[module].name});
-        error_module.hint(diagnostic, "the cycle is {s}; break it with a parameter or a primitive", .{path[0..length]});
-        return error.Checked;
-    }
-
-    fn append_name(buffer: []u8, length: usize, chunk: []const u8) usize {
-        const room = buffer.len - length;
-        const count = @min(room, chunk.len);
-        @memcpy(buffer[length..][0..count], chunk[0..count]);
-        return length + count;
-    }
-
-    /// `module(args)` as a signal: its body, checked in its frame.
-    fn expand_signal(checker: *Checker, module: u32, call: u32) Fail!u32 {
-        const frame = try checker.enter_module(module, call);
-        defer checker.frame_count = frame;
-        const saved = checker.frame;
-        checker.focus(frame);
-        defer checker.focus(saved);
-        const expr = try checker.signal(checker.memory.frames[frame].body);
-        checker.declared_last = checker.memory.frames[frame].declared;
-        return expr;
-    }
-
-    /// A mover: a primitive mover, or a module whose body is one (section 6).
-    fn mover_of(checker: *Checker, index: u32, param: []const u8) Fail!u32 {
-        if (checker.bound(index)) |arg| {
-            const saved = checker.frame;
-            checker.focus(arg.frame);
-            defer checker.focus(saved);
-            return checker.mover_of(arg.item, param);
-        }
-        const it = checker.item(index);
-        if (it.tag == .call) {
-            const name = checker.text(index);
-            if (checker.lookup(name, .mover)) |entry| return checker.check_call(entry, index);
-            if (checker.find_module(name)) |module| {
-                const frame = try checker.enter_module(module, index);
-                defer checker.frame_count = frame;
+            checker.memory.frames[frame_index] = frame;
+            checker.frame_count += 1;
+            if (module_item.c != 0) {
                 const saved = checker.frame;
-                checker.focus(frame);
+                checker.focus(frame_index);
                 defer checker.focus(saved);
-                return checker.mover_of(checker.memory.frames[frame].body, param);
+                checker.memory.frames[frame_index].declared = checker.number_range(module_item.c - 1) catch |err| {
+                    checker.frame_count = frame_index;
+                    return err;
+                };
             }
+            return frame_index;
         }
-        const diagnostic = checker.fail(index, .wrong_type, "`{s}` takes a mover", .{param});
-        var buffer: [hint_list_size]u8 = undefined;
-        const examples = checker.mover_examples(&buffer);
-        if (examples.len > 0) error_module.hint(diagnostic, "{s}", .{examples});
-        return error.Checked;
-    }
 
-    fn shape_of(checker: *const Checker, expr: u32) Shape {
-        return checker.memory.exprs[expr].shape;
-    }
-
-    fn lanes_of(checker: *const Checker, expr: u32) u32 {
-        return checker.memory.exprs[expr].lanes;
-    }
-
-    /// Refuses a signal whose shape or lanes the parameter's `need` does not take (step 55b).
-    fn expect_need(checker: *Checker, index: u32, entry: *const Entry, param: *const schema.Param, expr: u32) Fail!void {
-        const need = param.need;
-        const shape = checker.shape_of(expr);
-        const lanes = checker.lanes_of(expr);
-        const shape_fits = if (need.colour) shape.colour else if (need.components == 0) true else (!shape.colour and shape.components == need.components);
-        const lanes_fit = switch (need.lanes) {
-            .any => true,
-            .one => lanes == 1,
-            .many => lanes >= 2,
-        };
-        if (shape_fits and lanes_fit) return;
-        var need_buffer: [need_text_size]u8 = undefined;
-        var found_buffer: [need_text_size]u8 = undefined;
-        _ = checker.fail(index, .wrong_shape, "`{s}` of {s} takes {s}, and this is {s}", .{
-            param.name,
-            entry.name,
-            need_text(need, &need_buffer),
-            found_text(shape, lanes, &found_buffer),
-        });
-        return error.Checked;
-    }
-
-    /// Refuses a number outside its parameter's `range`, at the number's own item: a whole
-    /// number where the parameter is an `integer` (section 3).
-    fn in_range(checker: *Checker, index: u32, param: *const schema.Param, number: f64) Fail!void {
-        const range = param.range orelse return;
-        const whole = param.kind != .integer or @floor(number) == number;
-        if (number >= range[0] and number <= range[1] and whole) return;
-        const diagnostic = if (param.kind == .integer)
-            checker.fail(index, .out_of_range, "`{s}` is a whole number from {d} to {d}", .{ param.name, range[0], range[1] })
-        else
-            checker.fail(index, .out_of_range, "`{s}` is from {d} to {d}", .{ param.name, range[0], range[1] });
-        if (param.hint.len > 0) error_module.hint(diagnostic, "{s}", .{param.hint});
-        return error.Checked;
-    }
-
-    /// `lanes(n, …)`'s count: opens a region of n lanes for its body (section 9).
-    fn open_region(checker: *Checker, index: u32, number: f64) Fail!void {
-        if (checker.region) |count| {
-            const diagnostic = checker.fail(index, .wrong_lanes, "a region of lanes is inside `lanes({d}, …)`", .{count});
-            error_module.hint(diagnostic, "regions do not nest; give the outer region the lanes of both", .{});
-            return error.Checked;
-        }
-        if (!(number >= 1 and number <= lanes_max)) {
-            const diagnostic = checker.fail(index, .out_of_range, "a region has from 1 to {d} lanes", .{lanes_max});
-            error_module.hint(diagnostic, "for example `lanes(1000, …)`", .{});
-            return error.Checked;
-        }
-        checker.region = @intFromFloat(number);
-    }
-
-    /// `lane`: each lane's index, inside a region (section 9).
-    fn lane_index(checker: *Checker, index: u32) Fail!u32 {
-        const count = checker.region orelse {
-            const diagnostic = checker.fail(index, .wrong_lanes, "`lane` is a lane's index, so it is used inside `lanes(n, …)`", .{});
-            error_module.hint(diagnostic, "wrap the expression in a region, such as `lanes(1000, lane * 0.001)`", .{});
-            return error.Checked;
-        };
-        return checker.push_expr(.{ .tag = .lane, .item = index, .lanes = count });
-    }
-
-    /// The lanes of `left` and `right` together (section 9): one lane is broadcast, and two
-    /// counts above 1 must be equal.
-    fn join_lanes(checker: *Checker, index: u32, left: u32, right: u32) Fail!u32 {
-        return checker.joined(index, checker.lanes_of(left), checker.lanes_of(right));
-    }
-
-    fn joined(checker: *Checker, index: u32, a: u32, b: u32) Fail!u32 {
-        if (a == b or b == 1) return a;
-        if (a == 1) return b;
-        const diagnostic = checker.fail(index, .wrong_lanes, "{d} lanes and {d} lanes do not go together", .{ a, b });
-        error_module.hint(diagnostic, "lanes meet where their counts are equal, or where one side has one lane", .{});
-        return error.Checked;
-    }
-
-    /// Refuses a signal of many lanes where `name` takes one value for every lane (section 9).
-    fn expect_one_lane(checker: *Checker, index: u32, expr: u32, name: []const u8) Fail!void {
-        const lanes = checker.lanes_of(expr);
-        if (lanes == 1) return;
-        const diagnostic = checker.fail(index, .wrong_lanes, "`{s}` takes one value for every lane, found {d} lanes", .{ name, lanes });
-        error_module.hint(diagnostic, "a node has one law; let the lanes differ in what it reads instead", .{});
-        return error.Checked;
-    }
-
-    /// Holds every signal a mover reads to one lane: its law is one node (section 9).
-    fn expect_mover_one_lane(checker: *Checker, mover: u32) Fail!void {
-        const mover_entry = checker.memory.calls[mover].entry;
-        const mover_first = checker.memory.calls[mover].values;
-        const mover_values = checker.memory.values[mover_first..][0..mover_entry.params.len];
-        const mover_items = checker.memory.value_items[mover_first..][0..mover_entry.params.len];
-        assert(mover_entry.role == .mover);
-        for (mover_entry.params, mover_values, mover_items) |param, value, value_item| {
-            if (value == .signal) try checker.expect_one_lane(value_item, value.signal, param.name);
-        }
-    }
-
-    /// The lanes of a call (section 9): a per-lane source's region, else the most of its signals'.
-    fn call_lanes(checker: *Checker, call: u32, index: u32) Fail!u32 {
-        const entry = checker.memory.calls[call].entry;
-        const first = checker.memory.calls[call].values;
-        const values = checker.memory.values[first..][0..entry.params.len];
-        const items = checker.memory.value_items[first..][0..entry.params.len];
-        for (entry.params, values, items) |param, value, value_item| {
-            if (param.live and value == .signal) try checker.expect_one_lane(value_item, value.signal, param.name);
-        }
-        for (entry.params, values) |param, value| {
-            if (param.kind != .mover or value != .mover) continue;
-            try checker.expect_mover_one_lane(value.mover);
-        }
-        var lanes: u32 = 1;
-        // The rule `describe` prints for the call, so the two cannot differ.
-        switch (entry.lane_rule()) {
-            .makes => return @intCast(values[0].integer),
-            .region => return checker.region orelse 1,
-            .stagger => {
-                const at = entry.param("stagger").?;
-                if (checker.call_by_lane(entry, values)) {
-                    if (values[at].time != 0) {
-                        const diagnostic = checker.fail(items[at], .wrong_lanes, "`stagger:` and a cue chosen by lane both set when each lane starts", .{});
-                        error_module.hint(diagnostic, "each lane already starts at its own cue; drop `stagger:`", .{});
+        /// Matches a module call's arguments to its parameters, as a primitive's are matched.
+        fn match_module(
+            checker: *Checker,
+            module_tree: *const Tree,
+            name: []const u8,
+            params: []const u32,
+            call: u32,
+            given: *[schema.params_max]?u32,
+        ) Fail!void {
+            var positional: u32 = 0;
+            var named = false;
+            for (checker.tree.children(call)) |child| {
+                const it = checker.item(child);
+                if (it.tag == .named) {
+                    named = true;
+                    const argument_name = checker.text(child);
+                    var slot: ?usize = null;
+                    for (params, 0..) |param, at| {
+                        if (std.mem.eql(u8, module_tree.text(param), argument_name)) {
+                            slot = at;
+                            break;
+                        }
+                    }
+                    const at = slot orelse {
+                        var names: [schema.params_max][]const u8 = undefined;
+                        for (params, 0..) |param, k| names[k] = module_tree.text(param);
+                        const diagnostic = checker.fail_token(child, .unknown_parameter, "{s} has no parameter `{s}`", .{ name, argument_name });
+                        if (error_module.nearest(argument_name, names[0..params.len])) |near| {
+                            error_module.hint(diagnostic, "did you mean `{s}`?", .{near});
+                        }
+                        return error.Checked;
+                    };
+                    if (given[at] != null) {
+                        _ = checker.fail_token(child, .duplicate_argument, "`{s}` is given twice", .{argument_name});
                         return error.Checked;
                     }
-                    // `cue_ref` found the region.
-                    lanes = checker.region.?;
-                } else if (values[at].time != 0) lanes = checker.region orelse {
-                    const diagnostic = checker.fail(items[at], .wrong_lanes, "`stagger:` spreads lanes in time, so it is used inside `lanes(n, …)`", .{});
-                    error_module.hint(diagnostic, "wrap the call in a region, or drop `stagger:`", .{});
+                    given[at] = it.a;
+                    continue;
+                }
+                if (named) {
+                    const diagnostic = checker.fail(child, .positional_after_named, "an argument without a name comes after a named one", .{});
+                    error_module.hint(diagnostic, "write it first, or give it its name", .{});
                     return error.Checked;
-                };
-            },
-            .inputs, .one => {},
-            .apart => return 1,
+                }
+                if (positional == params.len) {
+                    const diagnostic = checker.fail(child, .too_many_positional, "{s} takes {d} arguments", .{ name, params.len });
+                    if (params.len == 0) {
+                        error_module.hint(diagnostic, "call it with none, `{s}()`", .{name});
+                    } else {
+                        error_module.hint(diagnostic, "remove the extra ones", .{});
+                    }
+                    return error.Checked;
+                }
+                given[positional] = child;
+                positional += 1;
+            }
         }
-        for (entry.params, values) |param, value| {
-            if (value != .signal or param.live) continue;
-            lanes = try checker.joined(index, lanes, checker.lanes_of(value.signal));
-        }
-        return lanes;
-    }
 
-    /// Whether a call's lanes each start at their own cue (section 9a): the parameter its entry
-    /// declares `by_lane` has a cue by lane, or a path whose one goal, one a run, has the flag.
-    fn call_by_lane(checker: *const Checker, entry: *const Entry, values: []const Value) bool {
-        assert(values.len == entry.params.len);
-        for (entry.params, values) |param, value| {
-            if (!param.by_lane) continue;
-            if (param.kind == .cue) return value == .cue_by_lane;
-            assert(param.kind == .path);
-            if (value != .path) return false;
-            const run = checker.memory.paths[value.path];
-            assert(run.count > 0);
-            const by_lane = checker.memory.goals[run.first].cue_by_lane;
-            if (by_lane) assert(run.count == 1);
-            return by_lane;
-        }
-        return false;
-    }
-
-    /// The shape of `left` and `right` together (section 8): theirs when equal, the other's when
-    /// one is a number; a colour and a vector, two vectors of different sizes, and a product of
-    /// two colours are refused.
-    fn combine(checker: *Checker, index: u32, left: u32, right: u32, product: bool) Fail!Shape {
-        const a = checker.shape_of(left);
-        const b = checker.shape_of(right);
-        if (product and a.colour and b.colour) {
-            const diagnostic = checker.fail(index, .wrong_shape, "two colours do not multiply", .{});
-            error_module.hint(diagnostic, "scale a colour by a number, or multiply components, such as `a.l * b.l`", .{});
+        /// The error for a module that reaches itself: the modules on the chain of callers, from
+        /// the first time it was called, then itself again.
+        fn module_cycle(checker: *Checker, module: u32, call: u32) Fail!u32 {
+            var chain_modules: [frames_max]u32 = undefined;
+            var count: usize = 0;
+            var chain = checker.frame;
+            for (0..checker.frame_count) |_| {
+                const frame = checker.memory.frames[chain];
+                const of = frame.module orelse break;
+                chain_modules[count] = of;
+                count += 1;
+                if (of == module) break;
+                chain = frame.parent;
+            }
+            assert(count > 0);
+            assert(chain_modules[count - 1] == module);
+            var path: [error_module.hint_len_max]u8 = undefined;
+            var length: usize = 0;
+            var at = count;
+            while (at > 0) {
+                at -= 1;
+                length = append_name(&path, length, checker.memory.modules[chain_modules[at]].name);
+                length = append_name(&path, length, " -> ");
+            }
+            length = append_name(&path, length, checker.memory.modules[module].name);
+            const diagnostic = checker.fail(call, .module_cycle, "the module `{s}` uses itself", .{checker.memory.modules[module].name});
+            error_module.hint(diagnostic, "the cycle is {s}; break it with a parameter or a primitive", .{path[0..length]});
             return error.Checked;
         }
-        if (a.eql(b) or b.eql(Shape.scalar)) return a;
-        if (a.eql(Shape.scalar)) return b;
-        const diagnostic = checker.fail(index, .wrong_shape, "{s} and {s} do not go together", .{ a.noun(), b.noun() });
-        if (a.colour or b.colour) {
-            error_module.hint(diagnostic, "a colour's components are `.l .a .b`; take one to mix it with a vector", .{});
-        } else {
-            error_module.hint(diagnostic, "make them one size, or take a component such as `.x`", .{});
+
+        fn append_name(buffer: []u8, length: usize, chunk: []const u8) usize {
+            const room = buffer.len - length;
+            const count = @min(room, chunk.len);
+            @memcpy(buffer[length..][0..count], chunk[0..count]);
+            return length + count;
         }
-        return error.Checked;
-    }
 
-    /// Refuses a vector or a colour where `name` takes one value (section 8).
-    fn expect_scalar(checker: *Checker, index: u32, expr: u32, name: []const u8) Fail!void {
-        const shape = checker.shape_of(expr);
-        if (shape.eql(Shape.scalar)) return;
-        const diagnostic = checker.fail(index, .wrong_shape, "`{s}` takes one value, found {s}", .{ name, shape.noun() });
-        error_module.hint(diagnostic, "take a component, such as `.{s}`", .{shape.component_names()[0]});
-        return error.Checked;
-    }
+        /// `module(args)` as a signal: its body, checked in its frame.
+        fn expand_signal(checker: *Checker, module: u32, call: u32) Fail!u32 {
+            const frame = try checker.enter_module(module, call);
+            defer checker.frame_count = frame;
+            const saved = checker.frame;
+            checker.focus(frame);
+            defer checker.focus(saved);
+            const expr = try checker.signal(checker.memory.frames[frame].body);
+            checker.declared_last = checker.memory.frames[frame].declared;
+            return expr;
+        }
 
-    /// The shape of a call (section 8): what its entry says its value is, from its parameters.
-    fn call_shape(checker: *Checker, call: u32, index: u32) Fail!Shape {
-        const entry = checker.memory.calls[call].entry;
-        const values = checker.memory.values[checker.memory.calls[call].values..][0..entry.params.len];
-        assert(values.len == entry.params.len);
-        switch (entry.shape) {
-            .one => return Shape.scalar,
-            .of => |name| return checker.value_shape(values[entry.param(name).?]),
-            .agree => |names| {
-                const shape = try checker.call_agree(entry, values, index, names);
-                try checker.after_shape(entry, values, index, shape);
-                return shape;
-            },
-            .combine => |names| {
-                const left = values[entry.param(names[0]).?].signal;
-                return checker.combine(index, left, values[entry.param(names[1]).?].signal, false);
-            },
-            .constructor => |constructor| return .{
+        /// A mover: a primitive mover, or a module whose body is one (section 6).
+        fn mover_of(checker: *Checker, index: u32, param: []const u8) Fail!u32 {
+            if (checker.bound(index)) |arg| {
+                const saved = checker.frame;
+                checker.focus(arg.frame);
+                defer checker.focus(saved);
+                return checker.mover_of(arg.item, param);
+            }
+            const it = checker.item(index);
+            if (it.tag == .call) {
+                const name = checker.text(index);
+                if (checker.lookup(name, .mover)) |entry| return checker.check_call(entry, index);
+                if (checker.find_module(name)) |module| {
+                    const frame = try checker.enter_module(module, index);
+                    defer checker.frame_count = frame;
+                    const saved = checker.frame;
+                    checker.focus(frame);
+                    defer checker.focus(saved);
+                    return checker.mover_of(checker.memory.frames[frame].body, param);
+                }
+            }
+            const diagnostic = checker.fail(index, .wrong_type, "`{s}` takes a mover", .{param});
+            var buffer: [hint_list_size]u8 = undefined;
+            const examples = checker.mover_examples(&buffer);
+            if (examples.len > 0) error_module.hint(diagnostic, "{s}", .{examples});
+            return error.Checked;
+        }
+
+        fn shape_of(checker: *const Checker, expr: u32) Shape {
+            return checker.memory.exprs[expr].shape;
+        }
+
+        fn lanes_of(checker: *const Checker, expr: u32) u32 {
+            return checker.memory.exprs[expr].lanes;
+        }
+
+        /// Refuses a signal whose shape or lanes the parameter's `need` does not take (step 55b).
+        fn expect_need(checker: *Checker, index: u32, entry: *const Entry, param: *const schema.Param, expr: u32) Fail!void {
+            const need = param.need;
+            const shape = checker.shape_of(expr);
+            const lanes = checker.lanes_of(expr);
+            const shape_fits = if (need.colour) shape.colour else if (need.components == 0) true else (!shape.colour and shape.components == need.components);
+            const lanes_fit = switch (need.lanes) {
+                .any => true,
+                .one => lanes == 1,
+                .many => lanes >= 2,
+            };
+            if (shape_fits and lanes_fit) return;
+            var need_buffer: [need_text_size]u8 = undefined;
+            var found_buffer: [need_text_size]u8 = undefined;
+            _ = checker.fail(index, .wrong_shape, "`{s}` of {s} takes {s}, and this is {s}", .{
+                param.name,
+                entry.name,
+                need_text(need, &need_buffer),
+                found_text(shape, lanes, &found_buffer),
+            });
+            return error.Checked;
+        }
+
+        /// Refuses a number outside its parameter's `range`, at the number's own item: a whole
+        /// number where the parameter is an `integer` (section 3).
+        fn in_range(checker: *Checker, index: u32, param: *const schema.Param, number: f64) Fail!void {
+            const range = param.range orelse return;
+            const whole = param.kind != .integer or @floor(number) == number;
+            if (number >= range[0] and number <= range[1] and whole) return;
+            const diagnostic = if (param.kind == .integer)
+                checker.fail(index, .out_of_range, "`{s}` is a whole number from {d} to {d}", .{ param.name, range[0], range[1] })
+            else
+                checker.fail(index, .out_of_range, "`{s}` is from {d} to {d}", .{ param.name, range[0], range[1] });
+            if (param.hint.len > 0) error_module.hint(diagnostic, "{s}", .{param.hint});
+            return error.Checked;
+        }
+
+        /// `lanes(n, …)`'s count: opens a region of n lanes for its body (section 9).
+        fn open_region(checker: *Checker, index: u32, number: f64) Fail!void {
+            if (checker.region) |count| {
+                const diagnostic = checker.fail(index, .wrong_lanes, "a region of lanes is inside `lanes({d}, …)`", .{count});
+                error_module.hint(diagnostic, "regions do not nest; give the outer region the lanes of both", .{});
+                return error.Checked;
+            }
+            if (!(number >= 1 and number <= lanes_max)) {
+                const diagnostic = checker.fail(index, .out_of_range, "a region has from 1 to {d} lanes", .{lanes_max});
+                error_module.hint(diagnostic, "for example `lanes(1000, …)`", .{});
+                return error.Checked;
+            }
+            checker.region = @intFromFloat(number);
+        }
+
+        /// `lane`: each lane's index, inside a region (section 9).
+        fn lane_index(checker: *Checker, index: u32) Fail!u32 {
+            const count = checker.region orelse {
+                const diagnostic = checker.fail(index, .wrong_lanes, "`lane` is a lane's index, so it is used inside `lanes(n, …)`", .{});
+                error_module.hint(diagnostic, "wrap the expression in a region, such as `lanes(1000, lane * 0.001)`", .{});
+                return error.Checked;
+            };
+            return checker.push_expr(.{ .tag = .lane, .item = index, .lanes = count });
+        }
+
+        /// The lanes of `left` and `right` together (section 9): one lane is broadcast, and two
+        /// counts above 1 must be equal.
+        fn join_lanes(checker: *Checker, index: u32, left: u32, right: u32) Fail!u32 {
+            return checker.joined(index, checker.lanes_of(left), checker.lanes_of(right));
+        }
+
+        fn joined(checker: *Checker, index: u32, a: u32, b: u32) Fail!u32 {
+            if (a == b or b == 1) return a;
+            if (a == 1) return b;
+            const diagnostic = checker.fail(index, .wrong_lanes, "{d} lanes and {d} lanes do not go together", .{ a, b });
+            error_module.hint(diagnostic, "lanes meet where their counts are equal, or where one side has one lane", .{});
+            return error.Checked;
+        }
+
+        /// Refuses a signal of many lanes where `name` takes one value for every lane (section 9).
+        fn expect_one_lane(checker: *Checker, index: u32, expr: u32, name: []const u8) Fail!void {
+            const lanes = checker.lanes_of(expr);
+            if (lanes == 1) return;
+            const diagnostic = checker.fail(index, .wrong_lanes, "`{s}` takes one value for every lane, found {d} lanes", .{ name, lanes });
+            error_module.hint(diagnostic, "a node has one law; let the lanes differ in what it reads instead", .{});
+            return error.Checked;
+        }
+
+        /// Holds every signal a mover reads to one lane: its law is one node (section 9).
+        fn expect_mover_one_lane(checker: *Checker, mover: u32) Fail!void {
+            const mover_entry = checker.memory.calls[mover].entry;
+            const mover_first = checker.memory.calls[mover].values;
+            const mover_values = checker.memory.values[mover_first..][0..mover_entry.params.len];
+            const mover_items = checker.memory.value_items[mover_first..][0..mover_entry.params.len];
+            assert(mover_entry.role == .mover);
+            for (mover_entry.params, mover_values, mover_items) |param, value, value_item| {
+                if (value == .signal) try checker.expect_one_lane(value_item, value.signal, param.name);
+            }
+        }
+
+        /// The lanes of a call (section 9): a per-lane source's region, else the most of its
+        /// signals'.
+        fn call_lanes(checker: *Checker, call: u32, index: u32) Fail!u32 {
+            const entry = checker.memory.calls[call].entry;
+            const first = checker.memory.calls[call].values;
+            const values = checker.memory.values[first..][0..entry.params.len];
+            const items = checker.memory.value_items[first..][0..entry.params.len];
+            for (entry.params, values, items) |param, value, value_item| {
+                if (param.live and value == .signal) try checker.expect_one_lane(value_item, value.signal, param.name);
+            }
+            for (entry.params, values) |param, value| {
+                if (param.kind != .mover or value != .mover) continue;
+                try checker.expect_mover_one_lane(value.mover);
+            }
+            var lanes: u32 = 1;
+            // The rule `describe` prints for the call, so the two cannot differ.
+            switch (entry.lane_rule()) {
+                .makes => return @intCast(values[0].integer),
+                .region => return checker.region orelse 1,
+                .stagger => {
+                    const at = entry.param("stagger").?;
+                    if (checker.call_by_lane(entry, values)) {
+                        if (values[at].time != 0) {
+                            const diagnostic = checker.fail(items[at], .wrong_lanes, "`stagger:` and a cue chosen by lane both set when each lane starts", .{});
+                            error_module.hint(diagnostic, "each lane already starts at its own cue; drop `stagger:`", .{});
+                            return error.Checked;
+                        }
+                        // `cue_ref` found the region.
+                        lanes = checker.region.?;
+                    } else if (values[at].time != 0) lanes = checker.region orelse {
+                        const diagnostic = checker.fail(items[at], .wrong_lanes, "`stagger:` spreads lanes in time, so it is used inside `lanes(n, …)`", .{});
+                        error_module.hint(diagnostic, "wrap the call in a region, or drop `stagger:`", .{});
+                        return error.Checked;
+                    };
+                },
+                .inputs, .one => {},
+                .apart => return 1,
+            }
+            for (entry.params, values) |param, value| {
+                if (value != .signal or param.live) continue;
+                lanes = try checker.joined(index, lanes, checker.lanes_of(value.signal));
+            }
+            return lanes;
+        }
+
+        /// Whether a call's lanes each start at their own cue (section 9a): the parameter its entry
+        /// declares `by_lane` has a cue by lane, or a path whose one goal, one a run, has the flag.
+        fn call_by_lane(checker: *const Checker, entry: *const Entry, values: []const Value) bool {
+            assert(values.len == entry.params.len);
+            for (entry.params, values) |param, value| {
+                if (!param.by_lane) continue;
+                if (param.kind == .cue) return value == .cue_by_lane;
+                assert(param.kind == .path);
+                if (value != .path) return false;
+                const run = checker.memory.paths[value.path];
+                assert(run.count > 0);
+                const by_lane = checker.memory.goals[run.first].cue_by_lane;
+                if (by_lane) assert(run.count == 1);
+                return by_lane;
+            }
+            return false;
+        }
+
+        /// The shape of `left` and `right` together (section 8): theirs when equal, the other's
+        /// when one is a number; a colour and a vector, two vectors of different sizes, and a
+        /// product of two colours are refused.
+        fn combine(checker: *Checker, index: u32, left: u32, right: u32, product: bool) Fail!Shape {
+            const a = checker.shape_of(left);
+            const b = checker.shape_of(right);
+            if (product and a.colour and b.colour) {
+                const diagnostic = checker.fail(index, .wrong_shape, "two colours do not multiply", .{});
+                error_module.hint(diagnostic, "scale a colour by a number, or multiply components, such as `a.l * b.l`", .{});
+                return error.Checked;
+            }
+            if (a.eql(b) or b.eql(Shape.scalar)) return a;
+            if (a.eql(Shape.scalar)) return b;
+            const diagnostic = checker.fail(index, .wrong_shape, "{s} and {s} do not go together", .{ a.noun(), b.noun() });
+            if (a.colour or b.colour) {
+                error_module.hint(diagnostic, "a colour's components are `.l .a .b`; take one to mix it with a vector", .{});
+            } else {
+                error_module.hint(diagnostic, "make them one size, or take a component such as `.x`", .{});
+            }
+            return error.Checked;
+        }
+
+        /// Refuses a vector or a colour where `name` takes one value (section 8).
+        fn expect_scalar(checker: *Checker, index: u32, expr: u32, name: []const u8) Fail!void {
+            const shape = checker.shape_of(expr);
+            if (shape.eql(Shape.scalar)) return;
+            const diagnostic = checker.fail(index, .wrong_shape, "`{s}` takes one value, found {s}", .{ name, shape.noun() });
+            error_module.hint(diagnostic, "take a component, such as `.{s}`", .{shape.component_names()[0]});
+            return error.Checked;
+        }
+
+        /// The shape of a call (section 8): what its entry says its value is, from its parameters.
+        fn call_shape(checker: *Checker, call: u32, index: u32) Fail!Shape {
+            const entry = checker.memory.calls[call].entry;
+            const values = checker.memory.values[checker.memory.calls[call].values..][0..entry.params.len];
+            assert(values.len == entry.params.len);
+            switch (entry.shape) {
+                .one => return Shape.scalar,
+                .of => |name| return checker.value_shape(values[entry.param(name).?]),
+                .agree => |names| {
+                    const shape = try checker.call_agree(entry, values, index, names);
+                    try checker.after_shape(entry, values, index, shape);
+                    return shape;
+                },
+                .combine => |names| {
+                    const left = values[entry.param(names[0]).?].signal;
+                    return checker.combine(index, left, values[entry.param(names[1]).?].signal, false);
+                },
+                .constructor => |constructor| return .{
+                    .components = @intCast(entry.params.len),
+                    .colour = constructor.colour,
+                },
+            }
+        }
+
+        /// The shape of one value a rule reads: a vector's own, a path's goals', a signal's.
+        fn value_shape(checker: *const Checker, value: Value) Shape {
+            return switch (value) {
+                .path => |path| checker.memory.paths[path].shape,
+                .signal => |expr| checker.shape_of(expr),
+                else => value.shape(),
+            };
+        }
+
+        /// The shape of two parameters that agree. A path of numbers is one run, so a second with
+        /// components has nowhere to go (section 8).
+        fn call_agree(checker: *Checker, entry: *const Entry, values: []const Value, index: u32, names: [2][]const u8) Fail!Shape {
+            const first = values[entry.param(names[0]).?];
+            const second = values[entry.param(names[1]).?];
+            const a = checker.value_shape(first);
+            const b = checker.value_shape(second);
+            if (first != .path) return checker.agree(index, a, b, names, false);
+            if (a.eql(Shape.scalar) and !b.eql(Shape.scalar)) {
+                const diagnostic = checker.fail(index, .wrong_shape, "the {s} are numbers, and `{s}` {s}", .{ names[0], names[1], b.noun() });
+                error_module.hint(diagnostic, "write the {s} as {s}s too, or `{s}` as a number", .{ names[0], b.noun()[2..], names[1] });
+                return error.Checked;
+            }
+            return checker.agree(index, a, b, names, true);
+        }
+
+        /// A call that continues another (section 6b) has the shape of the value it continues from:
+        /// its `by` parameter, when a signal, is held to the call's own shape.
+        fn after_shape(checker: *Checker, entry: *const Entry, values: []const Value, index: u32, shape: Shape) Fail!void {
+            const after = entry.after orelse return;
+            const value = values[entry.param(after.by).?];
+            if (value != .signal) return;
+            const found = checker.shape_of(value.signal);
+            if (found.eql(shape)) return;
+            _ = checker.fail(index, .wrong_shape, "`{s}` is {s}, and this {s} {s}", .{ after.by, found.noun(), entry.name, shape.noun() });
+            return error.Checked;
+        }
+
+        /// Two shapes that must agree, a number broadcast to a vector. A number is never broadcast
+        /// to a colour, whose three components are not alike (section 8). `names` are the two
+        /// parameters, and `path_first` says the first is a path of goals.
+        fn agree(checker: *Checker, index: u32, a: Shape, b: Shape, names: [2][]const u8, path_first: bool) Fail!Shape {
+            if (a.eql(b)) return a;
+            if (!a.colour and !b.colour) {
+                if (b.eql(Shape.scalar)) return a;
+                if (a.eql(Shape.scalar)) return b;
+            }
+            const diagnostic = if (path_first)
+                checker.fail(index, .wrong_shape, "the {s} and `{s}` differ: {s} and {s}", .{ names[0], names[1], a.noun(), b.noun() })
+            else
+                checker.fail(index, .wrong_shape, "`{s}` and `{s}` differ: {s} and {s}", .{ names[0], names[1], a.noun(), b.noun() });
+            if ((a.colour and b.eql(Shape.scalar)) or (b.colour and a.eql(Shape.scalar))) {
+                error_module.hint(diagnostic, "write the number as a colour, such as `oklab(0.5, 0, 0)`", .{});
+            }
+            return error.Checked;
+        }
+
+        /// A vector or a colour written as numbers (section 8), or null for anything else: a call
+        /// of `vec2`, `vec3`, `oklab`, or `srgb` whose arguments are all numbers that fold (section
+        /// 3b).
+        fn constant_vector(checker: *Checker, index: u32) Fail!?Vector {
+            if (checker.bound(index)) |arg| {
+                const saved = checker.frame;
+                checker.focus(arg.frame);
+                defer checker.focus(saved);
+                return checker.constant_vector(arg.item);
+            }
+            const it = checker.item(index);
+            if (it.tag != .call) return null;
+            const entry = checker.lookup(checker.text(index), .signal) orelse return null;
+            const constructor = switch (entry.shape) {
+                .constructor => |found| found,
+                else => return null,
+            };
+            const children = checker.tree.children(index);
+            if (children.len != entry.params.len) return null;
+            for (children) |child| {
+                // A literal of another kind stays in, so it is refused as a component, as before.
+                if (checker.item(child).tag != .literal and !checker.folds(child)) return null;
+            }
+            var vector: Vector = .{ .values = @splat(0), .shape = .{
                 .components = @intCast(entry.params.len),
                 .colour = constructor.colour,
-            },
+            } };
+            for (children, entry.params, 0..) |child, param, at| {
+                vector.values[at] = try checker.fixed_number(child, "a component");
+                try checker.in_range(child, &param, vector.values[at]);
+            }
+            if (constructor.converts) vector.values = vocabulary.convert(entry, vector.values);
+            return vector;
         }
-    }
 
-    /// The shape of one value a rule reads: a vector's own, a path's goals', a signal's.
-    fn value_shape(checker: *const Checker, value: Value) Shape {
-        return switch (value) {
-            .path => |path| checker.memory.paths[path].shape,
-            .signal => |expr| checker.shape_of(expr),
-            else => value.shape(),
-        };
-    }
+        /// A path of vectors (section 8): one run a component, in order, never shared.
+        fn vector_path(checker: *Checker, index: u32, goals: []const Goal, values: []const [4]f64, shape: Shape, declared: bool) Fail!u32 {
+            const count = shape.components;
+            if (goals.len * count > checker.memory.goals.len - checker.goal_count) {
+                return checker.limit(index, "goals", .goals, checker.memory.goals.len);
+            }
+            if (checker.path_count + count > checker.memory.paths.len) return checker.limit(index, "paths", .goals, checker.memory.paths.len);
+            const first_path = checker.path_count;
+            for (0..count) |k| {
+                const first = checker.goal_count;
+                for (goals, values, 0..) |goal, value, at| {
+                    checker.memory.goals[first + at] = .{ .cue = goal.cue, .value = value[k], .cue_by_lane = goal.cue_by_lane };
+                }
+                checker.goal_count += @intCast(goals.len);
+                checker.memory.paths[checker.path_count] = .{
+                    .first = first,
+                    .count = @intCast(goals.len),
+                    .declared = declared,
+                    .shape = if (k == 0) shape else Shape.scalar,
+                };
+                checker.path_count += 1;
+            }
+            return first_path;
+        }
 
-    /// The shape of two parameters that agree. A path of numbers is one run, so a second with
-    /// components has nowhere to go (section 8).
-    fn call_agree(checker: *Checker, entry: *const Entry, values: []const Value, index: u32, names: [2][]const u8) Fail!Shape {
-        const first = values[entry.param(names[0]).?];
-        const second = values[entry.param(names[1]).?];
-        const a = checker.value_shape(first);
-        const b = checker.value_shape(second);
-        if (first != .path) return checker.agree(index, a, b, names, false);
-        if (a.eql(Shape.scalar) and !b.eql(Shape.scalar)) {
-            const diagnostic = checker.fail(index, .wrong_shape, "the {s} are numbers, and `{s}` {s}", .{ names[0], names[1], b.noun() });
-            error_module.hint(diagnostic, "write the {s} as {s}s too, or `{s}` as a number", .{ names[0], b.noun()[2..], names[1] });
+        /// `base.x`: a component of `vector`, a name or a call of a vector or a colour (section 8).
+        fn component_of(checker: *Checker, index: u32, vector: u32, output_name: []const u8) Fail!u32 {
+            const shape = checker.shape_of(vector);
+            for (shape.component_names(), 0..) |name, component| {
+                if (!std.mem.eql(u8, name, output_name)) continue;
+                return checker.push_expr(.{ .tag = .pick, .a = vector, .b = @intCast(component), .item = index, .lanes = checker.lanes_of(vector) });
+            }
+            const diagnostic = checker.fail_token(index, .unknown_output, "{s} has no component `{s}`", .{ shape.noun(), output_name });
+            const names = shape.component_names();
+            if (names.len == 2) {
+                error_module.hint(diagnostic, "its components are `.{s}` and `.{s}`", .{ names[0], names[1] });
+            } else {
+                error_module.hint(diagnostic, "its components are `.{s}`, `.{s}`, and `.{s}`", .{ names[0], names[1], names[2] });
+            }
             return error.Checked;
         }
-        return checker.agree(index, a, b, names, true);
-    }
 
-    /// A call that continues another (section 6b) has the shape of the value it continues from:
-    /// its `by` parameter, when a signal, is held to the call's own shape.
-    fn after_shape(checker: *Checker, entry: *const Entry, values: []const Value, index: u32, shape: Shape) Fail!void {
-        const after = entry.after orelse return;
-        const value = values[entry.param(after.by).?];
-        if (value != .signal) return;
-        const found = checker.shape_of(value.signal);
-        if (found.eql(shape)) return;
-        _ = checker.fail(index, .wrong_shape, "`{s}` is {s}, and this {s} {s}", .{ after.by, found.noun(), entry.name, shape.noun() });
-        return error.Checked;
-    }
+        /// The seed of section 5, for the next seeded call of this declaration.
+        fn derived_seed(checker: *Checker) u64 {
+            const frame = &checker.memory.frames[checker.frame];
+            const base = frame.seed_base;
+            const ordinal = frame.seeded;
+            frame.seeded += 1;
+            return if (ordinal == 0) base else vocabulary.seed_hash(base, ordinal);
+        }
 
-    /// Two shapes that must agree, a number broadcast to a vector. A number is never broadcast to
-    /// a colour, whose three components are not alike (section 8).
-    /// `names` are the two parameters, and `path_first` says the first is a path of goals.
-    fn agree(checker: *Checker, index: u32, a: Shape, b: Shape, names: [2][]const u8, path_first: bool) Fail!Shape {
-        if (a.eql(b)) return a;
-        if (!a.colour and !b.colour) {
-            if (b.eql(Shape.scalar)) return a;
-            if (a.eql(Shape.scalar)) return b;
-        }
-        const diagnostic = if (path_first)
-            checker.fail(index, .wrong_shape, "the {s} and `{s}` differ: {s} and {s}", .{ names[0], names[1], a.noun(), b.noun() })
-        else
-            checker.fail(index, .wrong_shape, "`{s}` and `{s}` differ: {s} and {s}", .{ names[0], names[1], a.noun(), b.noun() });
-        if ((a.colour and b.eql(Shape.scalar)) or (b.colour and a.eql(Shape.scalar))) {
-            error_module.hint(diagnostic, "write the number as a colour, such as `oklab(0.5, 0, 0)`", .{});
-        }
-        return error.Checked;
-    }
-
-    /// A vector or a colour written as numbers (section 8), or null for anything else: a call of
-    /// `vec2`, `vec3`, `oklab`, or `srgb` whose arguments are all numbers that fold (section 3b).
-    fn constant_vector(checker: *Checker, index: u32) Fail!?Vector {
-        if (checker.bound(index)) |arg| {
-            const saved = checker.frame;
-            checker.focus(arg.frame);
-            defer checker.focus(saved);
-            return checker.constant_vector(arg.item);
-        }
-        const it = checker.item(index);
-        if (it.tag != .call) return null;
-        const entry = checker.lookup(checker.text(index), .signal) orelse return null;
-        const constructor = switch (entry.shape) {
-            .constructor => |found| found,
-            else => return null,
-        };
-        const children = checker.tree.children(index);
-        if (children.len != entry.params.len) return null;
-        for (children) |child| {
-            // A literal of another kind stays in, so it is refused as a component, as before.
-            if (checker.item(child).tag != .literal and !checker.folds(child)) return null;
-        }
-        var vector: Vector = .{ .values = @splat(0), .shape = .{
-            .components = @intCast(entry.params.len),
-            .colour = constructor.colour,
-        } };
-        for (children, entry.params, 0..) |child, param, at| {
-            vector.values[at] = try checker.fixed_number(child, "a component");
-            try checker.in_range(child, &param, vector.values[at]);
-        }
-        if (constructor.converts) vector.values = checker.memory.vocabulary.convert(entry, vector.values);
-        return vector;
-    }
-
-    /// A path of vectors (section 8): one run a component, in order, never shared.
-    fn vector_path(checker: *Checker, index: u32, goals: []const Goal, values: []const [4]f64, shape: Shape, declared: bool) Fail!u32 {
-        const count = shape.components;
-        if (goals.len * count > checker.memory.goals.len - checker.goal_count) {
-            return checker.limit(index, "goals", .goals, checker.memory.goals.len);
-        }
-        if (checker.path_count + count > checker.memory.paths.len) return checker.limit(index, "paths", .goals, checker.memory.paths.len);
-        const first_path = checker.path_count;
-        for (0..count) |k| {
-            const first = checker.goal_count;
-            for (goals, values, 0..) |goal, value, at| {
-                checker.memory.goals[first + at] = .{ .cue = goal.cue, .value = value[k], .cue_by_lane = goal.cue_by_lane };
+        fn argument(checker: *Checker, entry: *const Entry, param: *const schema.Param, index: u32) Fail!Value {
+            if (checker.bound(index)) |arg| {
+                const saved = checker.frame;
+                checker.focus(arg.frame);
+                defer checker.focus(saved);
+                return checker.argument(entry, param, arg.item);
             }
-            checker.goal_count += @intCast(goals.len);
-            checker.memory.paths[checker.path_count] = .{
-                .first = first,
-                .count = @intCast(goals.len),
-                .declared = declared,
-                .shape = if (k == 0) shape else Shape.scalar,
-            };
-            checker.path_count += 1;
-        }
-        return first_path;
-    }
-
-    /// `base.x`: a component of `vector`, a name or a call of a vector or a colour (section 8).
-    fn component_of(checker: *Checker, index: u32, vector: u32, output_name: []const u8) Fail!u32 {
-        const shape = checker.shape_of(vector);
-        for (shape.component_names(), 0..) |name, component| {
-            if (!std.mem.eql(u8, name, output_name)) continue;
-            return checker.push_expr(.{ .tag = .pick, .a = vector, .b = @intCast(component), .item = index, .lanes = checker.lanes_of(vector) });
-        }
-        const diagnostic = checker.fail_token(index, .unknown_output, "{s} has no component `{s}`", .{ shape.noun(), output_name });
-        const names = shape.component_names();
-        if (names.len == 2) {
-            error_module.hint(diagnostic, "its components are `.{s}` and `.{s}`", .{ names[0], names[1] });
-        } else {
-            error_module.hint(diagnostic, "its components are `.{s}`, `.{s}`, and `.{s}`", .{ names[0], names[1], names[2] });
-        }
-        return error.Checked;
-    }
-
-    /// The seed of section 5, for the next seeded call of this declaration.
-    fn derived_seed(checker: *Checker) u64 {
-        const frame = &checker.memory.frames[checker.frame];
-        const base = frame.seed_base;
-        const ordinal = frame.seeded;
-        frame.seeded += 1;
-        return if (ordinal == 0) base else checker.memory.vocabulary.seed_hash(base, ordinal);
-    }
-
-    fn argument(checker: *Checker, entry: *const Entry, param: *const schema.Param, index: u32) Fail!Value {
-        if (checker.bound(index)) |arg| {
-            const saved = checker.frame;
-            checker.focus(arg.frame);
-            defer checker.focus(saved);
-            return checker.argument(entry, param, arg.item);
-        }
-        const it = checker.item(index);
-        switch (param.kind) {
-            .number => {
-                // A number that folds is fixed as its literal is, even where a signal may set it
-                // (section 3b), so `2 * pi` builds what `6.283185307179586` builds.
-                if (it.tag == .literal or checker.folds(index)) {
-                    const number = try checker.fixed_number(index, "a number");
-                    try checker.in_range(index, param, number);
-                    return .{ .number = number };
-                }
-                if (param.shaped) if (try checker.constant_vector(index)) |vector| return .{ .vector = vector };
-                if (!param.live) return checker.not_live(entry, param, index);
-                const expr = try checker.signal(index);
-                try checker.expect_scalar(index, expr, param.name);
-                try checker.expect_need(index, entry, param, expr);
-                return .{ .signal = expr };
-            },
-            .integer => {
-                const number = try checker.fixed_number(index, "a whole number");
-                try checker.in_range(index, param, number);
-                if (!(number >= 0 and number <= 0x1p32 and @floor(number) == number)) {
-                    _ = checker.fail(index, .out_of_range, "`{s}` is a whole number from 0 to 2^32", .{param.name});
-                    return error.Checked;
-                }
-                if (entry.op == .lanes) try checker.open_region(index, number);
-                return .{ .integer = @intFromFloat(number) };
-            },
-            .time => {
-                if (it.tag == .literal) return .{ .time = try checker.literal_time(index) };
-                if (!param.live) return checker.not_live(entry, param, index);
-                const expr = try checker.signal(index);
-                try checker.expect_scalar(index, expr, param.name);
-                return .{ .signal = expr };
-            },
-            .frequency => {
-                if (it.tag != .literal or checker.tree.tokens[it.token].tag != .frequency) {
-                    const diagnostic = checker.fail(index, .wrong_type, "`{s}` takes a frequency", .{param.name});
-                    if (it.tag == .literal) error_module.hint(diagnostic, "write `{s}hz`", .{checker.text(index)}) else error_module.hint(diagnostic, "for example `1hz`", .{});
-                    return error.Checked;
-                }
-                const digits = token_module.digits_of(checker.tree.tokens[it.token], checker.source());
-                const number = parse_float(digits) orelse return checker.bad_number(index);
-                return .{ .frequency = if (it.a == 1) -number else number };
-            },
-            .signal => {
-                const expr = try checker.signal(index);
-                if (!param.shaped) try checker.expect_scalar(index, expr, param.name);
-                try checker.expect_need(index, entry, param, expr);
-                return .{ .signal = expr };
-            },
-            .cue => {
-                const found = try checker.cue_ref(index, if (param.by_lane) .taken else .refused);
-                if (found.by_lane) return .{ .cue_by_lane = found.index };
-                return .{ .cue = found.index };
-            },
-            .cues => {
-                if (it.tag == .name) {
-                    if (checker.find(checker.text(index))) |found| {
-                        const binding = checker.memory.bindings[found];
-                        if (binding.kind == .series) return .{ .span = .{ .first = binding.index, .count = binding.count } };
+            const it = checker.item(index);
+            switch (param.kind) {
+                .number => {
+                    // A number that folds is fixed as its literal is, even where a signal may set
+                    // it (section 3b), so `2 * pi` builds what `6.283185307179586` builds.
+                    if (it.tag == .literal or checker.folds(index)) {
+                        const number = try checker.fixed_number(index, "a number");
+                        try checker.in_range(index, param, number);
+                        return .{ .number = number };
                     }
-                }
-                return .{ .span = .{ .first = try checker.cue_of(index), .count = 1 } };
-            },
-            .path => {
-                const path = if (it.tag == .list) try checker.path_of(index, false, param.by_lane) else try checker.named_of(index, .path);
-                if (!param.shaped and !checker.memory.paths[path].shape.eql(Shape.scalar)) {
-                    _ = checker.fail(index, .wrong_shape, "`{s}` takes a path of numbers, found one of {s}s", .{ param.name, checker.memory.paths[path].shape.noun()[2..] });
+                    if (param.shaped) if (try checker.constant_vector(index)) |vector| return .{ .vector = vector };
+                    if (!param.live) return checker.not_live(entry, param, index);
+                    const expr = try checker.signal(index);
+                    try checker.expect_scalar(index, expr, param.name);
+                    try checker.expect_need(index, entry, param, expr);
+                    return .{ .signal = expr };
+                },
+                .integer => {
+                    const number = try checker.fixed_number(index, "a whole number");
+                    try checker.in_range(index, param, number);
+                    if (!(number >= 0 and number <= 0x1p32 and @floor(number) == number)) {
+                        _ = checker.fail(index, .out_of_range, "`{s}` is a whole number from 0 to 2^32", .{param.name});
+                        return error.Checked;
+                    }
+                    if (entry.op == .lanes) try checker.open_region(index, number);
+                    return .{ .integer = @intFromFloat(number) };
+                },
+                .time => {
+                    if (it.tag == .literal) return .{ .time = try checker.literal_time(index) };
+                    if (!param.live) return checker.not_live(entry, param, index);
+                    const expr = try checker.signal(index);
+                    try checker.expect_scalar(index, expr, param.name);
+                    return .{ .signal = expr };
+                },
+                .frequency => {
+                    if (it.tag != .literal or checker.tree.tokens[it.token].tag != .frequency) {
+                        // A live frequency takes a signal, which the client's own back end builds;
+                        // a bare number keeps the hint that says to write the unit.
+                        if (param.live and it.tag != .literal) {
+                            const expr = try checker.signal(index);
+                            try checker.expect_scalar(index, expr, param.name);
+                            return .{ .signal = expr };
+                        }
+                        const diagnostic = checker.fail(index, .wrong_type, "`{s}` takes a frequency", .{param.name});
+                        if (it.tag == .literal) error_module.hint(diagnostic, "write `{s}hz`", .{checker.text(index)}) else error_module.hint(diagnostic, "for example `1hz`", .{});
+                        return error.Checked;
+                    }
+                    const digits = token_module.digits_of(checker.tree.tokens[it.token], checker.source());
+                    const number = parse_float(digits) orelse return checker.bad_number(index);
+                    return .{ .frequency = if (it.a == 1) -number else number };
+                },
+                .signal => {
+                    const expr = try checker.signal(index);
+                    if (!param.shaped) try checker.expect_scalar(index, expr, param.name);
+                    try checker.expect_need(index, entry, param, expr);
+                    return .{ .signal = expr };
+                },
+                .cue => {
+                    const found = try checker.cue_ref(index, if (param.by_lane) .taken else .refused);
+                    if (found.by_lane) return .{ .cue_by_lane = found.index };
+                    return .{ .cue = found.index };
+                },
+                .cues => {
+                    if (it.tag == .name) {
+                        if (checker.find(checker.text(index))) |found| {
+                            const binding = checker.memory.bindings[found];
+                            if (binding.kind == .series) return .{ .span = .{ .first = binding.index, .count = binding.count } };
+                        }
+                    }
+                    return .{ .span = .{ .first = try checker.cue_of(index), .count = 1 } };
+                },
+                .path => {
+                    const path = if (it.tag == .list) try checker.path_of(index, false, param.by_lane) else try checker.named_of(index, .path);
+                    if (!param.shaped and !checker.memory.paths[path].shape.eql(Shape.scalar)) {
+                        _ = checker.fail(index, .wrong_shape, "`{s}` takes a path of numbers, found one of {s}s", .{ param.name, checker.memory.paths[path].shape.noun()[2..] });
+                        return error.Checked;
+                    }
+                    return .{ .path = path };
+                },
+                .regions => {
+                    if (it.tag == .list) return .{ .regions = try checker.region_list(index, false) };
+                    return .{ .regions = try checker.named_of(index, .regions) };
+                },
+                .number_range => return .{ .number_range = try checker.number_range(index) },
+                .time_range => {
+                    if (it.tag != .range) {
+                        const diagnostic = checker.fail(index, .wrong_type, "`{s}` takes a range of times", .{param.name});
+                        error_module.hint(diagnostic, "for example `0s..500ms`", .{});
+                        return error.Checked;
+                    }
+                    const low = try checker.literal_time(it.a);
+                    const high = try checker.literal_time(it.b);
+                    return .{ .time_range = .{ low, high } };
+                },
+                .ease => {
+                    if (it.tag != .list) return checker.argument(entry, &.{ .name = param.name, .kind = .word, .words = param.words }, index);
+                    const children = checker.tree.children(index);
+                    if (children.len != 4) {
+                        const diagnostic = checker.fail(index, .wrong_type, "a cubic ease is four numbers, `[x1, y1, x2, y2]`", .{});
+                        error_module.hint(diagnostic, "for example `[0.34, 1.56, 0.64, 1]`, or a word such as `in_out`", .{});
+                        return error.Checked;
+                    }
+                    var points: [4]f64 = undefined;
+                    for (&points, children) |*point, child| point.* = try checker.fixed_number(child, "a control point");
+                    return .{ .cubic = points };
+                },
+                .word => {
+                    const word = if (it.tag == .name) checker.text(index) else "";
+                    for (param.words, 0..) |candidate, at| {
+                        if (std.mem.eql(u8, candidate, word)) return .{ .word = @intCast(at) };
+                    }
+                    const diagnostic = checker.fail(index, .unknown_word, "`{s}` takes one of its words", .{param.name});
+                    if (error_module.nearest(word, param.words)) |near| {
+                        error_module.hint(diagnostic, "did you mean `{s}`?", .{near});
+                    } else {
+                        hint_words(diagnostic, param.words);
+                    }
                     return error.Checked;
-                }
-                return .{ .path = path };
-            },
-            .regions => {
-                if (it.tag == .list) return .{ .regions = try checker.region_list(index, false) };
-                return .{ .regions = try checker.named_of(index, .regions) };
-            },
-            .number_range => return .{ .number_range = try checker.number_range(index) },
-            .time_range => {
-                if (it.tag != .range) {
-                    const diagnostic = checker.fail(index, .wrong_type, "`{s}` takes a range of times", .{param.name});
-                    error_module.hint(diagnostic, "for example `0s..500ms`", .{});
-                    return error.Checked;
-                }
-                const low = try checker.literal_time(it.a);
-                const high = try checker.literal_time(it.b);
-                return .{ .time_range = .{ low, high } };
-            },
-            .ease => {
-                if (it.tag != .list) return checker.argument(entry, &.{ .name = param.name, .kind = .word, .words = param.words }, index);
-                const children = checker.tree.children(index);
-                if (children.len != 4) {
-                    const diagnostic = checker.fail(index, .wrong_type, "a cubic ease is four numbers, `[x1, y1, x2, y2]`", .{});
-                    error_module.hint(diagnostic, "for example `[0.34, 1.56, 0.64, 1]`, or a word such as `in_out`", .{});
-                    return error.Checked;
-                }
-                var points: [4]f64 = undefined;
-                for (&points, children) |*point, child| point.* = try checker.fixed_number(child, "a control point");
-                return .{ .cubic = points };
-            },
-            .word => {
-                const word = if (it.tag == .name) checker.text(index) else "";
-                for (param.words, 0..) |candidate, at| {
-                    if (std.mem.eql(u8, candidate, word)) return .{ .word = @intCast(at) };
-                }
-                const diagnostic = checker.fail(index, .unknown_word, "`{s}` takes one of its words", .{param.name});
-                if (error_module.nearest(word, param.words)) |near| {
-                    error_module.hint(diagnostic, "did you mean `{s}`?", .{near});
-                } else {
+                },
+                .mover => return .{ .mover = try checker.mover_of(index, param.name) },
+                .string => {
+                    if (it.tag != .literal or checker.tree.tokens[it.token].tag != .string) {
+                        const diagnostic = checker.fail(index, .wrong_type, "`{s}` takes a string", .{param.name});
+                        error_module.hint(diagnostic, "write it in double quotes, such as `\"text\"`", .{});
+                        return error.Checked;
+                    }
+                    return .{ .string = token_module.string_of(checker.tree.tokens[it.token], checker.source()) };
+                },
+                .noun => {
+                    if (it.tag != .name) {
+                        const diagnostic = checker.fail(index, .wrong_type, "`{s}` takes the name of a noun", .{param.name});
+                        error_module.hint(diagnostic, "declare it on a line above, then name it here", .{});
+                        return error.Checked;
+                    }
+                    const name = checker.text(index);
+                    const found = try checker.resolve(index, name);
+                    const binding = checker.memory.bindings[found];
+                    if (binding.kind != .noun) {
+                        _ = checker.fail(index, .wrong_type, "`{s}` is a {s}, and `{s}` takes a noun", .{ name, kind_name(binding.kind), param.name });
+                        return error.Checked;
+                    }
+                    if (param.words.len == 0) return .{ .noun = found };
+                    for (param.words) |word| {
+                        if (std.mem.eql(u8, word, binding.entry.?.name)) return .{ .noun = found };
+                    }
+                    const diagnostic = checker.fail(index, .wrong_type, "`{s}` is `{s}`, which `{s}` does not take", .{ name, binding.entry.?.name, param.name });
                     hint_words(diagnostic, param.words);
+                    return error.Checked;
+                },
+                .seed => {
+                    const token = checker.tree.tokens[it.token];
+                    if (it.tag != .literal or token.tag != .number or it.a == 1) {
+                        _ = checker.fail(index, .out_of_range, "a seed is a whole number from 0 to 2^64 - 1", .{});
+                        return error.Checked;
+                    }
+                    const seed = std.fmt.parseInt(u64, checker.text(index), 10) catch {
+                        _ = checker.fail(index, .out_of_range, "a seed is a whole number from 0 to 2^64 - 1", .{});
+                        return error.Checked;
+                    };
+                    checker.memory.frames[checker.frame].seeded += 1;
+                    return .{ .seed = seed };
+                },
+            }
+        }
+
+        fn not_live(checker: *Checker, entry: *const Entry, param: *const schema.Param, index: u32) Fail {
+            if (checker.item(index).tag == .name) {
+                if (checker.find(checker.text(index))) |found| {
+                    if (checker.memory.bindings[found].kind == .failed) return checker.reported();
                 }
+            }
+            const diagnostic = checker.fail(index, .not_live, "{s}'s `{s}` is fixed when it is built, so a signal cannot set it", .{ entry.name, param.name });
+            if (entry.fixed_hint.len > 0) {
+                error_module.hint(diagnostic, "{s}", .{entry.fixed_hint});
+            } else {
+                error_module.hint(diagnostic, "write {s}", .{example_of(checker, param)});
+            }
+            return error.Checked;
+        }
+
+        fn named_of(checker: *Checker, index: u32, kind: Binding.Kind) Fail!u32 {
+            const it = checker.item(index);
+            if (it.tag != .name) {
+                _ = checker.fail(index, .wrong_type, "expected {s}, found {s}", .{ kind_name(kind), item_kind(it.tag) });
                 return error.Checked;
-            },
-            .mover => return .{ .mover = try checker.mover_of(index, param.name) },
-            .string => {
-                if (it.tag != .literal or checker.tree.tokens[it.token].tag != .string) {
-                    const diagnostic = checker.fail(index, .wrong_type, "`{s}` takes a string", .{param.name});
-                    error_module.hint(diagnostic, "write it in double quotes, such as `\"text\"`", .{});
-                    return error.Checked;
-                }
-                return .{ .string = token_module.string_of(checker.tree.tokens[it.token], checker.source()) };
-            },
-            .noun => {
-                if (it.tag != .name) {
-                    const diagnostic = checker.fail(index, .wrong_type, "`{s}` takes the name of a noun", .{param.name});
-                    error_module.hint(diagnostic, "declare it on a line above, then name it here", .{});
-                    return error.Checked;
-                }
-                const name = checker.text(index);
-                const found = try checker.resolve(index, name);
-                const binding = checker.memory.bindings[found];
-                if (binding.kind != .noun) {
-                    _ = checker.fail(index, .wrong_type, "`{s}` is a {s}, and `{s}` takes a noun", .{ name, kind_name(binding.kind), param.name });
-                    return error.Checked;
-                }
-                if (param.words.len == 0) return .{ .noun = found };
-                for (param.words) |word| {
-                    if (std.mem.eql(u8, word, binding.entry.?.name)) return .{ .noun = found };
-                }
-                const diagnostic = checker.fail(index, .wrong_type, "`{s}` is `{s}`, which `{s}` does not take", .{ name, binding.entry.?.name, param.name });
-                hint_words(diagnostic, param.words);
+            }
+            const name = checker.text(index);
+            const found = try checker.resolve(index, name);
+            const binding = checker.memory.bindings[found];
+            if (binding.kind != kind) {
+                _ = checker.fail(index, .wrong_type, "`{s}` is a {s}, not {s}", .{ name, kind_name(binding.kind), kind_name(kind) });
                 return error.Checked;
-            },
-            .seed => {
-                const token = checker.tree.tokens[it.token];
-                if (it.tag != .literal or token.tag != .number or it.a == 1) {
-                    _ = checker.fail(index, .out_of_range, "a seed is a whole number from 0 to 2^64 - 1", .{});
-                    return error.Checked;
-                }
-                const seed = std.fmt.parseInt(u64, checker.text(index), 10) catch {
-                    _ = checker.fail(index, .out_of_range, "a seed is a whole number from 0 to 2^64 - 1", .{});
+            }
+            return binding.index;
+        }
+
+        /// A cue: a cue's name, or an element of a series.
+        fn cue_of(checker: *Checker, index: u32) Fail!u32 {
+            const found = try checker.cue_ref(index, .refused);
+            assert(!found.by_lane);
+            return found.index;
+        }
+
+        /// A cue as `cue_of` reads it, or, where `place` takes it, `series[lane]` inside a region:
+        /// the series' first cue, which lane g of the region reads g cues after (section 9a).
+        fn cue_ref(checker: *Checker, index: u32, place: LanePlace) Fail!CueRef {
+            if (checker.bound(index)) |arg| {
+                const saved = checker.frame;
+                checker.focus(arg.frame);
+                defer checker.focus(saved);
+                return checker.cue_ref(arg.item, place);
+            }
+            const it = checker.item(index);
+            if (it.tag == .element) {
+                const base = checker.item(it.a);
+                const name = checker.text(it.a);
+                const found = if (base.tag == .name) checker.find(name) else null;
+                const binding = if (found) |at| checker.memory.bindings[at] else {
+                    if (base.tag == .name) return checker.unknown_name(it.a, name);
+                    _ = checker.fail(index, .wrong_type, "only a series has elements", .{});
                     return error.Checked;
                 };
-                checker.memory.frames[checker.frame].seeded += 1;
-                return .{ .seed = seed };
-            },
-        }
-    }
-
-    fn not_live(checker: *Checker, entry: *const Entry, param: *const schema.Param, index: u32) Fail {
-        if (checker.item(index).tag == .name) {
-            if (checker.find(checker.text(index))) |found| {
-                if (checker.memory.bindings[found].kind == .failed) return checker.reported();
+                if (binding.kind == .failed) return checker.reported();
+                if (binding.kind != .series) {
+                    _ = checker.fail(index, .wrong_type, "`{s}` is a {s}, not a series", .{ name, kind_name(binding.kind) });
+                    return error.Checked;
+                }
+                if (checker.tree.tokens[it.token].tag == .name) return checker.lane_element(index, name, binding, place);
+                const element = std.fmt.parseInt(u32, checker.text(index), 10) catch binding.count;
+                if (element >= binding.count) {
+                    _ = checker.fail(index, .out_of_range, "`{s}` has {d} cues, from [0] to [{d}]", .{ name, binding.count, binding.count - 1 });
+                    return error.Checked;
+                }
+                return .{ .index = binding.index + element };
             }
-        }
-        const diagnostic = checker.fail(index, .not_live, "{s}'s `{s}` is fixed when it is built, so a signal cannot set it", .{ entry.name, param.name });
-        if (entry.fixed_hint.len > 0) {
-            error_module.hint(diagnostic, "{s}", .{entry.fixed_hint});
-        } else {
-            error_module.hint(diagnostic, "write {s}", .{example_of(checker, param)});
-        }
-        return error.Checked;
-    }
-
-    fn named_of(checker: *Checker, index: u32, kind: Binding.Kind) Fail!u32 {
-        const it = checker.item(index);
-        if (it.tag != .name) {
-            _ = checker.fail(index, .wrong_type, "expected {s}, found {s}", .{ kind_name(kind), item_kind(it.tag) });
-            return error.Checked;
-        }
-        const name = checker.text(index);
-        const found = try checker.resolve(index, name);
-        const binding = checker.memory.bindings[found];
-        if (binding.kind != kind) {
-            _ = checker.fail(index, .wrong_type, "`{s}` is a {s}, not {s}", .{ name, kind_name(binding.kind), kind_name(kind) });
-            return error.Checked;
-        }
-        return binding.index;
-    }
-
-    /// A cue: a cue's name, or an element of a series.
-    fn cue_of(checker: *Checker, index: u32) Fail!u32 {
-        const found = try checker.cue_ref(index, .refused);
-        assert(!found.by_lane);
-        return found.index;
-    }
-
-    /// A cue as `cue_of` reads it, or, where `place` takes it, `series[lane]` inside a region:
-    /// the series' first cue, which lane g of the region reads g cues after (section 9a).
-    fn cue_ref(checker: *Checker, index: u32, place: LanePlace) Fail!CueRef {
-        if (checker.bound(index)) |arg| {
-            const saved = checker.frame;
-            checker.focus(arg.frame);
-            defer checker.focus(saved);
-            return checker.cue_ref(arg.item, place);
-        }
-        const it = checker.item(index);
-        if (it.tag == .element) {
-            const base = checker.item(it.a);
-            const name = checker.text(it.a);
-            const found = if (base.tag == .name) checker.find(name) else null;
-            const binding = if (found) |at| checker.memory.bindings[at] else {
-                if (base.tag == .name) return checker.unknown_name(it.a, name);
-                _ = checker.fail(index, .wrong_type, "only a series has elements", .{});
-                return error.Checked;
-            };
-            if (binding.kind == .failed) return checker.reported();
-            if (binding.kind != .series) {
-                _ = checker.fail(index, .wrong_type, "`{s}` is a {s}, not a series", .{ name, kind_name(binding.kind) });
+            if (it.tag != .name) {
+                const diagnostic = checker.fail(index, .wrong_type, "expected a cue, found {s}", .{item_kind(it.tag)});
+                error_module.hint(diagnostic, "a cue is a name declared with `cue`", .{});
                 return error.Checked;
             }
-            if (checker.tree.tokens[it.token].tag == .name) return checker.lane_element(index, name, binding, place);
-            const element = std.fmt.parseInt(u32, checker.text(index), 10) catch binding.count;
-            if (element >= binding.count) {
-                _ = checker.fail(index, .out_of_range, "`{s}` has {d} cues, from [0] to [{d}]", .{ name, binding.count, binding.count - 1 });
+            const name = checker.text(index);
+            const found = try checker.resolve(index, name);
+            const binding = checker.memory.bindings[found];
+            if (binding.kind != .cue) {
+                const diagnostic = checker.fail(index, .wrong_type, "`{s}` is a {s}, not a cue", .{ name, kind_name(binding.kind) });
+                if (binding.kind == .series) error_module.hint(diagnostic, "name one of its cues, such as `{s}[0]`", .{name});
                 return error.Checked;
             }
-            return .{ .index = binding.index + element };
+            return .{ .index = binding.index };
         }
-        if (it.tag != .name) {
-            const diagnostic = checker.fail(index, .wrong_type, "expected a cue, found {s}", .{item_kind(it.tag)});
-            error_module.hint(diagnostic, "a cue is a name declared with `cue`", .{});
-            return error.Checked;
-        }
-        const name = checker.text(index);
-        const found = try checker.resolve(index, name);
-        const binding = checker.memory.bindings[found];
-        if (binding.kind != .cue) {
-            const diagnostic = checker.fail(index, .wrong_type, "`{s}` is a {s}, not a cue", .{ name, kind_name(binding.kind) });
-            if (binding.kind == .series) error_module.hint(diagnostic, "name one of its cues, such as `{s}[0]`", .{name});
-            return error.Checked;
-        }
-        return .{ .index = binding.index };
-    }
 
-    /// The hint for a cue by lane where none is taken: every `by_lane` parameter of the
-    /// vocabulary's entries and then the client's, in order, as far as `buffer` holds them.
-    fn by_lane_list(checker: *const Checker, buffer: *[hint_list_size]u8) []const u8 {
-        var total: u32 = 0;
-        const lists = [2][]const Entry{ checker.memory.vocabulary.entries, checker.memory.clients };
-        for (lists) |list| {
-            for (list) |entry| {
+        /// The hint for a cue by lane where none is taken: every `by_lane` parameter of the
+        /// vocabulary's entries and then the client's, in order, as far as `buffer` holds them.
+        fn by_lane_list(checker: *const Checker, buffer: *[hint_list_size]u8) []const u8 {
+            var total: u32 = 0;
+            _ = checker;
+            for (entries) |entry| {
                 for (entry.params) |param| total += @intFromBool(param.by_lane);
             }
-        }
-        var stream = std.Io.Writer.fixed(buffer);
-        stream.writeAll("a cue by lane is taken by ") catch return stream.buffered();
-        var count: u32 = 0;
-        for (lists) |list| {
-            for (list) |entry| {
+            var stream = std.Io.Writer.fixed(buffer);
+            stream.writeAll("a cue by lane is taken by ") catch return stream.buffered();
+            var count: u32 = 0;
+            for (entries) |entry| {
                 for (entry.params) |param| {
                     if (!param.by_lane) continue;
                     count += 1;
@@ -2645,326 +2663,341 @@ const Checker = struct {
                     stream.print("{s}`{s}`'s `{s}:`", .{ joiner, entry.name, param.name }) catch return stream.buffered();
                 }
             }
+            return stream.buffered();
         }
-        return stream.buffered();
-    }
 
-    /// `series[NAME]` (step 28): only `lane`, only where the parameter takes a cue by lane, only
-    /// inside a region, and only of a series with a cue for every lane.
-    fn lane_element(checker: *Checker, index: u32, name: []const u8, binding: Binding, place: LanePlace) Fail!CueRef {
-        const it = checker.item(index);
-        const lane_name = checker.tree.token_text(it.token);
-        if (!std.mem.eql(u8, lane_name, "lane")) {
-            const diagnostic = checker.fail(index, .wrong_type, "`{s}` is not an index", .{lane_name});
-            error_module.hint(diagnostic, "an index is a whole number, or `lane` inside a region", .{});
-            return error.Checked;
-        }
-        switch (place) {
-            .taken => {},
-            .refused => {
-                const diagnostic = checker.fail(index, .wrong_lanes, "`{s}[lane]` is a cue for each lane, which this place does not take", .{name});
-                var buffer: [hint_list_size]u8 = undefined;
-                error_module.hint(diagnostic, "{s}", .{checker.by_lane_list(&buffer)});
-                return error.Checked;
-            },
-            .path_of_goals => {
-                const diagnostic = checker.fail(index, .wrong_lanes, "`{s}[lane]` is a cue for each lane, and a path by lane has one goal", .{name});
-                error_module.hint(diagnostic, "write one goal, `[{s}[lane]: 1]`, or give every lane the same path, moved by `stagger:`", .{name});
-                return error.Checked;
-            },
-            .declared_path => {
-                const diagnostic = checker.fail(index, .wrong_lanes, "`{s}[lane]` is a cue for each lane, and a declared path is outside any region", .{name});
-                error_module.hint(diagnostic, "write the path in the call, as `[{s}[lane]: 1]`, inside `lanes(n, …)`", .{name});
-                return error.Checked;
-            },
-        }
-        const count = checker.region orelse {
-            const diagnostic = checker.fail(index, .wrong_lanes, "`{s}[lane]` is a cue for each lane, so it is used inside `lanes(n, …)`", .{name});
-            error_module.hint(diagnostic, "wrap the call in a region, such as `lanes({d}, …)`", .{binding.count});
-            return error.Checked;
-        };
-        if (binding.count < count) {
-            const diagnostic = checker.fail(index, .wrong_lanes, "`{s}` has {d} cues and the region {d} lanes", .{ name, binding.count, count });
-            error_module.hint(diagnostic, "give the series a cue for every lane, or the region fewer lanes", .{});
-            return error.Checked;
-        }
-        return .{ .index = binding.index, .by_lane = true };
-    }
-
-    /// A path written as a list, declared or inline. Where `by_lane` allows it, its goal's cue may
-    /// be `series[lane]`, when it is the path's only goal (section 9a).
-    fn path_of(checker: *Checker, index: u32, declared: bool, by_lane: bool) Fail!u32 {
-        if (declared) assert(!by_lane);
-        const children = checker.tree.children(index);
-        if (children.len == 0) {
-            _ = checker.fail(index, .wrong_type, "a path has at least one goal", .{});
-            return error.Checked;
-        }
-        if (children.len > run_max) return checker.fixed_limit(index, "goals in one path", run_max);
-        var buffer: [run_max]Goal = undefined;
-        var values: [run_max][4]f64 = undefined;
-        const fresh = buffer[0..children.len];
-        var shape: ?Shape = null;
-        const place: LanePlace = if (declared) .declared_path else if (!by_lane) .refused else if (children.len > 1) .path_of_goals else .taken;
-        for (children, fresh, 0..) |child, *goal, at| {
-            const it = checker.item(child);
-            if (it.tag != .goal) {
-                const diagnostic = checker.fail(child, .wrong_type, "a path's items are goals", .{});
-                error_module.hint(diagnostic, "a goal is a cue and a value, such as `c1: 1`", .{});
+        /// `series[NAME]` (step 28): only `lane`, only where the parameter takes a cue by lane,
+        /// only inside a region, and only of a series with a cue for every lane.
+        fn lane_element(checker: *Checker, index: u32, name: []const u8, binding: Binding, place: LanePlace) Fail!CueRef {
+            const it = checker.item(index);
+            const lane_name = checker.tree.token_text(it.token);
+            if (!std.mem.eql(u8, lane_name, "lane")) {
+                const diagnostic = checker.fail(index, .wrong_type, "`{s}` is not an index", .{lane_name});
+                error_module.hint(diagnostic, "an index is a whole number, or `lane` inside a region", .{});
                 return error.Checked;
             }
-            const cue = try checker.cue_ref(it.a, place);
-            if (cue.by_lane) assert(place == .taken);
-            const cue_index = cue.index;
-            var goal_shape = Shape.scalar;
-            if (try checker.constant_vector(it.b)) |vector| {
-                values[at] = vector.values;
-                goal_shape = vector.shape;
-            } else {
-                values[at][0] = try checker.fixed_number(it.b, "a goal's value");
-            }
-            if (shape) |first| if (!first.eql(goal_shape)) {
-                _ = checker.fail(it.b, .wrong_shape, "this goal is {s}, and the path's first goal {s}", .{ goal_shape.noun(), first.noun() });
-                return error.Checked;
-            };
-            shape = goal_shape;
-            if (at > 0 and cue_index <= fresh[at - 1].cue) {
-                const diagnostic = checker.fail(child, .cue_out_of_order, "a path's goals are in cue order, each at a later cue", .{});
-                error_module.hint(diagnostic, "move this goal before the goals at later cues", .{});
-                return error.Checked;
-            }
-            goal.* = .{ .cue = cue_index, .value = values[at][0], .cue_by_lane = cue.by_lane };
-        }
-        const path_shape = shape.?;
-        if (path_shape.components > 1) return checker.vector_path(index, fresh, values[0..fresh.len], path_shape, declared);
-        if (!declared) {
-            for (checker.memory.paths[0..checker.path_count], 0..) |run, at| {
-                // A vector path's first run holds its shape, so it is never a path of numbers.
-                if (!run.shape.eql(Shape.scalar)) continue;
-                if (same_goals(checker.memory.goals[run.first..][0..run.count], fresh)) return @intCast(at);
-            }
-        }
-        if (fresh.len > checker.memory.goals.len - checker.goal_count) {
-            return checker.limit(index, "goals", .goals, checker.memory.goals.len);
-        }
-        if (checker.path_count == checker.memory.paths.len) return checker.limit(index, "paths", .goals, checker.memory.paths.len);
-        const first = checker.goal_count;
-        @memcpy(checker.memory.goals[first..][0..fresh.len], fresh);
-        checker.goal_count += @intCast(fresh.len);
-        const at = checker.path_count;
-        checker.memory.paths[at] = .{ .first = first, .count = @intCast(fresh.len), .declared = declared };
-        checker.path_count += 1;
-        return at;
-    }
-
-    fn region_list(checker: *Checker, index: u32, declared: bool) Fail!u32 {
-        const children = checker.tree.children(index);
-        if (children.len == 0) {
-            _ = checker.fail(index, .wrong_type, "regions are at least one range", .{});
-            return error.Checked;
-        }
-        if (children.len > run_max) return checker.fixed_limit(index, "regions in one list", run_max);
-        var buffer: [run_max]Region = undefined;
-        const fresh = buffer[0..children.len];
-        for (children, fresh) |child, *region| {
-            const range = try checker.number_range(child);
-            region.* = .{ .low = range[0], .high = range[1] };
-        }
-        if (!declared) {
-            for (checker.memory.region_runs[0..checker.run_count], 0..) |run, at| {
-                if (same_regions(checker.memory.regions[run.first..][0..run.count], fresh)) return @intCast(at);
-            }
-        }
-        if (fresh.len > checker.memory.regions.len - checker.region_count) {
-            return checker.limit(index, "regions", .regions, checker.memory.regions.len);
-        }
-        if (checker.run_count == checker.memory.region_runs.len) {
-            return checker.limit(index, "region runs", .regions, checker.memory.region_runs.len);
-        }
-        const first = checker.region_count;
-        @memcpy(checker.memory.regions[first..][0..fresh.len], fresh);
-        checker.region_count += @intCast(fresh.len);
-        const at = checker.run_count;
-        checker.memory.region_runs[at] = .{ .first = first, .count = @intCast(fresh.len), .declared = declared };
-        checker.run_count += 1;
-        return at;
-    }
-
-    fn number_range(checker: *Checker, index: u32) Fail![2]f64 {
-        if (checker.bound(index)) |arg| {
-            const saved = checker.frame;
-            checker.focus(arg.frame);
-            defer checker.focus(saved);
-            return checker.number_range(arg.item);
-        }
-        const it = checker.item(index);
-        if (it.tag != .range) {
-            const diagnostic = checker.fail(index, .wrong_type, "expected a range, found {s}", .{item_kind(it.tag)});
-            error_module.hint(diagnostic, "for example `0..1`", .{});
-            return error.Checked;
-        }
-        const low = try checker.fixed_number(it.a, "a range's end");
-        const high = try checker.fixed_number(it.b, "a range's end");
-        return .{ low, high };
-    }
-
-    /// The number at `index` where one fixed when the program is built is due (section 3b): a
-    /// literal, `pi`, `tau`, or their arithmetic, folded; anything else is refused as `what`.
-    fn fixed_number(checker: *Checker, index: u32, what: []const u8) Fail!f64 {
-        assert(index < checker.tree.items.len);
-        assert(what.len > 0);
-        if (checker.bound(index)) |arg| {
-            const saved = checker.frame;
-            checker.focus(arg.frame);
-            defer checker.focus(saved);
-            return checker.fixed_number(arg.item, what);
-        }
-        if (checker.folds(index)) return checker.fold(index);
-        const it = checker.item(index);
-        const token = checker.tree.tokens[it.token];
-        if (it.tag == .name) {
-            // A track or a signal changes after the build, and this number cannot, as `not_live` says.
-            if (checker.find(checker.text(index))) |found| switch (checker.memory.bindings[found].kind) {
-                .track, .signal => {
-                    const diagnostic = checker.fail(index, .not_live, "{s} is fixed when it is built, so `{s}` cannot set it", .{ what, checker.text(index) });
-                    error_module.hint(diagnostic, "write a number; to move it, map the output instead", .{});
+            switch (place) {
+                .taken => {},
+                .refused => {
+                    const diagnostic = checker.fail(index, .wrong_lanes, "`{s}[lane]` is a cue for each lane, which this place does not take", .{name});
+                    var buffer: [hint_list_size]u8 = undefined;
+                    error_module.hint(diagnostic, "{s}", .{checker.by_lane_list(&buffer)});
                     return error.Checked;
                 },
-                .failed => return checker.reported(),
-                else => {},
+                .path_of_goals => {
+                    const diagnostic = checker.fail(index, .wrong_lanes, "`{s}[lane]` is a cue for each lane, and a path by lane has one goal", .{name});
+                    error_module.hint(diagnostic, "write one goal, `[{s}[lane]: 1]`, or give every lane the same path, moved by `stagger:`", .{name});
+                    return error.Checked;
+                },
+                .declared_path => {
+                    const diagnostic = checker.fail(index, .wrong_lanes, "`{s}[lane]` is a cue for each lane, and a declared path is outside any region", .{name});
+                    error_module.hint(diagnostic, "write the path in the call, as `[{s}[lane]: 1]`, inside `lanes(n, …)`", .{name});
+                    return error.Checked;
+                },
+            }
+            const count = checker.region orelse {
+                const diagnostic = checker.fail(index, .wrong_lanes, "`{s}[lane]` is a cue for each lane, so it is used inside `lanes(n, …)`", .{name});
+                error_module.hint(diagnostic, "wrap the call in a region, such as `lanes({d}, …)`", .{binding.count});
+                return error.Checked;
             };
+            if (binding.count < count) {
+                const diagnostic = checker.fail(index, .wrong_lanes, "`{s}` has {d} cues and the region {d} lanes", .{ name, binding.count, count });
+                error_module.hint(diagnostic, "give the series a cue for every lane, or the region fewer lanes", .{});
+                return error.Checked;
+            }
+            return .{ .index = binding.index, .by_lane = true };
         }
-        assert(!(it.tag == .literal and token.tag == .number));
-        const diagnostic = checker.fail(index, .wrong_type, "expected {s}, found {s}", .{ what, if (it.tag == .literal) literal_kind(token.tag) else item_kind(it.tag) });
-        if (it.tag == .literal and token.tag != .string) error_module.hint(diagnostic, "drop the unit", .{});
-        return error.Checked;
-    }
 
-    /// Whether `index` folds to a number (section 3b): number literals, `pi` and `tau` where no
-    /// name shadows them, parentheses, unary minus, and `+ - * /`, through bound parameters. It
-    /// reports nothing, so a caller that finds no fold gives the message it always gave.
-    fn folds(checker: *Checker, index: u32) bool {
-        assert(index < checker.tree.items.len);
-        assert(checker.frame < checker.frame_count);
-        if (checker.bound(index)) |arg| {
-            const saved = checker.frame;
-            checker.focus(arg.frame);
-            defer checker.focus(saved);
-            return checker.folds(arg.item);
+        /// A path written as a list, declared or inline. Where `by_lane` allows it, its goal's cue
+        /// may be `series[lane]`, when it is the path's only goal (section 9a).
+        fn path_of(checker: *Checker, index: u32, declared: bool, by_lane: bool) Fail!u32 {
+            if (declared) assert(!by_lane);
+            const children = checker.tree.children(index);
+            if (children.len == 0) {
+                _ = checker.fail(index, .wrong_type, "a path has at least one goal", .{});
+                return error.Checked;
+            }
+            if (children.len > run_max) return checker.fixed_limit(index, "goals in one path", run_max);
+            var buffer: [run_max]Goal = undefined;
+            var values: [run_max][4]f64 = undefined;
+            const fresh = buffer[0..children.len];
+            var shape: ?Shape = null;
+            const place: LanePlace = if (declared) .declared_path else if (!by_lane) .refused else if (children.len > 1) .path_of_goals else .taken;
+            for (children, fresh, 0..) |child, *goal, at| {
+                const it = checker.item(child);
+                if (it.tag != .goal) {
+                    const diagnostic = checker.fail(child, .wrong_type, "a path's items are goals", .{});
+                    error_module.hint(diagnostic, "a goal is a cue and a value, such as `c1: 1`", .{});
+                    return error.Checked;
+                }
+                const cue = try checker.cue_ref(it.a, place);
+                if (cue.by_lane) assert(place == .taken);
+                const cue_index = cue.index;
+                var goal_shape = Shape.scalar;
+                if (try checker.constant_vector(it.b)) |vector| {
+                    values[at] = vector.values;
+                    goal_shape = vector.shape;
+                } else {
+                    values[at][0] = try checker.fixed_number(it.b, "a goal's value");
+                }
+                if (shape) |first| if (!first.eql(goal_shape)) {
+                    _ = checker.fail(it.b, .wrong_shape, "this goal is {s}, and the path's first goal {s}", .{ goal_shape.noun(), first.noun() });
+                    return error.Checked;
+                };
+                shape = goal_shape;
+                if (at > 0 and cue_index <= fresh[at - 1].cue) {
+                    const diagnostic = checker.fail(child, .cue_out_of_order, "a path's goals are in cue order, each at a later cue", .{});
+                    error_module.hint(diagnostic, "move this goal before the goals at later cues", .{});
+                    return error.Checked;
+                }
+                goal.* = .{ .cue = cue_index, .value = values[at][0], .cue_by_lane = cue.by_lane };
+            }
+            const path_shape = shape.?;
+            if (path_shape.components > 1) return checker.vector_path(index, fresh, values[0..fresh.len], path_shape, declared);
+            if (!declared) {
+                for (checker.memory.paths[0..checker.path_count], 0..) |run, at| {
+                    // A vector path's first run holds its shape, so it is never a path of numbers.
+                    if (!run.shape.eql(Shape.scalar)) continue;
+                    if (same_goals(checker.memory.goals[run.first..][0..run.count], fresh)) return @intCast(at);
+                }
+            }
+            if (fresh.len > checker.memory.goals.len - checker.goal_count) {
+                return checker.limit(index, "goals", .goals, checker.memory.goals.len);
+            }
+            if (checker.path_count == checker.memory.paths.len) return checker.limit(index, "paths", .goals, checker.memory.paths.len);
+            const first = checker.goal_count;
+            @memcpy(checker.memory.goals[first..][0..fresh.len], fresh);
+            checker.goal_count += @intCast(fresh.len);
+            const at = checker.path_count;
+            checker.memory.paths[at] = .{ .first = first, .count = @intCast(fresh.len), .declared = declared };
+            checker.path_count += 1;
+            return at;
         }
-        const it = checker.item(index);
-        return switch (it.tag) {
-            .literal => checker.tree.tokens[it.token].tag == .number,
-            .name => checker.known_number(index) != null,
-            .paren, .negate => checker.folds(it.a),
-            .add, .subtract, .multiply, .divide => checker.folds(it.a) and checker.folds(it.b),
-            else => false,
-        };
-    }
 
-    /// The number `index` folds to, which `folds` has said it does (section 3b). A divisor of 0
-    /// and a result that is not finite are refused here.
-    fn fold(checker: *Checker, index: u32) Fail!f64 {
-        assert(index < checker.tree.items.len);
-        assert(checker.frame < checker.frame_count);
-        if (checker.bound(index)) |arg| {
-            const saved = checker.frame;
-            checker.focus(arg.frame);
-            defer checker.focus(saved);
-            return checker.fold(arg.item);
+        fn region_list(checker: *Checker, index: u32, declared: bool) Fail!u32 {
+            const children = checker.tree.children(index);
+            if (children.len == 0) {
+                _ = checker.fail(index, .wrong_type, "regions are at least one range", .{});
+                return error.Checked;
+            }
+            if (children.len > run_max) return checker.fixed_limit(index, "regions in one list", run_max);
+            var buffer: [run_max]Region = undefined;
+            const fresh = buffer[0..children.len];
+            for (children, fresh) |child, *region| {
+                const range = try checker.number_range(child);
+                region.* = .{ .low = range[0], .high = range[1] };
+            }
+            if (!declared) {
+                for (checker.memory.region_runs[0..checker.run_count], 0..) |run, at| {
+                    if (same_regions(checker.memory.regions[run.first..][0..run.count], fresh)) return @intCast(at);
+                }
+            }
+            if (fresh.len > checker.memory.regions.len - checker.region_count) {
+                return checker.limit(index, "regions", .regions, checker.memory.regions.len);
+            }
+            if (checker.run_count == checker.memory.region_runs.len) {
+                return checker.limit(index, "region runs", .regions, checker.memory.region_runs.len);
+            }
+            const first = checker.region_count;
+            @memcpy(checker.memory.regions[first..][0..fresh.len], fresh);
+            checker.region_count += @intCast(fresh.len);
+            const at = checker.run_count;
+            checker.memory.region_runs[at] = .{ .first = first, .count = @intCast(fresh.len), .declared = declared };
+            checker.run_count += 1;
+            return at;
         }
-        const it = checker.item(index);
-        const number: f64 = switch (it.tag) {
-            .literal => literal: {
-                assert(checker.tree.tokens[it.token].tag == .number);
-                const digits_text = checker.text(index);
-                const digits = parse_float(digits_text) orelse return checker.bad_number(index);
-                break :literal if (it.a == 1) -digits else digits;
-            },
-            .name => checker.known_number(index).?,
-            .paren => try checker.fold(it.a),
-            .negate => -(try checker.fold(it.a)),
-            .add, .subtract, .multiply => operands: {
-                const a = try checker.fold(it.a);
-                const b = try checker.fold(it.b);
-                break :operands arithmetic(it.tag, a, b);
-            },
-            .divide => divide: {
-                const a = try checker.fold(it.a);
-                const by = try checker.nonzero_divisor(it.b, try checker.fold(it.b));
-                break :divide arithmetic(.divide, a, by);
-            },
-            else => unreachable,
-        };
-        if (!std.math.isFinite(number)) {
-            const span = checker.span_of(index);
-            const written = checker.located(index).tree.source[span[0]..][0..span[1]];
-            const diagnostic = checker.fail(index, .out_of_range, "`{s}` is past what a number holds", .{written});
-            error_module.hint(diagnostic, "a number is finite; keep it within about 1.8e308", .{});
+
+        fn number_range(checker: *Checker, index: u32) Fail![2]f64 {
+            if (checker.bound(index)) |arg| {
+                const saved = checker.frame;
+                checker.focus(arg.frame);
+                defer checker.focus(saved);
+                return checker.number_range(arg.item);
+            }
+            const it = checker.item(index);
+            if (it.tag != .range) {
+                const diagnostic = checker.fail(index, .wrong_type, "expected a range, found {s}", .{item_kind(it.tag)});
+                error_module.hint(diagnostic, "for example `0..1`", .{});
+                return error.Checked;
+            }
+            const low = try checker.fixed_number(it.a, "a range's end");
+            const high = try checker.fixed_number(it.b, "a range's end");
+            return .{ low, high };
+        }
+
+        /// The number at `index` where one fixed when the program is built is due (section 3b): a
+        /// literal, `pi`, `tau`, or their arithmetic, folded; anything else is refused as `what`.
+        fn fixed_number(checker: *Checker, index: u32, what: []const u8) Fail!f64 {
+            assert(index < checker.tree.items.len);
+            assert(what.len > 0);
+            if (checker.bound(index)) |arg| {
+                const saved = checker.frame;
+                checker.focus(arg.frame);
+                defer checker.focus(saved);
+                return checker.fixed_number(arg.item, what);
+            }
+            if (checker.folds(index)) return checker.fold(index);
+            const it = checker.item(index);
+            const token = checker.tree.tokens[it.token];
+            if (it.tag == .name) {
+                // A track or a signal changes after the build, and this number cannot, as
+                // `not_live` says.
+                if (checker.find(checker.text(index))) |found| switch (checker.memory.bindings[found].kind) {
+                    .track, .signal => {
+                        const diagnostic = checker.fail(index, .not_live, "{s} is fixed when it is built, so `{s}` cannot set it", .{ what, checker.text(index) });
+                        error_module.hint(diagnostic, "write a number; to move it, map the output instead", .{});
+                        return error.Checked;
+                    },
+                    .failed => return checker.reported(),
+                    else => {},
+                };
+            }
+            assert(!(it.tag == .literal and token.tag == .number));
+            const diagnostic = checker.fail(index, .wrong_type, "expected {s}, found {s}", .{ what, if (it.tag == .literal) literal_kind(token.tag) else item_kind(it.tag) });
+            if (it.tag == .literal and token.tag != .string) error_module.hint(diagnostic, "drop the unit", .{});
             return error.Checked;
         }
-        return number;
-    }
 
-    /// The value of `pi` or `tau` at `index`, a name, unless a parameter or a declaration of the
-    /// file takes the name there (section 3b).
-    fn known_number(checker: *const Checker, index: u32) ?f64 {
-        const it = checker.item(index);
-        assert(it.tag == .name);
-        const name = checker.text(index);
-        const number = schema.number_named(name) orelse return null;
-        if (checker.bound_slot(index) != null) return null;
-        // A module's body never sees the file's names (section 6), so only a parameter shadows.
-        if (checker.in_module()) return number;
-        if (checker.find(name) != null) return null;
-        if (declares_name(checker.root, name)) return null;
-        assert(std.math.isFinite(number));
-        return number;
-    }
-
-    fn bad_number(checker: *Checker, index: u32) Fail {
-        _ = checker.fail(index, .out_of_range, "the number `{s}` is not finite", .{checker.text(index)});
-        return error.Checked;
-    }
-
-    /// A time literal in whole flicks (section 4).
-    fn literal_time(checker: *Checker, index: u32) Fail!i64 {
-        if (checker.bound(index)) |arg| {
-            const saved = checker.frame;
-            checker.focus(arg.frame);
-            defer checker.focus(saved);
-            return checker.literal_time(arg.item);
+        /// Whether `index` folds to a number (section 3b): number literals, `pi` and `tau` where no
+        /// name shadows them, parentheses, unary minus, and `+ - * /`, through bound parameters. It
+        /// reports nothing, so a caller that finds no fold gives the message it always gave.
+        fn folds(checker: *Checker, index: u32) bool {
+            assert(index < checker.tree.items.len);
+            assert(checker.frame < checker.frame_count);
+            if (checker.bound(index)) |arg| {
+                const saved = checker.frame;
+                checker.focus(arg.frame);
+                defer checker.focus(saved);
+                return checker.folds(arg.item);
+            }
+            const it = checker.item(index);
+            return switch (it.tag) {
+                .literal => checker.tree.tokens[it.token].tag == .number,
+                .name => checker.known_number(index) != null,
+                .paren, .negate => checker.folds(it.a),
+                .add, .subtract, .multiply, .divide => checker.folds(it.a) and checker.folds(it.b),
+                else => false,
+            };
         }
-        const it = checker.item(index);
-        const token = if (it.tag == .literal) checker.tree.tokens[it.token] else null;
-        if (token == null or token.?.tag != .time) {
-            const diagnostic = checker.fail(index, .wrong_type, "expected a time, found {s}", .{if (token) |t| literal_kind(t.tag) else item_kind(it.tag)});
-            if (token != null and token.?.tag == .number) {
-                error_module.hint(diagnostic, "a time needs a unit: `{s}s`?", .{checker.text(index)});
-            } else {
-                error_module.hint(diagnostic, "for example `0.5s` or `500ms`", .{});
+
+        /// The number `index` folds to, which `folds` has said it does (section 3b). A divisor of 0
+        /// and a result that is not finite are refused here.
+        fn fold(checker: *Checker, index: u32) Fail!f64 {
+            assert(index < checker.tree.items.len);
+            assert(checker.frame < checker.frame_count);
+            if (checker.bound(index)) |arg| {
+                const saved = checker.frame;
+                checker.focus(arg.frame);
+                defer checker.focus(saved);
+                return checker.fold(arg.item);
+            }
+            const it = checker.item(index);
+            const number: f64 = switch (it.tag) {
+                .literal => literal: {
+                    assert(checker.tree.tokens[it.token].tag == .number);
+                    const digits_text = checker.text(index);
+                    const digits = parse_float(digits_text) orelse return checker.bad_number(index);
+                    break :literal if (it.a == 1) -digits else digits;
+                },
+                .name => checker.known_number(index).?,
+                .paren => try checker.fold(it.a),
+                .negate => -(try checker.fold(it.a)),
+                .add, .subtract, .multiply => operands: {
+                    const a = try checker.fold(it.a);
+                    const b = try checker.fold(it.b);
+                    break :operands arithmetic(it.tag, a, b);
+                },
+                .divide => divide: {
+                    const a = try checker.fold(it.a);
+                    const by = try checker.nonzero_divisor(it.b, try checker.fold(it.b));
+                    break :divide arithmetic(.divide, a, by);
+                },
+                else => unreachable,
+            };
+            if (!std.math.isFinite(number)) {
+                const span = checker.span_of(index);
+                const written = checker.located(index).tree.source[span[0]..][0..span[1]];
+                const diagnostic = checker.fail(index, .out_of_range, "`{s}` is past what a number holds", .{written});
+                error_module.hint(diagnostic, "a number is finite; keep it within about 1.8e308", .{});
+                return error.Checked;
+            }
+            return number;
+        }
+
+        /// The value of `pi` or `tau` at `index`, a name, unless a parameter or a declaration of
+        /// the file takes the name there (section 3b).
+        fn known_number(checker: *const Checker, index: u32) ?f64 {
+            const it = checker.item(index);
+            assert(it.tag == .name);
+            const name = checker.text(index);
+            const number = schema.number_named(name) orelse return null;
+            if (checker.bound_slot(index) != null) return null;
+            // A module's body never sees the file's names (section 6), so only a parameter shadows.
+            if (checker.in_module()) return number;
+            if (checker.find(name) != null) return null;
+            if (declares_name(checker.root, name)) return null;
+            assert(std.math.isFinite(number));
+            return number;
+        }
+
+        fn bad_number(checker: *Checker, index: u32) Fail {
+            _ = checker.fail(index, .out_of_range, "the number `{s}` is not finite", .{checker.text(index)});
+            return error.Checked;
+        }
+
+        /// A time literal in whole flicks (section 4).
+        fn literal_time(checker: *Checker, index: u32) Fail!i64 {
+            if (checker.bound(index)) |arg| {
+                const saved = checker.frame;
+                checker.focus(arg.frame);
+                defer checker.focus(saved);
+                return checker.literal_time(arg.item);
+            }
+            const it = checker.item(index);
+            const token = if (it.tag == .literal) checker.tree.tokens[it.token] else null;
+            if (token == null or token.?.tag != .time) {
+                const diagnostic = checker.fail(index, .wrong_type, "expected a time, found {s}", .{if (token) |t| literal_kind(t.tag) else item_kind(it.tag)});
+                if (token != null and token.?.tag == .number) {
+                    error_module.hint(diagnostic, "a time needs a unit: `{s}s`?", .{checker.text(index)});
+                } else {
+                    error_module.hint(diagnostic, "for example `0.5s` or `500ms`", .{});
+                }
+                return error.Checked;
+            }
+            // The one reader of a time literal, the public one (section 4). A time token is digits,
+            // a fraction, an exponent, and `s` or `ms`, so it is never `not_time`.
+            const result = read_time(token.?.text(checker.source()));
+            switch (result) {
+                .flicks => |flicks| return if (it.a == 1) -flicks else flicks,
+                .not_time => unreachable,
+                .exponent => {
+                    const diagnostic = checker.fail(index, .wrong_type, "a time is written without an exponent", .{});
+                    error_module.hint(diagnostic, "write its digits, such as `0.001s` or `1ms`", .{});
+                },
+                .too_large => _ = checker.fail(index, .out_of_range, "the time `{s}` does not fit in flicks", .{checker.text(index)}),
+                .not_whole => |nearest_flicks| {
+                    const diagnostic = checker.fail(index, .not_whole_flicks, "`{s}` is not a whole number of flicks", .{checker.text(index)});
+                    error_module.hint(diagnostic, "the nearest is {d} flicks; seconds are exact to 5 places, ms to 2", .{nearest_flicks});
+                },
             }
             return error.Checked;
         }
-        // The one reader of a time literal, the public one (section 4). A time token is digits,
-        // a fraction, an exponent, and `s` or `ms`, so it is never `not_time`.
-        const result = read_time(token.?.text(checker.source()));
-        switch (result) {
-            .flicks => |flicks| return if (it.a == 1) -flicks else flicks,
-            .not_time => unreachable,
-            .exponent => {
-                const diagnostic = checker.fail(index, .wrong_type, "a time is written without an exponent", .{});
-                error_module.hint(diagnostic, "write its digits, such as `0.001s` or `1ms`", .{});
-            },
-            .too_large => _ = checker.fail(index, .out_of_range, "the time `{s}` does not fit in flicks", .{checker.text(index)}),
-            .not_whole => |nearest_flicks| {
-                const diagnostic = checker.fail(index, .not_whole_flicks, "`{s}` is not a whole number of flicks", .{checker.text(index)});
-                error_module.hint(diagnostic, "the nearest is {d} flicks; seconds are exact to 5 places, ms to 2", .{nearest_flicks});
-            },
+    };
+}
+
+/// How many different names a list of entries has: a name in two roles counts once.
+fn distinct_names(comptime list: []const Entry) u32 {
+    comptime {
+        @setEvalBranchQuota(1_000_000);
+        var count: u32 = 0;
+        for (list, 0..) |entry, at| {
+            var seen = false;
+            for (list[0..at]) |earlier| seen = seen or std.mem.eql(u8, earlier.name, entry.name);
+            count += @intFromBool(!seen);
         }
-        return error.Checked;
+        return count;
     }
-};
+}
 
 fn bits(value: f64) u64 {
     return @bitCast(value);
@@ -3387,7 +3420,7 @@ fn outputs_list(entry: *const Entry, buffer: *[outputs_hint_size]u8) []const u8 
     return stream.buffered();
 }
 
-fn example_of(checker: *const Checker, param: *const schema.Param) []const u8 {
+fn example_of(checker: anytype, param: *const schema.Param) []const u8 {
     return switch (param.kind) {
         .number, .integer => "a number",
         .time => "a time, such as 0.5s",
@@ -3446,13 +3479,19 @@ fn example_wanted(entry: *const Entry, fed: bool) bool {
 const hint_list_size = 256;
 
 /// Checks `tree`, which parsed with no error, into `memory`.
-pub fn check(tree: *const Tree, memory: Memory, diagnostics: *Diagnostics) Checked {
+pub fn check(
+    comptime vocabulary: schema.Vocabulary,
+    comptime clients: []const Entry,
+    tree: *const Tree,
+    memory: Memory,
+    diagnostics: *Diagnostics,
+) Checked {
+    const Checker = CheckerOf(vocabulary, clients);
     assert(memory.values.len == memory.value_items.len);
     assert(memory.cue_forms.len == memory.cue_times.len);
     var checker: Checker = .{ .tree = tree, .root = tree, .memory = memory, .diagnostics = diagnostics };
     const before = diagnostics.total();
     assert(memory.frames.len >= frames_max);
-    for (memory.clients) |*entry| schema.assert_entry(entry);
     memory.frames[0] = .{ .tree = tree };
     checker.register(tree);
     for (tree.declarations) |index| {

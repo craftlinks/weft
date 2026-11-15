@@ -14,8 +14,9 @@
 //! The language never names a back end's table. The back end gives `check.Memory` a
 //! `schema.Vocabulary`: its entries, and three functions whose bits are its own (a folding
 //! call's value, a constructor's conversion, and the seed hash). Weft's is `src/lang/table.zig`.
-//! The functions are function pointers for now, a decided exception to the style that step 56
-//! removes with comptime vocabularies.
+//! The vocabulary exists at compile time only (step 56): the functions are plain calls, never
+//! pointers, and `check.check` takes the vocabulary and a client's entries as comptime
+//! parameters, joined into one list by `schema.join`.
 
 pub const token = @import("token.zig");
 pub const parse = @import("parse.zig");

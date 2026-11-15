@@ -880,7 +880,13 @@ the compiler already vectorizes them.
 
 The language is a front end, and Weft's signal graph is one back end. A client adds its own
 calls to the table of primitives with `Compiled.compile_client(entries, libraries, source)`, in
-one of two ways, by the entry's `op`:
+one of two ways, by the entry's `op`. The entries are known at compile time (a `const` array: the
+parameter is `comptime`), so a client's call that has the name and role of one of Weft's, or of
+another of its own, or the name of a number (`pi`) or a keyword (`seed`), stops the build with a
+message naming both. Weft's lookup, its "did you mean" hint, and its formatter all read the one
+joined list, so a client formats its files with
+`weft.lang.format.format(tree, weft.lang.entries_of(&nouns), out)` and its calls' named arguments
+take their entries' order:
 
 | `op` | What it is | What Weft's back end does | What the client does |
 |---|---|---|---|
@@ -1053,9 +1059,9 @@ $ weft sample play/signals.weft --to 1 --step 0.5 --signal wave
   `test/golden/cli`, so a change to it is a reviewed change.
 - **Exit codes**: 0 on success, 1 when the file has errors, 2 for bad arguments or a file that
   cannot be read.
-- **A client's nouns**: `Compiled.compile_client` takes entries beside the table of primitives,
-  and `describe` lists them under `nouns`. The `weft` command itself registers none, so a
-  client's own command checks its files (see A Client's Nouns).
+- **A client's nouns**: `Compiled.compile_client` takes comptime entries beside the table of
+  primitives, and `describe` lists them under `nouns`. The `weft` command itself registers none,
+  so a client's own command checks its files (see A Client's Nouns).
 
 ## Regress
 

@@ -86,7 +86,7 @@ fn gate(hint: []const u8) schema.Entry {
 }
 
 /// Checks `source` with `entries`, which the back end then refuses as `refused`.
-fn checks(entries: []const schema.Entry, source: []const u8) !void {
+fn checks(comptime entries: []const schema.Entry, source: []const u8) !void {
     try testing.expectError(error.Invalid, compiled.compile_client(entries, &.{}, source));
     try testing.expectEqual(weft.lang.diagnostic.Code.refused, compiled.errors()[0].code);
 }
@@ -97,7 +97,7 @@ fn expression(at: usize) check.Expr {
     return compiled.checked.exprs[declaration.signal.expr];
 }
 
-fn fails(entries: []const schema.Entry, source: []const u8, message: []const u8, hint: []const u8) !void {
+fn fails(comptime entries: []const schema.Entry, source: []const u8, message: []const u8, hint: []const u8) !void {
     try testing.expectError(error.Invalid, compiled.compile_client(entries, &.{}, source));
     const found = compiled.errors()[0];
     try testing.expectEqualStrings(message, found.message_text());
@@ -308,7 +308,7 @@ test "an entry's constructor rule makes one component a parameter" {
     try checks(&entries, "v = make3(1, 2, 3)\n");
     try testing.expectEqual(@as(u8, 3), expression(0).shape.components);
     try testing.expect(!expression(0).shape.colour);
-    var colour = make3;
+    comptime var colour = make3;
     colour.shape = .{ .constructor = .{ .colour = true } };
     try checks(&.{colour}, "v = make3(1, 2, 3)\n");
     try testing.expect(expression(0).shape.colour);
@@ -375,7 +375,7 @@ test "a client's cue by lane takes series[lane] in a region" {
     try testing.expectEqual(@as(u32, 3), lanes);
     try fails(&entries, head ++ "x = begin(at: beat[lane])\n", "`beat[lane]` is a cue for each lane, so it is used inside `lanes(n, …)`", "wrap the call in a region, such as `lanes(3, …)`");
     try fails(&entries, head ++ "x = lanes(3, begin(at: beat[lane], stagger: 1ms))\n", "`stagger:` and a cue chosen by lane both set when each lane starts", "each lane already starts at its own cue; drop `stagger:`");
-    var plain_cue = begin;
+    comptime var plain_cue = begin;
     plain_cue.params = &.{
         .{ .name = "at", .kind = .cue, .doc = "the cue" },
         .{ .name = "stagger", .kind = .time, .default = .{ .time = 0 }, .doc = "the delay a lane" },
@@ -395,9 +395,85 @@ test "a client's mover parameter holds its signals to one lane" {
 // Locks `of` on a shaped number: `size(2)` is one value and `size(vec2(1, 2))`, arriving as a
 // constant vector, is a vec2, where a signal parameter's expression gave its shape before.
 test "an entry's of rule reads a number parameter's shape" {
-    var numbers = size;
+    comptime var numbers = size;
     numbers.params = &.{.{ .name = "x", .kind = .number, .positional = true, .shaped = true, .doc = "the input" }};
     try checks(&.{numbers}, "a = size(2)\nb = size(vec2(1, 2))\n");
     try testing.expectEqual(@as(u8, 1), expression(0).shape.components);
     try testing.expectEqual(@as(u8, 2), expression(1).shape.components);
+}
+
+// Step 56: a client's entries are joined to Weft's at compile time, and the formatter, the hint
+// for a misspelt call, and a defaulted integer or a live frequency read the one list.
+
+const mark: schema.Entry = .{
+    .name = "mark",
+    .op = .client,
+    .role = .signal,
+    .summary = "a signal with two named parameters",
+    .params = &.{
+        .{ .name = "at", .kind = .number, .positional = true, .doc = "where" },
+        .{ .name = "size", .kind = .number, .default = .{ .number = 1 }, .doc = "how big" },
+        .{ .name = "tint", .kind = .number, .default = .{ .number = 0 }, .doc = "which shade" },
+    },
+};
+
+const repeat: schema.Entry = .{
+    .name = "repeat",
+    .op = .client,
+    .role = .signal,
+    .summary = "a signal with a defaulted integer",
+    .params = &.{.{ .name = "count", .kind = .integer, .default = .{ .number = 3 }, .doc = "how many" }},
+};
+
+const ring: schema.Entry = .{
+    .name = "ring",
+    .op = .client,
+    .role = .signal,
+    .summary = "a signal with a live frequency",
+    .params = &.{.{ .name = "rate", .kind = .frequency, .positional = true, .live = true, .doc = "cycles a second" }},
+};
+
+/// The value of the first parameter of the call the declaration `at` of the file binds.
+fn first_value(at: usize) check.Value {
+    const call = compiled.checked.calls[expression(at).a];
+    return compiled.checked.values[call.values];
+}
+
+// Locks the formatter's use of a client's entries: `mark(1, tint: 2, size: 3)` becomes `mark(1,
+// size: 3, tint: 2)` through `entries_of`, the order of the entry's parameters, and keeps its
+// written order through Weft's own list, which does not know `mark`.
+test "a client's call formats into its entry's order" {
+    const clients = [_]schema.Entry{mark};
+    try checks(&clients, "m = mark(1, tint: 2, size: 3)\n");
+    var buffer: [256]u8 = undefined;
+    const joined = try weft.lang.format.format(&compiled.syntax.tree, weft.lang.entries_of(&clients), &buffer);
+    try testing.expectEqualStrings("m = mark(1, size: 3, tint: 2)\n", joined);
+    const alone = try weft.lang.format.format(&compiled.syntax.tree, &weft.lang.table.entries, &buffer);
+    try testing.expectEqualStrings("m = mark(1, tint: 2, size: 3)\n", alone);
+}
+
+// Locks the hint for a misspelt call: `marks(1)` beside a client's `mark` is told `mark`, and a
+// Weft call is still offered (`hold`, for `holt`).
+test "a misspelt client call gets did you mean" {
+    const clients = [_]schema.Entry{mark};
+    try fails(&clients, "m = marks(1)\n", "there is no call `marks`", "did you mean `mark`?");
+    try fails(&clients, "m = noice(1)\n", "there is no call `noice`", "did you mean `noise`?");
+}
+
+// Locks TW10: a defaulted integer and a written one both read `.integer = 3`.
+test "a defaulted integer reads as an integer" {
+    const clients = [_]schema.Entry{repeat};
+    try checks(&clients, "a = repeat()\nb = repeat(count: 3)\n");
+    try testing.expectEqual(check.Value{ .integer = 3 }, first_value(0));
+    try testing.expectEqual(check.Value{ .integer = 3 }, first_value(1));
+}
+
+// Locks TW1: a live frequency given `2hz` reads `.frequency = 2`, given a signal's name reads
+// `.signal`, and given the bare number 2 is today's error with the hint to write the unit.
+test "a live frequency takes a signal and a literal needs its unit" {
+    const clients = [_]schema.Entry{ osc, ring };
+    try checks(&clients, "a = ring(2hz)\ns = osc(1)\nb = ring(s)\n");
+    try testing.expectEqual(check.Value{ .frequency = 2 }, first_value(0));
+    try testing.expectEqual(.signal, std.meta.activeTag(first_value(2)));
+    try fails(&clients, "a = ring(2)\n", "`rate` takes a frequency", "write `2hz`");
 }
