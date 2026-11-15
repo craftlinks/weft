@@ -155,7 +155,7 @@ Exit codes: 0 for success, 1 when the file has errors, 2 for bad arguments.
   `to: 2 * pi`, `0..tau`, and `lane * tau / 96` all check. A file's own `tau = …`, or a module's
   parameter named `tau`, is that name instead.
 - Up to two leading arguments go by position; the rest are named.
-- A few words are reserved: `cue`, `track`, `seed`, `start`, `use`, `module`, `lane`.
+- A few words are reserved: `cue`, `track`, `seed`, `tempo`, `start`, `use`, `module`, `lane`.
 
 ---
 
@@ -713,8 +713,8 @@ score, against 0.6 ms carried.
 - It returns `true` when every simulated signal is unchanged, and the new reader then has the old
   one's steps and checkpoints.
 - It returns `false` when any simulated signal changed, and the whole reader starts fresh, not
-  only the changed signal. A changed `seed`, `start`, `use`, or `module` line, a changed library,
-  or a file that feeds a delay also start fresh.
+  only the changed signal. A changed `seed`, `tempo`, `start`, `use`, or `module` line, a changed
+  library, or a file that feeds a delay also start fresh.
 - It returns `false` for a program with no simulated signal. There is nothing to carry.
 
 An edit that changes a simulated signal does make it jump, since it has a new history. To change

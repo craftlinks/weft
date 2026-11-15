@@ -12,7 +12,7 @@
 //!
 //! ## 2. Classes
 //! ```text
-//! keyword      seed, start, cue, track, module, use first on a line; in and every anywhere
+//! keyword      seed, tempo, start, cue, track, module, use first on a line; in and every anywhere
 //! call         a name right before `(`, a primitive or a module
 //! name         any other name: a declaration, a cue, a parameter, a word
 //! number       a number, a time, or a frequency, with its unit; a string, which only a client's
@@ -59,7 +59,7 @@ pub const palette: [8][4]f32 = .{
     .{ 0.95, 0.42, 0.42, 1 },
 };
 
-const line_keywords = [_][]const u8{ "seed", "start", "cue", "track", "module", "use" };
+const line_keywords = [_][]const u8{ "seed", "tempo", "start", "cue", "track", "module", "use" };
 
 /// The next token of `line` at or after `at.*`, which advances past it; null at the line's end.
 pub fn next(line: []const u8, at: *u32, state: *State) ?Token {
