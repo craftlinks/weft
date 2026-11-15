@@ -5,14 +5,12 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const wasm_target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
 
-    // No target of its own, so one module serves a client on any target, and links nothing.
-    // The language: a module of its own, which cannot import Weft's core.
-    const language = b.addModule("language", .{ .root_source_file = b.path("language/language.zig") });
-    const weft = b.addModule("weft", .{
-        .root_source_file = b.path("src/weft.zig"),
-        .imports = &.{.{ .name = "language", .module = language }},
-    });
-    const catalog = b.createModule(.{
+    // No target of its own, so one module serves a client on any target, and links nothing. The
+    // package is the core only and depends on nothing: the text front end is `text/`, a package
+    // of its own (step 58).
+    const weft = b.addModule("weft", .{ .root_source_file = b.path("src/weft.zig") });
+    // The core's graphs, which the text package's tests compile from text and compare with.
+    const catalog = b.addModule("catalog", .{
         .root_source_file = b.path("test/catalog.zig"),
         .imports = &.{.{ .name = "weft", .module = weft }},
     });
@@ -23,114 +21,12 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/weft.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "language", .module = language }},
-        }),
-        b.createModule(.{
-            .root_source_file = b.path("language/language.zig"),
-            .target = target,
-            .optimize = optimize,
         }),
         b.createModule(.{
             .root_source_file = b.path("test/catalog.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{.{ .name = "weft", .module = weft }},
-        }),
-        b.createModule(.{
-            .root_source_file = b.path("test/carry.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "weft", .module = weft }},
-        }),
-        b.createModule(.{
-            .root_source_file = b.path("test/modules.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "weft", .module = weft }},
-        }),
-        b.createModule(.{
-            .root_source_file = b.path("test/vectors.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "weft", .module = weft }},
-        }),
-        b.createModule(.{
-            .root_source_file = b.path("test/lanes.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "weft", .module = weft }},
-        }),
-        b.createModule(.{
-            .root_source_file = b.path("test/nouns.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "weft", .module = weft }},
-        }),
-        b.createModule(.{
-            .root_source_file = b.path("test/division.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "weft", .module = weft }},
-        }),
-        b.createModule(.{
-            .root_source_file = b.path("test/constants.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "weft", .module = weft }},
-        }),
-        b.createModule(.{
-            .root_source_file = b.path("test/forms.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "weft", .module = weft }},
-        }),
-        b.createModule(.{
-            .root_source_file = b.path("test/chains.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "weft", .module = weft }},
-        }),
-        b.createModule(.{
-            .root_source_file = b.path("test/functions.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "weft", .module = weft }},
-        }),
-        b.createModule(.{
-            .root_source_file = b.path("test/lang.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "weft", .module = weft },
-                .{ .name = "catalog", .module = catalog },
-            },
-        }),
-        b.createModule(.{
-            .root_source_file = b.path("test/by_lane.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "weft", .module = weft }},
-        }),
-        b.createModule(.{
-            .root_source_file = b.path("test/motion_by_lane.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "weft", .module = weft }},
-        }),
-        b.createModule(.{
-            .root_source_file = b.path("test/client_entries.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "weft", .module = weft }},
-        }),
-        b.createModule(.{
-            .root_source_file = b.path("test/sources.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "weft", .module = weft },
-                .{ .name = "catalog", .module = catalog },
-            },
         }),
     };
     for (test_roots) |root| {
@@ -146,42 +42,6 @@ pub fn build(b: *std.Build) void {
     rules.setCwd(b.path("."));
     rules.has_side_effects = true;
     test_step.dependOn(&rules.step);
-
-    // The `weft` command (step 14): its commands are a module of their own, so the tests call
-    // the same functions and compare the bytes with the goldens in test/golden/cli.
-    const commands = b.addModule("commands", .{
-        .root_source_file = b.path("cli/commands.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{.{ .name = "weft", .module = weft }},
-    });
-    const cli = b.addExecutable(.{
-        .name = "weft",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("cli/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "weft", .module = weft },
-                .{ .name = "commands", .module = commands },
-            },
-        }),
-    });
-    b.installArtifact(cli);
-    const cli_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("test/cli.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "weft", .module = weft },
-                .{ .name = "commands", .module = commands },
-            },
-        }),
-    });
-    const cli_run = b.addRunArtifact(cli_tests);
-    b.step("test-cli", "Compare the weft command's output with its goldens").dependOn(&cli_run.step);
-    test_step.dependOn(&cli_run.step);
 
     const wasm = b.addExecutable(.{
         .name = "weft-regress",
@@ -217,25 +77,4 @@ pub fn build(b: *std.Build) void {
     regress_run.addPassthruArgs();
     regress_run.has_side_effects = true;
     b.step("regress", "Compare sampled signals with the golden").dependOn(&regress_run.step);
-
-    // Native only, with no thresholds: its numbers depend on the machine (`tools/bench.zig`).
-    const bench = b.addExecutable(.{
-        .name = "weft-bench",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tools/bench.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "weft", .module = weft }},
-        }),
-    });
-    bench.root_module.addAnonymousImport("play_signals", .{
-        .root_source_file = b.path("play/signals.weft"),
-    });
-    bench.root_module.addAnonymousImport("play_lanes", .{
-        .root_source_file = b.path("play/lanes.weft"),
-    });
-    const bench_run = b.addRunArtifact(bench);
-    bench_run.has_side_effects = true;
-    const bench_step = b.step("bench", "Time reads on this machine (use -Doptimize=ReleaseFast)");
-    bench_step.dependOn(&bench_run.step);
 }

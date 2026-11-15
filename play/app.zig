@@ -1,6 +1,6 @@
 //! Play: Weft's own Modulator Play on Patchwork: a scope of signals around a playhead, a page of
 //! shapes whose parameters any signal can drive, a page of bouncers whose hits are events, a
-//! page where `signals.weft` is edited while it runs, a page of vectors and colours, and a page
+//! page where `signals.jig` is edited while it runs, a page of vectors and colours, and a page
 //! of a thousand lanes, and a page of forty-eight wanderers.
 //!
 //! # Deep Architectural Guide for Reviewers:
@@ -93,7 +93,7 @@
 //! scrub, a pause, or a frame rate never changes what a time shows.
 //!
 //! ## 8. The Text Page
-//! The editor holds `signals.weft`, coloured by Weft's own tokenizer (`language.zig`). Each event
+//! The editor holds `signals.jig`, coloured by Weft's own tokenizer (`language.zig`). Each event
 //! on the page goes to the editor, then to its knobs; when the editor's revision moved, the glue
 //! recompiles its text (`glue.zig`, section 3b). A text that does not compile keeps the last good
 //! program running: its errors are marked in the text and the first is named, with its place and
@@ -291,7 +291,7 @@ const page_6: Step = .{ .key = .{ .key = .other, .text = "6" } };
 const page_7: Step = .{ .key = .{ .key = .other, .text = "7" } };
 const line_end: Step = .{ .key = .{ .key = .end, .text = "" } };
 const backspace: Step = .{ .key = .{ .key = .backspace, .text = "" } };
-/// A click on line 21 of `signals.weft`, `wave = wave(sine, 0.5hz)`, which gives the editor focus.
+/// A click on line 21 of `signals.jig`, `wave = wave(sine, 0.5hz)`, which gives the editor focus.
 const click_wave_line: Step = .{ .click_at = .{
     .target = patchwork.bench.area("editor", 0),
     .x = 200,
@@ -353,7 +353,7 @@ pub const App = struct {
     swarm: glue.Swarm,
     row_dots: [glue.scope_row_count][glue.dots_max][2]f32,
     row_dot_counts: [glue.scope_row_count]u32,
-    /// The text page (section 8): `signals.weft` in the editor.
+    /// The text page (section 8): `signals.jig` in the editor.
     editor: WeftEditor,
     /// The editor's revision the running program, or the last errors, were compiled from.
     compiled_revision: u64,
@@ -895,7 +895,7 @@ pub const App = struct {
             const shown = std.fmt.bufPrint(out, "{d}:{d}  {s}   {s}", args) catch out;
             return shown;
         }
-        if (app.recompiles == 0) return "signals.weft, as built";
+        if (app.recompiles == 0) return "signals.jig, as built";
         const kept = if (app.motion.last == .carried) "readers kept their steps" else "readers started again";
         return std.fmt.bufPrint(out, "compiled, {s}", .{kept}) catch out;
     }

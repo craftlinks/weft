@@ -21,7 +21,7 @@ shapes_play    633fe0785a986398
 still          64b4c63e070effb5
 swarm          1a2577593183dc32
 swarm_play     f745740d5f927d03
-text           08010acaf0cb9cdb
+text           7baf249341f6ae49
 text_600       e113d72253e0af14
 text_edit      f5105078d05c8d97
 text_error     652b9ce59041478b

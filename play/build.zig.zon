@@ -4,7 +4,7 @@
     .fingerprint = 0x5e89deba62227b10,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
-        .weft = .{ .path = ".." },
+        .weft_text = .{ .path = "../text" },
         .patchwork = .{ .path = "../../patchwork" },
     },
     .paths = .{
@@ -17,8 +17,8 @@
         "patch.zig",
         "shapes.zig",
         "bouncers.zig",
-        "signals.weft",
-        "bouncers.weft",
+        "signals.jig",
+        "bouncers.jig",
         "test",
     },
 }

@@ -1,11 +1,11 @@
-//! Weft's language for Patchwork's editor: the token classes `signals.weft` is coloured by, from
+//! Weft's language for Patchwork's editor: the token classes `signals.jig` is coloured by, from
 //! Weft's own tokenizer, one line at a time (step 15).
 //!
 //! # Deep Architectural Guide for Reviewers:
 //!
 //! ## 1. One Tokenizer
 //! The editor asks for a line's tokens one at a time (`patchwork.editor.language`, section 2);
-//! this file asks Weft's tokenizer (`weft.lang.token.next`) and names each token's class, so the
+//! this file asks Weft's tokenizer (`jig.token.next`) and names each token's class, so the
 //! colours and the compiler can never disagree about where a token ends. No Weft token crosses a
 //! line, since a comment ends at its line's end and a string ends on the line it starts on, so
 //! the state is only `normal`.
@@ -30,8 +30,8 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const patchwork = @import("patchwork");
-const weft = @import("weft");
-const token = weft.lang.token;
+const jig = @import("jig");
+const token = jig.token;
 
 pub const State = enum(u8) { normal };
 
@@ -118,7 +118,7 @@ fn classes(line: []const u8, out: []Class) []const Class {
     return out[0..count];
 }
 
-// Locks section 2 on lines of `signals.weft`: keywords first on a line, calls before `(`, names,
+// Locks section 2 on lines of `signals.jig`: keywords first on a line, calls before `(`, names,
 // numbers with their units, operators, punctuation, and a comment to the end of the line.
 test "each token of a line has its class" {
     var out: [32]Class = undefined;

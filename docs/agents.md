@@ -6,18 +6,18 @@ add a primitive. The README says why things are as they are; this says what to d
 
 ## 1. Learn the Toolbox From the Tool
 
-Build the command once, from the root of the repository:
+Build the command once, from `text/`, Weft's text package (the command is Weft's table over Jig):
 
 ```bash
-zig build                                  # zig-out/bin/weft
+cd text && zig build                       # text/zig-out/bin/weft
 ```
 
 Then ask it, rather than guessing:
 
 ```bash
-zig-out/bin/weft describe --use std=src/lang/std.weft   # every call and module, as JSON
+zig-out/bin/weft describe --use std=src/std.jig         # every call and module, as JSON
 zig-out/bin/weft check FILE                              # ok, or errors with hints
-zig-out/bin/weft check FILE --use std=src/lang/std.weft  # a file that says `use std`
+zig-out/bin/weft check FILE --use std=src/std.jig       # a file that says `use std`
 zig-out/bin/weft sample FILE --to 4 --step 0.25          # every signal's values and events
 zig-out/bin/weft sample FILE --signal NAME               # one signal
 ```
@@ -91,7 +91,7 @@ ring = lanes(3, spring([word[lane]: 1], time: 450ms, overshoot: 0.3)) # a spring
 fb = delay(0)
 loop = chase(1 + fb * -0.8, time: 0.5s)
 fb <- loop                               # a cycle goes through a delay, fed by name
-use std                                  # the standard library: pass --use std=src/lang/std.weft
+use std                                  # the standard library: pass --use std=text/src/std.jig
 soft = snappy(moves)                     # a module: a macro with types
 far = abs(wave - 0.5) + max(rise, 0.25)  # abs, min, max: calls, per component like +
 held = clamp(sum, -1, 1)                 # std's clamp: min(max(sum, -1), 1)
@@ -135,19 +135,19 @@ Rules that trip agents most often:
 - **Spring and Newtonian goals are at cues**, not times: declare the cues first.
 - **A simulated signal** (chase, follow, shift, delay, crossing, oscillator) runs from the start
   cue, the first cue unless `start c` names another, so the file needs a cue.
-- **The format is canonical.** `weft.lang.Syntax.format_into` writes it; Play's tests compare its
+- **The format is canonical.** `weft_text.Syntax.format_into` writes it; Play's tests compare its
   files with it, so write one space after a comma and around `=`, `+`, `-`, `*`, none inside
   parentheses, and no trailing spaces.
 
 ## 3. How Play Puts a Page Together
 
 Play is a Patchwork app in `play/`, its own package. Only `signals.zig` and `glue.zig` import
-`weft` (the two-file rule; `language.zig` only for its tokenizer); every drawing file sees plain
-`f32` arrays. A page is four parts, and the lanes page (`lanes.weft`, `field.zig`) is the
+`weft` and `weft_text` (the two-file rule; `language.zig` only for `jig`'s tokenizer); every drawing file sees plain
+`f32` arrays. A page is four parts, and the lanes page (`lanes.jig`, `field.zig`) is the
 smallest complete one to copy:
 
-1. **The file**, `play/NAME.weft`, embedded with `@embedFile`.
-2. **The program**, in `signals.zig`: a struct holding a `weft.lang.Compiled` sized by `Limits`, the
+1. **The file**, `play/NAME.jig`, embedded with `@embedFile`.
+2. **The program**, in `signals.zig`: a struct holding a `weft_text.Compiled` sized by `Limits`, the
    ids it reads by name, and a `build` that compiles and asserts the node and slab counts. The
    counts are exact: `weft check` prints every one a `Limits` needs, so size it from that and
    assert the node and slab counts; a test then locks a few values. A `Limits` too small makes
@@ -197,7 +197,7 @@ runs one scenario.
 A client such as Tapestry registers nouns, calls that describe what it owns, and compiles a file
 with `compile_client`, whose entries are a comptime list: a name that two entries share is a
 compile error, and the formatter, the hint for a misspelt call, and lookup read the one joined
-list (`lang.entries_of`). In such a file you will meet two things plain Weft does not have:
+list (`weft_text.entries_of`). In such a file you will meet two things plain Weft does not have:
 
 ```txt
 ax = axes(x: -3..3, y: -1..9)            # a noun: a line of its own, bound to a name
@@ -217,7 +217,7 @@ n1 = say(b1, "Here is a parabola.")      # a string: double quotes, one line, no
 - To write a number back into the text, a knob, a slider, or a cue's time, do not walk the
   syntax tree: `compiled.cue_form(index)` and `compiled.track_form(name)` (or
   `Syntax.track_form` while the file has an error) give the bytes and say whether they are a
-  plain literal, and `weft.lang.write_time` writes a time exactly. Then compile the new text.
+  plain literal, and `jig.check.write_time` writes a time exactly. Then compile the new text.
   See the README's Writing a Number Back; Play's knobs (`track_literals`) are the worked case.
 
 ## 4. Add a Primitive
@@ -231,7 +231,7 @@ Step 33 took the short path below for eight functions.
 **A function of one value is shorter.** If the op is pure, reads one signal, and works per
 component and per lane, it is a value of `graph.Function`: its arm in `Function.of` and in
 `function_range` (`src/core/graph.zig`), its range rule in `src/core/range.zig`, and one entry in
-`src/lang/table.zig` with `tag(.function)` and `.function` set, `.shape = .{ .of = "input" }`, and
+`text/src/table.zig` with `tag(.function)` and `.function` set, `.shape = .{ .of = "input" }`, and
 `.folds = true`. `Op.apply`, `eval_node`, the checker's shape, lanes, and folding, and the back end already handle every function, so of the steps
 below it needs the range rule's test (1), the tests (3), the entry (4), and 7 to 10. A value
 whose bits could differ by target, such as `@min`, `@max`, `@sin`, `@exp`, or `@round`, is
@@ -241,7 +241,7 @@ f64 a signal can hold, infinities included, with NaN passed through and no asser
 range rule must hold for an unbounded input. A function with a whole-number parameter, as
 `pow` has, is a payload of the union and an `integer` parameter the checker bounds
 (its `range`), and `Builder.apply` refuses it by name. A catalog graph named after a call
-reads as one in `test/lang.zig`, so step 33's are `fn_NAME`.
+reads as one in `text/test/lang.zig`, so step 33's are `fn_NAME`.
 
 1. **`src/core/graph.zig`**
    - the op's struct, with a doc comment for each field, and its source struct if the client's
@@ -270,7 +270,7 @@ reads as one in `test/lang.zig`, so step 33's are `fn_NAME`.
      own loop at the end of `render`), so no existing golden line moves. Then
      `zig build regress -- --bless`, which blesses only when native and wasm agree, and
      `git diff test/golden/signals.txt` shows added lines only.
-4. **`src/lang/table.zig`**: a value of `table.Op` and an entry (stored as `tag(op)`), placed where `describe` should list it: its
+4. **`text/src/table.zig`**: a value of `table.Op` and an entry (stored as `tag(op)`), placed where `describe` should list it: its
    parameters in the builder's order and names, their kinds, defaults, and which are
    `positional`, `live`, or `shaped`, and each parameter's `doc`, one sentence on what it means
    (a test fails on a parameter without one). Fill the entry's `lanes`, which is `describe`'s
@@ -282,28 +282,28 @@ reads as one in `test/lang.zig`, so step 33's are `fn_NAME`.
    feeds, `after` for a call that continues another, `folds` for a call of constants that folds
    (its value is `fold` in the table's vocabulary), `by_lane` on a cue or path parameter, a
    parameter's `range` and `hint` and `need`, and a constructor's `converts` (its value is
-   `convert`). `schema.assert_entry` refuses an entry that names a parameter it lacks. Add it to `core_op()` in `src/lang/table.zig`, the core op its call
+   `convert`). `schema.assert_entry` refuses an entry that names a parameter it lacks. Add it to `core_op()` in `text/src/table.zig`, the core op its call
    builds, whose `Op.class` is `describe`'s `"class"`, and a call of it to `class_sample` in
-   `test/lang.zig`, which checks the two agree.
-5. **`language/check.zig`**: nothing, for an entry that declares what it needs as step 4 says. The
+   `text/test/lang.zig`, which checks the two agree.
+5. **Jig's `check.zig`**: nothing, for an entry that declares what it needs as step 4 says. The
    checker holds no list of calls; a call is one value unless its entry's `shape` says more.
    Fold with the core's own function in the table's `fold`, so the bits are the node's. Say which
    in the guide.
-6. **`src/lang/graph.zig`**: its arm in `build_call`, and a message in `refuse` for each builder
+6. **`text/src/graph.zig`**: its arm in `build_call`, and a message in `refuse` for each builder
    error a checked file can still reach.
-7. **The language's tests**: the catalog's new graph as text in `test/lang.zig`; a test file of
-   the op in `test/` with a guide at its top, wired in `build.zig`'s `test_roots`, with its
+7. **The language's tests**: the catalog's new graph as text in `text/test/lang.zig`; a test file of
+   the op in `test/` with a guide at its top, wired in `text/build.zig`'s `test_roots`, with its
    values, shapes, lanes, folding, and each error's code, message, hint, and span; and a seed
-   that calls it in `fuzz_seeds` of `src/lang/lang.zig`, since the fuzz test only mutates what
+   that calls it in `fuzz_seeds` of `text/text.zig`, since the fuzz test only mutates what
    its seeds hold.
-8. **Goldens**: `zig-out/bin/weft describe --use std=src/lang/std.weft >
+8. **Goldens**: from `text/`, `zig-out/bin/weft describe --use std=src/std.jig >
    test/golden/cli/describe.json`. It is one line, so compare old and new by characters: only
    insertions. A new call's name can also be one a test used as an unknown call
-   (`check_errors.txt`, `test/modules.zig`): change those examples to a name that will stay
-   unknown. A module added to `src/lang/std.weft` changes `check`'s limits line for every file
-   that uses `std` (`check_ok.txt`, `least` in `test/cli.zig`), since the limits count the
+   (`check_errors.txt`, `text/test/modules.zig`): change those examples to a name that will stay
+   unknown. A module added to `text/src/std.jig` changes `check`'s limits line for every file
+   that uses `std` (`check_ok.txt`, `least` in `text/test/cli.zig`), since the limits count the
    library's text.
-9. **The bench**: a value of `Kind` in `tools/bench.zig`, so the per-node case prints its cost.
+9. **The bench**: a value of `Kind` in `text/tools/bench.zig`, so the per-node case prints its cost.
 10. **Docs**: the README's op list (Graph), Language bullets, Ranges, Vectors, Costs, and Layout
     where they apply; `docs/agents.md` sections 1 and 2; and the tutorial's limits (section 16)
     and mistakes (section 17).
@@ -311,7 +311,12 @@ reads as one in `test/lang.zig`, so step 33's are `fn_NAME`.
 Run every tier, in Debug and in ReleaseFast, before calling it done:
 
 ```bash
-zig build test && zig fmt --check src test tools cli build.zig play/*.zig && zig build
-zig build regress && zig build test -Doptimize=ReleaseFast && zig build regress -Doptimize=ReleaseFast
-(cd play && zig build test && zig build regress)
+zig build test && zig fmt --check src test tools build.zig play/*.zig play/build.zig text && zig build
+zig build wasm && zig build regress && zig build regress -Doptimize=ReleaseFast
+(cd text && zig build test && zig build test-cli)
+(cd play && zig build test && zig build regress -Doptimize=ReleaseFast)
 ```
+
+An op's graph and tests are the core's (the first four lines, at the repository's root) and its
+table entry and text tests the text package's; the checker's rules are Jig's (`../jig`, its own
+`zig build test`).

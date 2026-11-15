@@ -28,7 +28,7 @@
 //! what was played. `knob` reads the parameter at t back, so a knob can show it.
 //!
 //! ## 3b. Recompiling
-//! The text page edits `signals.weft` while it runs (step 15), so `Motion` holds two compiled
+//! The text page edits `signals.jig` while it runs (step 15), so `Motion` holds two compiled
 //! files, each with its own readers' memory, and `signals` points at the running one. `recompile`
 //! builds the text into the spare file, which never touches the running one, so a text that does
 //! not compile changes nothing but `invalid`, and `problems` reads its errors. A text that

@@ -11,15 +11,16 @@ file that holds it. Section 14 lists the topics that deserve a closer look of th
 
 ## 1. The Shape of the Whole Thing
 
-Weft is about 13,000 lines of Zig with no dependencies, in two halves:
+Weft is about 15,000 lines of Zig in three places, and its root package, the engine, has no
+dependencies:
 
-| Half | Lines | Job |
+| Place | Lines | Job |
 |---|---|---|
 | `src/core/` | 7,000 (+4,000 of tests) | The engine: programs, readers, and every kind of signal |
-| `language/` | 5,700 | The front end of the text language: tokens, parser, formatter, checker; a module that imports only `std` |
-| `src/lang/` | 2,500 | Weft's side of the language: its table of primitives, the back end, and `Compiled` |
+| `../jig` | 5,700 | The front end of the text language, in its repository: tokens, parser, formatter, checker; a module that imports only `std` |
+| `text/` | 2,500 | Weft's side of the language, a package of its own: its table of primitives, the back end, and `Compiled` |
 
-Around them sit a command-line tool (`cli/`, 500 lines), a demo app (`play/`), and the tests.
+Around them sit a command-line tool (`text/cli/`, 500 lines), a demo app (`play/`), and the tests.
 
 There are three things in the engine, and understanding Weft is understanding these three and how
 little each one does:
@@ -440,8 +441,10 @@ on its own. 100,000 lanes of a typical region evaluate in about 2.5 ms.
 ## 11. The Language: A Small Compiler
 
 The language turns text into the same node array a programmer could build by hand with the
-`Builder`. Its front end is `language/`, a module that imports only `std` and checks a file
-against a `schema.Vocabulary` that Weft passes in; `src/lang/` is Weft's table and back end. It runs once, at load, so text costs nothing per frame. It is a conventional four-stage
+`Builder`. Its front end is Jig, a repository of its own (`../jig`) whose module imports only
+`std` and checks a file against a `schema.Vocabulary` that Weft passes in; `text/` is Weft's
+table and back end, a package of its own that depends on Jig and on the core. The front end's own
+account is Jig's `docs/internals.md`; this section keeps the part that is Weft's. It runs once, at load, so text costs nothing per frame. It is a conventional four-stage
 compiler, with a few unconventional constraints.
 
 ```txt
@@ -456,11 +459,11 @@ ordinary error that names the limit. A `Compiled` is therefore large and must st
 because the program points into its tables.
 
 **The language checks without building** (step 57). The front end's arrays are a struct of their
-own, `language.File(limits, vocabulary)` (`language/file.zig`): the syntax, the checker's tables,
+own, `jig.File(limits, vocabulary)` (Jig's `file.zig`): the syntax, the checker's tables,
 and the libraries, sized by `FileLimits`. `File.check_client` parses and checks and runs no back
 end, so a file of a client's own signals, which Weft's back end refuses, checks with no
 diagnostic. Weft's `Compiled` holds the same fields beside the program's, under the same names and
-types (a comptime block in `lang.zig` holds the two lists equal), and both call one function,
+types (a comptime block in `text/text.zig` holds the two lists equal), and both call one function,
 `file.check_fields`. `Compiled.check_client` is the language's part and `build_program` the
 back end's; `compile_client` is the two in order.
 
@@ -492,7 +495,7 @@ misspelt name is matched against the candidates by edit distance.
 
 When Play's editor changes the text, a new program is compiled and the reader must move to it.
 For pure signals nothing needs moving. For simulated ones, restarting would replay every step
-from zero. So (`src/lang/lang.zig`, section 5):
+from zero. So (`text/text.zig`, section 5):
 
 1. Each declaration gets a **fingerprint**: a hash of its tokens (ignoring comments and spacing)
    and of the fingerprints of the declarations it names.
@@ -511,14 +514,14 @@ values are the ones a fresh reader would compute; the carry saves the replay, no
 Weft is meant to be callable from an audio thread, where a missed deadline is an audible click.
 The rules, which the codebase calls TigerStyle after the TigerBeetle database's conventions:
 
-- **No allocation**, anywhere in `src/core`, `src/lang`, or `language/`. All memory is the caller's.
+- **No allocation**, anywhere in `src/core`, `text/` (its table and back end), or Jig. All memory is the caller's.
 - **No locks, no threads, no I/O, no clock.**
 - **Every loop is bounded**, and the bound is stated. A binary search is written as
   `for (0..33)` with an `unreachable` after it, not as `while (low < high)`.
 - **Assertions are dense.** Preconditions and invariants are asserted in the code that relies on
   them.
 
-These are checked, not merely intended. `test/rules.zig` reads every source file at each test run
+These are checked, not merely intended. `test/rules.zig` (and the text package's and Jig's own) reads every source file at each test run
 and fails if any file in the core or the language names an allocator, a thread, a lock, a file,
 or a clock. `zig build bench` runs a reader on its own thread at audio pace and reports the worst
 block.
