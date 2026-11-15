@@ -52,6 +52,14 @@
 //! a client that binds its numbers while another line has an error. Weft never edits the text:
 //! the client replaces its own bytes and compiles again, which checks the edit.
 //!
+//! ## 3b. Where Text Is Written (Jig step 3)
+//! The source map is `jig.file`'s, mirrored by hand like `cue_form`: `item_bytes` and `place_of`
+//! for a span and its line, `argument_of` and `argument_named` for what is written for a call's
+//! parameter, `constructor_parts` for a `vec2`'s parts, `declaration_of`, `declaration_of_cue`,
+//! and `names` for where a name is declared and the names in order, `setting_of` for `seed`,
+//! `tempo`, and `start`, and `readers_of` for the items that read a binding. A comptime block
+//! holds fields equal, not methods, so a method added to `jig.File` is added here by hand.
+//!
 //! ## 4. Modules and Libraries
 //! A module (step 13) is checked where it is used: the checker expands it into the arrays a
 //! hand-written graph would fill (`check.zig`, section 6), so the back end and the program never
@@ -595,6 +603,70 @@ pub fn Compiled(comptime limits: Limits) type {
         pub fn track_form(compiled: *const Self, name: []const u8) ?check.TrackForm {
             assert(compiled.ok);
             return jig.file.track_form_of(&compiled.checked, &compiled.syntax.tree, name);
+        }
+
+        /// The bytes of an item, first token to last.
+        pub fn item_bytes(compiled: *const Self, item: u32) check.Bytes {
+            return check.item_bytes(&compiled.syntax.tree, item);
+        }
+
+        /// A span's line and column, from 1.
+        pub fn place_of(compiled: *const Self, bytes: check.Bytes) jig.diagnostic.Place {
+            return jig.file.place_of(&compiled.syntax.tree, bytes);
+        }
+
+        /// The argument written for parameter `param` of the call `call` in `checked.calls`:
+        /// null when none is written (section 3b).
+        pub fn argument_of(compiled: *const Self, call: u32, param: u32) ?jig.file.Argument {
+            assert(compiled.ok);
+            return jig.file.argument_of(&compiled.checked, &compiled.syntax.tree, call, param);
+        }
+
+        /// The argument written for the parameter `name` of the call `call`.
+        pub fn argument_named(compiled: *const Self, call: u32, name: []const u8) ?jig.file.Argument {
+            assert(compiled.ok);
+            return jig.file.argument_named(&compiled.checked, &compiled.syntax.tree, call, name);
+        }
+
+        /// The parts of the constructor call at `item`, in parameter order, from the tree alone;
+        /// `entries` is the vocabulary's and the client's.
+        pub fn constructor_parts(
+            compiled: *const Self,
+            entries: []const schema.Entry,
+            item: u32,
+            out: *[schema.params_max]u32,
+        ) ?[]const u32 {
+            return jig.file.constructor_parts(&compiled.syntax.tree, entries, item, out);
+        }
+
+        /// The declaration of `name`, of any kind.
+        pub fn declaration_of(compiled: *const Self, name: []const u8) ?jig.file.Declaration {
+            assert(compiled.ok);
+            return jig.file.declaration_of(&compiled.checked, &compiled.syntax.tree, name);
+        }
+
+        /// The declaration of the cue at `cue_index` in the cue table; a series' cue gives the
+        /// series.
+        pub fn declaration_of_cue(compiled: *const Self, cue_index: u32) jig.file.Declaration {
+            assert(compiled.ok);
+            return jig.file.declaration_of_cue(&compiled.checked, &compiled.syntax.tree, cue_index);
+        }
+
+        /// The file's declared names with their kinds, in its order.
+        pub fn names(compiled: *const Self) jig.file.NameIterator {
+            assert(compiled.ok);
+            return jig.file.names_of(&compiled.checked, &compiled.syntax.tree);
+        }
+
+        /// The first line of a `seed`, `tempo`, or `start` setting, from the tree alone.
+        pub fn setting_of(compiled: *const Self, tag: parse.Tag) ?jig.file.Setting {
+            return jig.file.setting_of(&compiled.syntax.tree, tag);
+        }
+
+        /// How many items read the binding `binding_index`, the first `out.len` into `out`.
+        pub fn readers_of(compiled: *const Self, binding_index: u32, out: []u32) u32 {
+            assert(compiled.ok);
+            return jig.file.readers_of(&compiled.checked, &compiled.syntax.tree, binding_index, out);
         }
 
         /// Where the goal of the signal `name` comes from: a spring's or a Newtonian move's
