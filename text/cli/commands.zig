@@ -602,7 +602,8 @@ fn json_entry(writer: *std.Io.Writer, entry: *const schema.Entry) !void {
     try writer.writeAll("]}");
 }
 
-/// `weft parse --json`: the flat tree, one item at a time, with the children of a call or list.
+/// `weft parse --json`: the flat tree, one item at a time, with the children of a call, a list,
+/// or a module's body that names locals.
 pub fn parse(writer: *std.Io.Writer, source: Source) !bool {
     if (!scratch.parse_source(source.text)) {
         for (scratch.errors()) |found| try found.render(source.text, source.name, writer);
@@ -616,7 +617,7 @@ pub fn parse(writer: *std.Io.Writer, source: Source) !bool {
         try writer.print("{{\"index\":{d},\"tag\":\"{s}\",\"text\":", .{ at, @tagName(item.tag) });
         try json_string(writer, tree.text(index));
         try writer.print(",\"a\":{d},\"b\":{d},\"c\":{d},\"children\":[", .{ item.a, item.b, item.c });
-        if (item.tag == .call or item.tag == .list) {
+        if (item.tag == .call or item.tag == .list or item.tag == .body) {
             for (tree.children(index), 0..) |child, position| {
                 if (position > 0) try writer.writeAll(",");
                 try writer.print("{d}", .{child});

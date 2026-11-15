@@ -143,6 +143,9 @@ pub const Memory = struct {
     /// One for each checked expression, so an expression the checker shares is built once: a
     /// module's parameter used twice is one signal (`check.zig`, section 6).
     expr_ids: []?Ids,
+    /// One for each checked call, so a call two expressions share is built once: a module's local
+    /// read as `b` and as `b.velocity` is one `bounce` (Jig's step 2).
+    call_ids: []?Ids,
     /// One for each binding: the nodes its declaration built, for a recompile's carry (step 15).
     node_ranges: []NodeRange,
 };
@@ -173,6 +176,16 @@ const Back = struct {
         return ids;
     }
 
+    /// A call's nodes, built the first time any expression of it asks, so two expressions of one
+    /// call, a module local's outputs, share them.
+    fn call_built(back: *Back, call: u32) Fail!Ids {
+        assert(call < back.checked.calls.len);
+        if (back.memory.call_ids[call]) |ids| return ids;
+        const ids = try back.build_call(call);
+        back.memory.call_ids[call] = ids;
+        return ids;
+    }
+
     fn eval_uncached(back: *Back, expr_index: u32) Fail!Ids {
         const expr = back.checked.exprs[expr_index];
         assert(back.memory.expr_ids[expr_index] == null);
@@ -181,7 +194,7 @@ const Back = struct {
                 const saved = back.builder.lanes;
                 defer back.builder.lanes = saved;
                 back.builder.lanes = region_of(expr);
-                const ids = try back.build_call(expr.a);
+                const ids = try back.call_built(expr.a);
                 if (expr.b == 0) return .{ .first = ids.first, .second = ids.second };
                 assert(expr.b == 1);
                 return .{ .first = ids.second.? };
@@ -729,9 +742,11 @@ pub fn build(
     assert(memory.track_nodes.len >= checked.tracks.len);
     assert(memory.cue_times.len >= checked.cue_times.len);
     assert(memory.expr_ids.len >= checked.exprs.len);
+    assert(memory.call_ids.len >= checked.calls.len);
     assert(memory.node_ranges.len >= checked.bindings.len);
     @memset(memory.node_ranges[0..checked.bindings.len], .{ .first = 0, .end = 0 });
     @memset(memory.expr_ids[0..checked.exprs.len], null);
+    @memset(memory.call_ids[0..checked.calls.len], null);
     tables.cues = Cues.init(memory.cue_times);
     for (checked.cue_times) |flicks| _ = tables.cues.add(.{ .flicks = flicks }) catch unreachable;
     tables.tracks = track_module.Tracks.init(memory.track_entries);

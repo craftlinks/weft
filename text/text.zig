@@ -250,6 +250,7 @@ pub fn Compiled(comptime limits: Limits) type {
         goal_sources: [limits.names]GoalSource,
         track_nodes: [limits.tracks]?graph.Id,
         expr_ids: [limits.tree]?back_end.Ids,
+        call_ids: [limits.tree]?back_end.Ids,
         node_ranges: [limits.names]back_end.NodeRange,
         /// Each binding's fingerprint (section 5), for a recompile's carry.
         fingerprints: [limits.names]u64,
@@ -319,6 +320,7 @@ pub fn Compiled(comptime limits: Limits) type {
                 .goal_sources = &compiled.goal_sources,
                 .track_nodes = &compiled.track_nodes,
                 .expr_ids = &compiled.expr_ids,
+                .call_ids = &compiled.call_ids,
                 .node_ranges = &compiled.node_ranges,
             }, &compiled.tables, &compiled.syntax.diagnostics) orelse return error.Invalid;
             compiled.program = program;
@@ -884,6 +886,11 @@ test "a limit is an error that names its field" {
 
 /// The fuzz test's inputs: random bytes, then mutations of these.
 const fuzz_seeds = [_][]const u8{
+    // A module whose body names values (Jig's step 2): a block, a local read twice, a second
+    // output of a local, and a comment among the lines.
+    "cue c0 = 0s\nmodule bump(x) = # a block\n    a = abs(x)\n    # the sum\n    max(2 - a, 0) + a * a\n" ++
+        "module hit(at) =\n    b = bounce(0..1, speed: 0.7, at: at)\n    b + b.velocity\n" ++
+        "w = wave(sine, 1hz)\nout = bump(w) + hit(c0)\n",
     "seed 7\ncue c0 = 0s\ncue c1 = 2s\ntrack t = 0.5 in 0.125..2\nmoves = [c1: 1]\n" ++
         "n = noise(smooth, 1hz, seed: 1)\ns = spring(moves, time: 0.5s)\nc = chase(n, time: t)\n",
     "cue bar = 0s..10s every 2s\nb = bounce(0..1, speed: 0.7, at: bar[0])\nv = b.velocity\n" ++
