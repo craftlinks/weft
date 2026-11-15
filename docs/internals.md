@@ -16,7 +16,8 @@ Weft is about 13,000 lines of Zig with no dependencies, in two halves:
 | Half | Lines | Job |
 |---|---|---|
 | `src/core/` | 7,000 (+4,000 of tests) | The engine: programs, readers, and every kind of signal |
-| `src/lang/` | 5,800 | The text language: a compiler from `.weft` text to an engine program |
+| `language/` | 5,700 | The front end of the text language: tokens, parser, formatter, checker; a module that imports only `std` |
+| `src/lang/` | 2,500 | Weft's side of the language: its table of primitives, the back end, and `Compiled` |
 
 Around them sit a command-line tool (`cli/`, 500 lines), a demo app (`play/`), and the tests.
 
@@ -438,8 +439,9 @@ on its own. 100,000 lanes of a typical region evaluate in about 2.5 ms.
 
 ## 11. The Language: A Small Compiler
 
-`src/lang/` turns text into the same node array a programmer could build by hand with the
-`Builder`. It runs once, at load, so text costs nothing per frame. It is a conventional four-stage
+The language turns text into the same node array a programmer could build by hand with the
+`Builder`. Its front end is `language/`, a module that imports only `std` and checks a file
+against a `schema.Vocabulary` that Weft passes in; `src/lang/` is Weft's table and back end. It runs once, at load, so text costs nothing per frame. It is a conventional four-stage
 compiler, with a few unconventional constraints.
 
 ```txt
@@ -499,7 +501,7 @@ values are the ones a fresh reader would compute; the carry saves the replay, no
 Weft is meant to be callable from an audio thread, where a missed deadline is an audible click.
 The rules, which the codebase calls TigerStyle after the TigerBeetle database's conventions:
 
-- **No allocation**, anywhere in `src/core` or `src/lang`. All memory is the caller's.
+- **No allocation**, anywhere in `src/core`, `src/lang`, or `language/`. All memory is the caller's.
 - **No locks, no threads, no I/O, no clock.**
 - **Every loop is bounded**, and the bound is stated. A binary search is written as
   `for (0..33)` with an `unreachable` after it, not as `while (low < high)`.

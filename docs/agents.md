@@ -266,15 +266,17 @@ reads as one in `test/lang.zig`, so step 33's are `fn_NAME`.
      own loop at the end of `render`), so no existing golden line moves. Then
      `zig build regress -- --bless`, which blesses only when native and wasm agree, and
      `git diff test/golden/signals.txt` shows added lines only.
-4. **`src/lang/schema.zig`**: a value of `Op` and an entry, placed where `describe` should list
-   it: its parameters in the builder's order and names, their kinds, defaults, and which are
+4. **`language/schema.zig` and `src/lang/table.zig`**: a value of `Op` (in `language/schema.zig`)
+   and an entry (in `src/lang/table.zig`), placed where `describe` should list it: its
+   parameters in the builder's order and names, their kinds, defaults, and which are
    `positional`, `live`, or `shaped`, and each parameter's `doc`, one sentence on what it means
-   (a test fails on a parameter without one). Add the `Op` to `Entry.lane_rule()`, which is
-   exhaustive and is `describe`'s `"lanes"`; a pure op reading signals is `.inputs`. Add it to
-   `core_op()`, the core op its call builds, whose `Op.class` is `describe`'s `"class"`, and a
-   call of it to `class_sample` in `test/lang.zig`, which checks the two agree. Add it to
-   `event_value()` if it fires events.
-5. **`src/lang/check.zig`**:
+   (a test fails on a parameter without one). Add the `Op` to `Entry.lane_rule()` in
+   `language/schema.zig`, which is exhaustive and is `describe`'s `"lanes"`; a pure op reading
+   signals is `.inputs`. Add it to `core_op()` in `src/lang/table.zig`, the core op its call
+   builds, whose `Op.class` is `describe`'s `"class"`, and a call of it to `class_sample` in
+   `test/lang.zig`, which checks the two agree. Add it to `event_value()` in
+   `language/schema.zig` if it fires events.
+5. **`language/check.zig`**:
    - `call_shape`: a call is one number unless it has an arm, so an op with a `shaped`
      parameter needs one, or a vector argument is refused or read as one number. Use `combine`
      for `+`'s rule, or the argument's own shape for one input;

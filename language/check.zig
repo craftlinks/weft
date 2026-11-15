@@ -35,9 +35,8 @@
 //! it, the same bits on every target. Two numbers fold to their quotient itself.
 //!
 //! `abs`, `min`, and `max` (step 26), and step 33's functions of a value, are calls, not
-//! operators, and fold the same way: given only numbers, the call is the constant the core's own
-//! function gives (`graph.Function.of`, `graph.minimum`, `graph.maximum`), the bits its node
-//! would hold, so `max(1, 2)` builds one node, and a module such as `std`'s `clamp` given numbers
+//! operators, and fold the same way: given only numbers, the call is the constant the back
+//! end's own function gives (`Vocabulary.fold` and `fold_pair`), the bits its node would hold, so `max(1, 2)` builds one node, and a module such as `std`'s `clamp` given numbers
 //! builds none of its own. The call's record stays in `calls`, which a back end never reaches
 //! from an expression. A power that overflows folds to an infinity, which the back end refuses
 //! as it refuses `1e300 * 1e300`. `pow`'s `n` is a whole number from 2 to 8, fixed when the
@@ -226,18 +225,18 @@ const token_module = @import("token.zig");
 const schema = @import("schema.zig");
 /// The most modules a "did you mean" looks through.
 const modules_suggested_max = 256;
+/// The most call names a hint is chosen from; a vocabulary and a client's entries past it are not offered.
+const calls_suggested_max = 128;
 
 /// The fields of `Limits`, so a hint can only name one that exists.
-const LimitField = std.meta.FieldEnum(@import("lang.zig").Limits);
+const LimitField = std.meta.FieldEnum(@import("limits.zig").Limits);
 const Entry = schema.Entry;
 const error_module = @import("error.zig");
 const Diagnostics = error_module.List;
 const Code = error_module.Code;
-const time_module = @import("../core/time.zig");
-const noise_module = @import("../core/noise.zig");
-const colour_module = @import("../core/colour.zig");
+const limits_module = @import("limits.zig");
 
-const flicks_per_second = time_module.flicks_per_second;
+const flicks_per_second = limits_module.flicks_per_second;
 
 pub const Span = struct { first: u32, count: u32 };
 
@@ -514,6 +513,8 @@ pub const Memory = struct {
     /// A client's nouns, checked after the table of primitives (step 14), each with at most
     /// `schema.params_max` parameters, as the table's are.
     clients: []const schema.Entry = &.{},
+    /// The back end's table of calls and the functions whose bits are its own.
+    vocabulary: *const schema.Vocabulary,
 };
 
 pub const Checked = struct {
@@ -602,9 +603,7 @@ pub const run_max = 256;
 const reserved = [_][]const u8{ "seed", "start", "cue", "track", "module", "use", "lane" };
 
 /// The most lanes a region has (section 9), the core's own limit.
-const graph = @import("../core/graph.zig");
-const graph_elementary = @import("../core/elementary.zig");
-pub const lanes_max = graph.lanes_max;
+pub const lanes_max = limits_module.lanes_max;
 
 const Checker = struct {
     tree: *const Tree,
@@ -1260,13 +1259,13 @@ const Checker = struct {
                 assert(values.len == 1 or values.len == 2);
                 const x = checker.is_constant(values[0].signal) orelse return null;
                 const n = if (values.len == 2) values[1].integer else 0;
-                return entry.function_of(n).?.of(x);
+                return checker.memory.vocabulary.fold(entry.function_of(n).?, x);
             },
             .minimum, .maximum => {
                 assert(values.len == 2);
                 const a = checker.is_constant(values[0].signal) orelse return null;
                 const b = checker.is_constant(values[1].signal) orelse return null;
-                return if (entry.op == .minimum) graph.minimum(a, b) else graph.maximum(a, b);
+                return checker.memory.vocabulary.fold_pair(entry.op, a, b);
             },
             else => return null,
         }
@@ -1489,14 +1488,22 @@ const Checker = struct {
         const name = checker.text(index);
         if (checker.module_refused(name)) return checker.reported();
         const diagnostic = checker.fail_token(index, .unknown_call, "there is no call `{s}`", .{name});
-        // The primitives, then the modules in the table, the file's and its libraries'.
-        var buffer: [schema.call_names.len + modules_suggested_max][]const u8 = undefined;
-        @memcpy(buffer[0..schema.call_names.len], &schema.call_names);
+        // The vocabulary's calls, each name once, then the modules in the table, the file's and
+        // its libraries'.
+        var buffer: [calls_suggested_max + modules_suggested_max][]const u8 = undefined;
+        var count: usize = 0;
+        for (checker.memory.vocabulary.entries) |*entry| {
+            var seen = false;
+            for (buffer[0..count]) |known| seen = seen or std.mem.eql(u8, known, entry.name);
+            if (seen or count == calls_suggested_max) continue;
+            buffer[count] = entry.name;
+            count += 1;
+        }
         const modules = @min(checker.module_count, modules_suggested_max);
-        for (buffer[schema.call_names.len..][0..modules], checker.memory.modules[0..modules]) |*slot, module| {
+        for (buffer[count..][0..modules], checker.memory.modules[0..modules]) |*slot, module| {
             slot.* = module.name;
         }
-        if (error_module.nearest(name, buffer[0 .. schema.call_names.len + modules])) |near| {
+        if (error_module.nearest(name, buffer[0 .. count + modules])) |near| {
             error_module.hint(diagnostic, "did you mean `{s}`?", .{near});
         }
         return error.Checked;
@@ -1673,7 +1680,7 @@ const Checker = struct {
 
     /// The entry called `name` in `role`: a primitive, else one of the client's nouns.
     fn lookup(checker: *const Checker, name: []const u8, role: schema.Role) ?*const Entry {
-        if (schema.find(name, role)) |entry| return entry;
+        if (checker.memory.vocabulary.find(name, role)) |entry| return entry;
         for (checker.memory.clients) |*entry| {
             if (entry.role == role and std.mem.eql(u8, entry.name, name)) return entry;
         }
@@ -1802,7 +1809,7 @@ const Checker = struct {
             .module = module,
             .parent = caller,
             .body = module_item.b,
-            .seed_base = noise_module.hash(caller_frame.seed_base, std.hash.Fnv1a_64.hash(found.name) +% ordinal),
+            .seed_base = checker.memory.vocabulary.seed_hash(caller_frame.seed_base, std.hash.Fnv1a_64.hash(found.name) +% ordinal),
             .params = @intCast(params.len),
         };
         for (params, 0..) |param, at| {
@@ -1975,8 +1982,8 @@ const Checker = struct {
 
     /// `pow(x, n)`'s power: a whole number from 2 to 8 (section 3).
     fn power_in_range(checker: *Checker, index: u32, number: f64) Fail!void {
-        const low = graph_elementary.power_min;
-        const high = graph_elementary.power_max;
+        const low = limits_module.power_min;
+        const high = limits_module.power_max;
         if (number >= low and number <= high and @floor(number) == number) return;
         const diagnostic = checker.fail(index, .out_of_range, "a power is a whole number from {d} to {d}", .{ low, high });
         error_module.hint(diagnostic, "for 1 write the signal itself; for more than 8 multiply two, such as `pow(x, 8) * pow(x, 2)`", .{});
@@ -2215,7 +2222,7 @@ const Checker = struct {
                 error_module.hint(diagnostic, "write each of r, g, and b from 0 to 1", .{});
                 return error.Checked;
             };
-            const lab = colour_module.from_srgb(vector.values[0..3].*);
+            const lab = checker.memory.vocabulary.from_srgb(vector.values[0..3].*);
             vector.values = .{ lab[0], lab[1], lab[2], 0 };
         }
         return vector;
@@ -2269,7 +2276,7 @@ const Checker = struct {
         const base = frame.seed_base;
         const ordinal = frame.seeded;
         frame.seeded += 1;
-        return if (ordinal == 0) base else noise_module.hash(base, ordinal);
+        return if (ordinal == 0) base else checker.memory.vocabulary.seed_hash(base, ordinal);
     }
 
     fn argument(checker: *Checker, entry: *const Entry, param: *const schema.Param, index: u32) Fail!Value {
