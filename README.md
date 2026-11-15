@@ -893,6 +893,19 @@ take their entries' order:
 | `client` | A signal the client computes | Refuses the file | Builds its own program from `compiled.checked.calls` |
 | `noun` | A thing the client owns: an axis, a caption, a typeface | Builds the signals among its arguments, skips the call | Reads `compiled.nouns()` beside the program |
 
+**Which of the two a client calls** (step 57). `Compiled.compile_client` is for a client whose files
+Weft builds into a program: it checks and then builds. A client that builds its own program from
+`Checked.calls`, and whose file Weft refuses as `refused`, calls the language's own container,
+`weft.lang.File(limits.file(), weft.lang.table.vocabulary)` (the language's `File`), whose
+`check_client(entries, libraries, source)` parses and checks and builds nothing, so a file of only
+the client's signals checks with no diagnostic, and `Compiled.check_client` is the same call on a
+`Compiled`. `Limits` stays the flat struct a client writes, `.{ .nodes = 24, .slab = 112 }`;
+`limits.file()` is its part for the language (`weft.lang.FileLimits`). `weft check` on a file with
+a client's signal prints `ok:` with the counts the checker knows, a line that no program was
+built, and the least `FileLimits`, and exits 0; `weft sample` on it says there is nothing to
+sample. A file that mixes a client's signal with Weft's is read the same way by `check`, and
+`compile_client` still refuses it.
+
 A `noun` is how one file holds a client's score and its motion. Tapestry's scenes are the case it
 was made for:
 

@@ -311,7 +311,7 @@ const Back = struct {
             .noun => unreachable,
             .client => {
                 const diagnostic = back.fail(item, .refused, "`{s}` has no back end in Weft", .{entry.name});
-                error_module.hint(diagnostic, "a client builds its own nodes from `Checked.calls`", .{});
+                error_module.hint(diagnostic, "a client builds its own nodes from `Checked.calls`, and checks such a file with `language.File`", .{});
                 return error.Refused;
             },
             .wave => {

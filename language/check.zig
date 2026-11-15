@@ -231,8 +231,8 @@ const modules_suggested_max = 256;
 /// The most call names a hint is chosen from; the joined list's distinct names must fit.
 const calls_suggested_max = 128;
 
-/// The fields of `Limits`, so a hint can only name one that exists.
-const LimitField = std.meta.FieldEnum(@import("limits.zig").Limits);
+/// The fields of `FileLimits`, so a hint can only name one that exists.
+const LimitField = std.meta.FieldEnum(@import("limits.zig").FileLimits);
 const Entry = schema.Entry;
 const error_module = @import("error.zig");
 const Diagnostics = error_module.List;

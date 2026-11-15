@@ -21,6 +21,16 @@
 //! is built in place and never moves, as Play's `Signals` was. A full array is an error that names
 //! its field of `Limits`, never a crash.
 //!
+//! ## 2a. The Language's Part
+//! `Compiled` is two jobs in one struct (step 57). Its fields from `syntax` to `checked` are the
+//! language's, the ones `language.File(limits.file(), table.vocabulary)` has, under the same names
+//! and types, which a comptime block holds equal; the rest are the program's and its tables.
+//! `check_client` runs the language's part only, through the one function `File` calls, and
+//! leaves `program` alone; `build_program` is the back end's part; `compile_client` is the two.
+//! A client that builds its own program from `checked` and wants no Weft program calls `File`
+//! or `check_client`. `Limits` stays the flat struct a client writes and hands the language its
+//! part with `file()`; `Syntax(limits)` is the language's `Syntax` at that part.
+//!
 //! ## 3. Names for a Client
 //! The program stores no names (`graph.zig`, section 5). A client asks the `Compiled` for a
 //! signal's node, a track, a cue, or where a signal's goal comes from, by the name the text gave
@@ -105,7 +115,48 @@ pub const Diagnostic = diagnostic.Diagnostic;
 pub const GoalSource = back_end.GoalSource;
 pub const Ids = back_end.Ids;
 
-pub const Limits = language.Limits;
+/// How large a file may be: the language's tables (`language.FileLimits`) and the back end's, the
+/// program's nodes and slab and each track's samples. A flat struct, as a client writes it
+/// (step 57); `file` hands the language its part.
+/// The language's own container and limits (step 57): a file parsed and checked, no back end.
+pub const File = language.File;
+pub const FileLimits = language.FileLimits;
+
+pub const Limits = struct {
+    /// Tokens, comments and newlines included.
+    tokens: u32 = 4096,
+    /// Items of the tree, and the checker's calls and expressions.
+    tree: u32 = 4096,
+    /// Declarations and names.
+    names: u32 = 256,
+    nodes: u32 = 256,
+    /// The f64 of the program's slab.
+    slab: u32 = 4096,
+    cues: u32 = 512,
+    goals: u32 = 256,
+    regions: u32 = 64,
+    tracks: u32 = 8,
+    /// Each track's samples: the writes it can hold.
+    track_samples: u32 = 1024,
+    /// Modules in the file and its libraries.
+    modules: u32 = 32,
+    /// Libraries a file may `use`, passed to `compile_with`. None by default, so a client that
+    /// never uses one pays for no library's tree.
+    libraries: u32 = 0,
+    /// Diagnostics kept; more are counted.
+    errors: u32 = 16,
+
+    /// The language's part: every field of `language.FileLimits`, with this struct's value.
+    pub fn file(limits: Limits) language.FileLimits {
+        var result: language.FileLimits = undefined;
+        inline for (@typeInfo(language.FileLimits).@"struct".field_names) |name| {
+            @field(result, name) = @field(limits, name);
+        }
+        assert(result.tokens == limits.tokens);
+        assert(result.errors == limits.errors);
+        return result;
+    }
+};
 
 /// A library's name and its text, for `compile_with`.
 /// The one list a file is checked and formatted against: Weft's table, then a client's entries. A
@@ -116,15 +167,11 @@ pub fn entries_of(comptime clients: []const schema.Entry) []const schema.Entry {
     return schema.join(table.vocabulary, clients);
 }
 
-pub const Source = struct { name: []const u8, text: []const u8 };
+pub const Source = language.Source;
 
 /// What `Compiled.cue_name` gives for a cue (section 3): the name it was declared with, or for a
 /// cue of a series the series' name and the cue's place in it, `bar[2]`.
-pub const CueName = struct {
-    name: []const u8,
-    /// The cue's index in its series, or null for a cue declared alone.
-    element: ?u32 = null,
-};
+pub const CueName = language.file.CueName;
 
 /// Where a client writes a number back (section 3a): how a cue's time and a track's numbers
 /// are written, and the reader and writer of a time literal, all the checker's own.
@@ -164,64 +211,10 @@ fn hash_tokens(hash: *std.hash.Fnv1a_64, tree: *const parse.Tree, index: u32) vo
 /// The standard library, `std`: modules any file may `use std` for (src/lang/std.weft).
 pub const std_library = @embedFile("std.weft");
 
-/// The tokens and tree of one file, for formatting without compiling.
+/// The tokens and tree of one file, for formatting without compiling: the language's `Syntax`
+/// at the language's part of `limits`, formatting with Weft's table (step 57).
 pub fn Syntax(comptime limits: Limits) type {
-    return struct {
-        const Self = @This();
-
-        tokens: [limits.tokens]token.Token,
-        items: [limits.tree]parse.Item,
-        extra: [limits.tree]u32,
-        stack: [limits.tree]u32,
-        declarations: [limits.names]u32,
-        diagnostic_entries: [limits.errors]Diagnostic,
-        diagnostics: diagnostic.List,
-        tree: parse.Tree,
-
-        /// Parses `source`; false when it has an error, which `errors` lists.
-        pub fn parse_source(syntax: *Self, source: []const u8) bool {
-            syntax.diagnostics = .init(&syntax.diagnostic_entries);
-            const tokens = token.tokenize(source, &syntax.tokens);
-            if (tokens.full) {
-                const at: u32 = syntax.tokens[tokens.count - 1].start;
-                const found = syntax.diagnostics.add(.limit, at, 1, "the file has more than {d} tokens", .{limits.tokens});
-                diagnostic.hint(found, "raise `Limits.tokens`", .{});
-            }
-            syntax.tree = parse.parse(source, syntax.tokens[0..tokens.count], .{
-                .items = &syntax.items,
-                .extra = &syntax.extra,
-                .stack = &syntax.stack,
-                .declarations = &syntax.declarations,
-            }, &syntax.diagnostics);
-            return syntax.diagnostics.total() == 0;
-        }
-
-        pub fn errors(syntax: *const Self) []const Diagnostic {
-            return syntax.diagnostics.items();
-        }
-
-        /// The three numbers of the track `name` (section 3a), read from the tree alone, so a
-        /// client finds them while another line has an error the checker would refuse. The
-        /// first `track` line of that name, as the checker binds; null when there is none, when
-        /// its bounds are not a range, or when the parse stopped short of the whole file.
-        pub fn track_form(syntax: *const Self, name: []const u8) ?check.TrackForm {
-            const tree = &syntax.tree;
-            if (!tree.complete) return null;
-            for (tree.declarations) |index| {
-                const item = tree.item(index);
-                if (item.tag != .track) continue;
-                if (!std.mem.eql(u8, tree.token_text(item.token), name)) continue;
-                return check.track_form(tree, index);
-            }
-            return null;
-        }
-
-        /// The parsed file in the canonical format, into `out`.
-        pub fn format_into(syntax: *const Self, out: []u8) format.Error![]const u8 {
-            assert(syntax.diagnostics.total() == 0);
-            return format.format(&syntax.tree, &table.entries, out);
-        }
-    };
+    return language.Syntax(limits.file(), table.vocabulary.entries);
 }
 
 /// A compiled file: its program, its tables, and its names (section 2).
@@ -274,6 +267,18 @@ pub fn Compiled(comptime limits: Limits) type {
         program: graph.Program,
         ok: bool,
 
+        comptime {
+            // Every field of the language's `File` is here, under the same name and type, so the
+            // functions that read a `File` read this struct too and the two cannot drift
+            // (step 57).
+            const Container = language.File(limits.file(), table.vocabulary);
+            const info = @typeInfo(Container).@"struct";
+            for (info.field_names, info.field_types) |name, field_type| {
+                assert(@hasField(Self, name));
+                assert(@FieldType(Self, name) == field_type);
+            }
+        }
+
         /// Compiles `source` in place. On an error, `errors` lists what was found, and the
         /// program is not set.
         pub fn compile(compiled: *Self, source: []const u8) error{Invalid}!void {
@@ -291,40 +296,23 @@ pub fn Compiled(comptime limits: Limits) type {
         /// is set even when the back end refuses.
         pub fn compile_client(compiled: *Self, comptime clients: []const schema.Entry, libraries: []const Source, source: []const u8) error{Invalid}!void {
             compiled.ok = false;
-            compiled.failed_library = null;
-            assert(libraries.len <= limits.libraries);
-            if (comptime limits.libraries > 0) {
-                for (libraries, 0..) |library, at| {
-                    const syntax = &compiled.library_syntax[at];
-                    if (!syntax.parse_source(library.text) or !syntax.tree.complete) {
-                        compiled.failed_library = @intCast(at);
-                        return error.Invalid;
-                    }
-                    compiled.library_list[at] = .{ .name = library.name, .tree = &syntax.tree };
-                }
-            }
-            compiled.library_count = @intCast(libraries.len);
-            if (!compiled.syntax.parse_source(source) or !compiled.syntax.tree.complete) return error.Invalid;
-            compiled.checked = check.check(table.vocabulary, clients, &compiled.syntax.tree, .{
-                .modules = &compiled.modules,
-                .frames = &compiled.frames,
-                .libraries = compiled.library_list[0..libraries.len],
-                .instances = &compiled.instances,
-                .bindings = &compiled.bindings,
-                .declarations = &compiled.checked_declarations,
-                .calls = &compiled.calls,
-                .values = &compiled.values,
-                .value_items = &compiled.value_items,
-                .exprs = &compiled.exprs,
-                .cue_times = &compiled.checked_cue_times,
-                .cue_forms = &compiled.checked_cue_forms,
-                .goals = &compiled.checked_goals,
-                .paths = &compiled.checked_paths,
-                .regions = &compiled.checked_regions,
-                .region_runs = &compiled.checked_runs,
-                .tracks = &compiled.checked_tracks,
-            }, &compiled.syntax.diagnostics);
-            if (!compiled.checked.ok) return error.Invalid;
+            try compiled.check_client(clients, libraries, source);
+            return compiled.build_program(libraries);
+        }
+
+        /// The language's part of a compile (step 57): parses and checks `source` and its
+        /// `libraries` and builds no program. `checked` is valid after it, and `program` is not
+        /// touched. A file of a client's own signals checks here, which `build_program` refuses.
+        pub fn check_client(compiled: *Self, comptime clients: []const schema.Entry, libraries: []const Source, source: []const u8) error{Invalid}!void {
+            compiled.ok = false;
+            return language.file.check_fields(limits.file(), table.vocabulary, clients, compiled, libraries, source);
+        }
+
+        /// The back end's part: builds the program from `checked`, which `check_client` set, and
+        /// refuses a client's signal. `libraries` are the ones `check_client` was given.
+        pub fn build_program(compiled: *Self, libraries: []const Source) error{Invalid}!void {
+            assert(compiled.checked.ok);
+            assert(!compiled.ok);
             const program = back_end.build(&compiled.checked, &compiled.syntax.tree, .{
                 .nodes = &compiled.nodes,
                 .slab_count_max = limits.slab,
@@ -350,37 +338,42 @@ pub fn Compiled(comptime limits: Limits) type {
         /// The least `Limits` this file compiles with, as it compiled just now: every field but
         /// `track_samples` and `errors`, which the client chooses, and which keep this `limits`'
         /// values. `weft check` prints it, so a client can size a `Compiled` to a file (step 22).
+        /// The language's fields come from `language.file.needs_of`; the back end adds its own.
         pub fn needs(compiled: *const Self) Limits {
             assert(compiled.ok);
-            const checked = &compiled.checked;
-            var result: Limits = .{
-                .track_samples = limits.track_samples,
-                .errors = limits.errors,
-                .tokens = 0,
-                .tree = 0,
-                .names = 0,
+            const file = language.file.needs_of(limits.file(), compiled);
+            const tables = &compiled.tables;
+            return .{
+                .tokens = file.tokens,
+                .tree = file.tree,
+                .names = file.names,
                 .nodes = @intCast(compiled.program.nodes.len),
                 .slab = compiled.program.slab_count,
-                .cues = @intCast(@max(checked.cue_times.len, compiled.tables.cues.count)),
-                .goals = @intCast(@max(@max(checked.goals.len, checked.paths.len), compiled.tables.goals.count)),
-                .regions = @intCast(@max(@max(checked.regions.len, checked.region_runs.len), compiled.tables.regions.count)),
-                .tracks = @intCast(checked.tracks.len),
-                .modules = checked.module_count,
-                .libraries = compiled.library_count,
+                .cues = @max(file.cues, @as(u32, @intCast(tables.cues.count))),
+                .goals = @max(file.goals, @as(u32, @intCast(tables.goals.count))),
+                .regions = @max(file.regions, @as(u32, @intCast(tables.regions.count))),
+                .tracks = file.tracks,
+                .track_samples = limits.track_samples,
+                .modules = file.modules,
+                .libraries = file.libraries,
+                .errors = limits.errors,
             };
-            // The checker's calls and expressions share `tree`, and its values take two a node.
-            result.tree = @intCast(@max(@max(checked.calls.len, checked.exprs.len), (checked.values.len + 1) / 2));
-            result.names = @intCast(@max(@max(checked.bindings.len, checked.declarations.len), checked.instances.len));
-            // A library parses under the same limits as the file.
-            var trees: [limits.libraries + 1]*const parse.Tree = undefined;
-            trees[0] = &compiled.syntax.tree;
-            for (compiled.library_syntax[0..compiled.library_count], 1..) |*syntax, at| trees[at] = &syntax.tree;
-            for (trees[0 .. compiled.library_count + 1]) |tree| {
-                result.tokens = @max(result.tokens, @as(u32, @intCast(tree.tokens.len)));
-                result.tree = @max(result.tree, @as(u32, @intCast(@max(tree.items.len, tree.extra.len))));
-                result.names = @max(result.names, @as(u32, @intCast(tree.declarations.len)));
+        }
+
+        /// The least language limits the file checked with, as `check_client` left it: what
+        /// `needs` says of the language's tables, without a program (step 57).
+        pub fn file_needs(compiled: *const Self) language.FileLimits {
+            return language.file.needs_of(limits.file(), compiled);
+        }
+
+        /// The first call of the file that is a client's own signal, which Weft does not build,
+        /// as `check_client` left it; null when there is none (step 57).
+        pub fn client_signal(compiled: *const Self) ?*const schema.Entry {
+            assert(compiled.checked.ok);
+            for (compiled.checked.calls) |call| {
+                if (call.entry.op == .client) return call.entry;
             }
-            return result;
+            return null;
         }
 
         /// Each binding's fingerprint (section 5): its declaration's tokens, the fingerprint of
@@ -499,68 +492,29 @@ pub fn Compiled(comptime limits: Limits) type {
         }
 
         pub fn errors(compiled: *const Self) []const Diagnostic {
-            if (comptime limits.libraries > 0) {
-                if (compiled.failed_library) |at| return compiled.library_syntax[at].errors();
-            }
-            return compiled.syntax.errors();
+            return language.file.errors_of(limits.file(), compiled);
         }
 
         fn binding(compiled: *const Self, name: []const u8, kind: check.Binding.Kind) ?u32 {
             assert(compiled.ok);
-            for (compiled.checked.bindings, 0..) |entry, index| {
-                if (entry.kind == kind and std.mem.eql(u8, entry.name, name)) return @intCast(index);
-            }
-            return null;
+            return language.file.binding_of(&compiled.checked, name, kind);
         }
 
         /// A noun that only describes (step 27), as its declaration wrote it.
-        pub const Noun = struct {
-            /// The name it is bound to, the client's stable id for it.
-            name: []const u8,
-            entry: *const schema.Entry,
-            /// One value for each of `entry.params`, defaults filled in.
-            values: []const check.Value,
-            /// Its binding, which a `noun` value of another noun names.
-            binding: u32,
-            /// Its declaration's item in `syntax.tree`, for a client's own diagnostics.
-            item: u32,
-        };
+        pub const Noun = language.file.Noun;
 
-        pub const NounIterator = struct {
-            compiled: *const Self,
-            at: u32 = 0,
-
-            /// The next noun, in the file's order, so a noun comes after every noun it names.
-            pub fn next(iterator: *NounIterator) ?Noun {
-                const checked = &iterator.compiled.checked;
-                while (iterator.at < checked.declarations.len) {
-                    const declaration = checked.declarations[iterator.at];
-                    iterator.at += 1;
-                    if (declaration != .noun) continue;
-                    return iterator.compiled.noun_of(declaration.noun.binding);
-                }
-                return null;
-            }
-        };
+        pub const NounIterator = language.file.NounIterator;
 
         /// The file's nouns, in its order.
         pub fn nouns(compiled: *const Self) NounIterator {
             assert(compiled.ok);
-            return .{ .compiled = compiled };
+            return .{ .checked = &compiled.checked };
         }
 
         /// The noun `binding` holds, which a `noun` value names.
         pub fn noun_of(compiled: *const Self, binding_index: u32) Noun {
             assert(compiled.ok);
-            const entry = compiled.checked.bindings[binding_index];
-            assert(entry.kind == .noun);
-            return .{
-                .name = entry.name,
-                .entry = entry.entry.?,
-                .values = compiled.checked.call_values(entry.index),
-                .binding = binding_index,
-                .item = entry.item,
-            };
+            return language.file.noun_of_checked(&compiled.checked, binding_index);
         }
 
         /// The noun bound to `name`.
@@ -646,20 +600,7 @@ pub fn Compiled(comptime limits: Limits) type {
         /// Null for an index past the table.
         pub fn cue_name(compiled: *const Self, cue_index: u32) ?CueName {
             assert(compiled.ok);
-            const checked = &compiled.checked;
-            if (cue_index >= checked.cue_times.len) return null;
-            for (checked.bindings) |each| {
-                switch (each.kind) {
-                    .cue => if (each.index == cue_index) return .{ .name = each.name },
-                    .series => if (cue_index >= each.index and cue_index - each.index < each.count) {
-                        return .{ .name = each.name, .element = cue_index - each.index };
-                    },
-                    else => {},
-                }
-            }
-            // Every cue in the table was added by a `cue` declaration that bound its name, and a
-            // file that compiled refused none.
-            unreachable;
+            return language.file.cue_name_of(&compiled.checked, cue_index);
         }
 
         /// What the declaration of the cue at `cue_index` in the cue table is made of (section
@@ -667,30 +608,14 @@ pub fn Compiled(comptime limits: Limits) type {
         /// series spaced `every` a step. Null for an index past the table.
         pub fn cue_form(compiled: *const Self, cue_index: u32) ?check.CueForm {
             assert(compiled.ok);
-            const checked = &compiled.checked;
-            assert(checked.cue_forms.len == checked.cue_times.len);
-            if (cue_index >= checked.cue_forms.len) return null;
-            const form = checked.cue_forms[cue_index];
-            if (form.written()) |time| switch (time) {
-                .cue => |base| assert(base < cue_index),
-                .after => |after| assert(after.base < cue_index),
-                .literal => {},
-            };
-            return form;
+            return language.file.cue_form_of(&compiled.checked, cue_index);
         }
 
         /// The three numbers of the track `name` (section 3a): each a plain literal's bytes, or
         /// what else it is. Null for a name that is not a track.
         pub fn track_form(compiled: *const Self, name: []const u8) ?check.TrackForm {
-            const index = compiled.binding(name, .track) orelse return null;
-            const item = compiled.checked.bindings[index].item;
-            // The checker took its bounds as a range.
-            const form = check.track_form(&compiled.syntax.tree, item).?;
-            // The checker folded each, so none is a form it refuses.
-            assert(form.value.kind != .other);
-            assert(form.low.kind != .other);
-            assert(form.high.kind != .other);
-            return form;
+            assert(compiled.ok);
+            return language.file.track_form_of(&compiled.checked, &compiled.syntax.tree, name);
         }
 
         /// Where the goal of the signal `name` comes from: a spring's or a Newtonian move's

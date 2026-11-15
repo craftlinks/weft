@@ -5,7 +5,7 @@
 //!
 //! This file imports only `std`, like the rest of the module. Weft passes nothing in for these:
 //! it asserts, at comptime in `src/lang/table.zig`, that its core's own numbers equal them, so a
-//! drift fails the build. `Limits` is what a caller gives a compile: how large a file may be.
+//! drift fails the build. `FileLimits` is what a caller gives a check: how large a file may be.
 
 const std = @import("std");
 
@@ -17,25 +17,24 @@ pub const lanes_max = 1 << 20;
 pub const power_min = 2;
 pub const power_max = 8;
 
-pub const Limits = struct {
+/// How large a file may be, as far as the language's own tables go (step 57): the tokens, the
+/// tree, the names, the checker's tables, the modules, the libraries, and the diagnostics. A back
+/// end's tables (Weft's nodes and slab) are its own and sit beside these in its own `Limits`,
+/// which hands the language this part.
+pub const FileLimits = struct {
     /// Tokens, comments and newlines included.
     tokens: u32 = 4096,
     /// Items of the tree, and the checker's calls and expressions.
     tree: u32 = 4096,
     /// Declarations and names.
     names: u32 = 256,
-    nodes: u32 = 256,
-    /// The f64 of the program's slab.
-    slab: u32 = 4096,
     cues: u32 = 512,
     goals: u32 = 256,
     regions: u32 = 64,
     tracks: u32 = 8,
-    /// Each track's samples: the writes it can hold.
-    track_samples: u32 = 1024,
     /// Modules in the file and its libraries.
     modules: u32 = 32,
-    /// Libraries a file may `use`, passed to `compile_with`. None by default, so a client that
+    /// Libraries a file may `use`, passed to `check_client`. None by default, so a client that
     /// never uses one pays for no library's tree.
     libraries: u32 = 0,
     /// Diagnostics kept; more are counted.

@@ -137,8 +137,9 @@ fn language_import_allowed(io: std.Io, dir: std.Io.Dir, name: []const u8) bool {
     return true;
 }
 
-// Locks section 3: every file of `language/` (the six, the root, and `limits`) imports only `std`
-// and its own files; a planted `@import("../src/core/time.zig")` fails by file name and import.
+// Locks section 3: every file of `language/` (the six, the root, `file`, and `limits`) imports
+// only `std` and its own files; a planted `@import("../src/core/time.zig")` fails by file name
+// and import.
 test "the language imports only std and its own files" {
     const io = testing.io;
     const opener = "@import(\"";
@@ -164,6 +165,6 @@ test "the language imports only std and its own files" {
             from = start + length;
         }
     }
-    try testing.expectEqual(@as(usize, 9), files);
+    try testing.expectEqual(@as(usize, 10), files);
     try testing.expect(imports >= 8);
 }

@@ -1,0 +1,3 @@
+ok: 2 calls, 1 cues, 0 goals, 0 regions, 0 tracks
+no program: `osc` is a client's signal, which Weft does not build
+limits: .{ .tokens = 20, .tree = 8, .names = 3, .cues = 1, .goals = 0, .regions = 0, .tracks = 0, .modules = 0, .libraries = 0 }
