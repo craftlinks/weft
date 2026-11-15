@@ -270,12 +270,13 @@ reads as one in `test/lang.zig`, so step 33's are `fn_NAME`.
    and an entry (in `src/lang/table.zig`), placed where `describe` should list it: its
    parameters in the builder's order and names, their kinds, defaults, and which are
    `positional`, `live`, or `shaped`, and each parameter's `doc`, one sentence on what it means
-   (a test fails on a parameter without one). Add the `Op` to `Entry.lane_rule()` in
-   `language/schema.zig`, which is exhaustive and is `describe`'s `"lanes"`; a pure op reading
-   signals is `.inputs`. Add it to `core_op()` in `src/lang/table.zig`, the core op its call
+   (a test fails on a parameter without one). Fill the entry's `lanes`, which is `describe`'s
+   `"lanes"` (`.inputs`, the default, for a pure op reading signals), its `event` sentence if it
+   fires events, its `first_output` and `outputs` if it has more than one, and its `fixed_hint`
+   if a signal given to a fixed parameter needs a sentence of its own: they are data on the
+   entry, with no switch to extend. Add it to `core_op()` in `src/lang/table.zig`, the core op its call
    builds, whose `Op.class` is `describe`'s `"class"`, and a call of it to `class_sample` in
-   `test/lang.zig`, which checks the two agree. Add it to `event_value()` in
-   `language/schema.zig` if it fires events.
+   `test/lang.zig`, which checks the two agree.
 5. **`language/check.zig`**:
    - `call_shape`: a call is one number unless it has an arm, so an op with a `shaped`
      parameter needs one, or a vector argument is refused or read as one number. Use `combine`

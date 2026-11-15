@@ -1371,13 +1371,16 @@ const Checker = struct {
             },
         };
         const output_slot = entry.output(output_name) orelse {
-            if (base.tag == .call and entry.outputs.len == 0) {
+            if (base.tag == .call and entry.outputs.len == 0 and entry.first_output.len == 0) {
                 const vector = try checker.signal(base_index);
                 if (checker.shape_of(vector).components > 1) return checker.component_of(index, vector, output_name);
             }
             const diagnostic = checker.fail_token(index, .unknown_output, "{s} has no output `{s}`", .{ entry.name, output_name });
             if (entry.outputs.len > 0) {
-                error_module.hint(diagnostic, "its outputs are `position` and `{s}`", .{entry.outputs[0]});
+                var buffer: [outputs_hint_size]u8 = undefined;
+                error_module.hint(diagnostic, "its outputs are {s}", .{outputs_list(entry, &buffer)});
+            } else if (entry.first_output.len > 0) {
+                error_module.hint(diagnostic, "its only output is `{s}`", .{entry.first_output});
             }
             return error.Checked;
         };
@@ -2452,9 +2455,10 @@ const Checker = struct {
             }
         }
         const diagnostic = checker.fail(index, .not_live, "{s}'s `{s}` is fixed when it is built, so a signal cannot set it", .{ entry.name, param.name });
-        switch (entry.op) {
-            .spring, .newtonian => error_module.hint(diagnostic, "chase follows a moving value, and a follower's mover reads signals", .{}),
-            else => error_module.hint(diagnostic, "write {s}", .{example_of(param)}),
+        if (entry.fixed_hint.len > 0) {
+            error_module.hint(diagnostic, "{s}", .{entry.fixed_hint});
+        } else {
+            error_module.hint(diagnostic, "write {s}", .{example_of(param)});
         }
         return error.Checked;
     }
@@ -3238,6 +3242,35 @@ fn kind_name(kind: Binding.Kind) []const u8 {
     };
 }
 
+/// Room for a list of `schema.outputs_max` backquoted names and the joining words; a longer one is
+/// cut, since a client names its outputs.
+const outputs_hint_size = 256;
+
+/// The outputs of `entry` as a hint reads them, for an entry with at least one output beyond the
+/// first (so two to `schema.outputs_max` in all; one named output has a hint of its own), in order: `a` and `b`, or `a`, `b`, and `c`, and
+/// "the call itself" where the first has no name.
+fn outputs_list(entry: *const Entry, buffer: *[outputs_hint_size]u8) []const u8 {
+    const named: u32 = @intFromBool(entry.first_output.len > 0);
+    const count: u32 = 1 + @as(u32, @intCast(entry.outputs.len));
+    assert(count >= 2);
+    assert(count <= schema.outputs_max);
+    var stream = std.Io.Writer.fixed(buffer);
+    for (0..count) |index| {
+        const last = index + 1 == count;
+        if (index > 0) {
+            const joiner: []const u8 = if (count == 2) " and " else if (last) ", and " else ", ";
+            stream.writeAll(joiner) catch return stream.buffered();
+        }
+        if (index == 0 and named == 0) {
+            stream.writeAll("the call itself") catch return stream.buffered();
+        } else {
+            const name = if (index == 0) entry.first_output else entry.outputs[index - 1];
+            stream.print("`{s}`", .{name}) catch return stream.buffered();
+        }
+    }
+    return stream.buffered();
+}
+
 fn example_of(param: *const schema.Param) []const u8 {
     return switch (param.kind) {
         .number, .integer => "a number",
@@ -3264,7 +3297,10 @@ pub fn check(tree: *const Tree, memory: Memory, diagnostics: *Diagnostics) Check
     var checker: Checker = .{ .tree = tree, .root = tree, .memory = memory, .diagnostics = diagnostics };
     const before = diagnostics.total();
     assert(memory.frames.len >= frames_max);
-    for (memory.clients) |entry| assert(entry.params.len <= schema.params_max);
+    for (memory.clients) |entry| {
+        assert(entry.params.len <= schema.params_max);
+        assert(entry.outputs.len + @intFromBool(entry.first_output.len > 0) <= schema.outputs_max);
+    }
     memory.frames[0] = .{ .tree = tree };
     checker.register(tree);
     for (tree.declarations) |index| {
