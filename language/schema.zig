@@ -9,6 +9,14 @@
 //! orders named arguments by the same entry, and step 14's `describe` prints this table, which a
 //! client extends with its own nouns. A back end then reads each call by its entry's `op`.
 //!
+//! What a call is, beyond its parameters, is data on the entry too (step 54), with a default so a
+//! client's literal need not say it: `lanes`, how it takes lanes (`.inputs`); `event`, what its
+//! events carry (none); `first_output` and `outputs`, the names its outputs go by, where the
+//! first is the call itself and nameless unless `first_output` says; and `fixed_hint`, the
+//! sentence for a signal given to a fixed parameter. The checker reads them and holds no switch
+//! on an op for any. One rule stays by op: a noun has `apart` whatever `lanes` says, since a
+//! client's noun sets none.
+//!
 //! ## 2. Roles
 //! An entry is a signal or a mover. `spring` and `newtonian` have one of each: with goals they are
 //! signals, and in a `by:` slot, where the kind is `mover`, they are a follower's law. A lookup
@@ -89,6 +97,9 @@ const std = @import("std");
 const assert = std.debug.assert;
 
 pub const params_max = 24;
+
+/// The most outputs an entry names, the first included.
+pub const outputs_max = 4;
 
 pub const Kind = enum {
     /// A number fixed when the program is built: a literal, `pi`, `tau`, or their arithmetic
@@ -265,6 +276,15 @@ pub const Entry = struct {
     params: []const Param,
     /// Its outputs beyond the first, by name; the first is the call itself.
     outputs: []const []const u8 = &.{},
+    /// How a call takes lanes. `lane_rule` answers it, but `apart` for op `noun`.
+    lanes: LaneRule = .inputs,
+    /// What an event of the call carries in its `value`; null for a call with no events.
+    event: ?[]const u8 = null,
+    /// The first output's name, empty for none: then the first is the call itself, unnamed.
+    first_output: []const u8 = "",
+    /// The hint when a signal is given to a parameter fixed at build; empty gives "write
+    /// <an example>".
+    fixed_hint: []const u8 = "",
     summary: []const u8,
     /// The core function of an entry whose `op` is `function`, and null for every other. A
     /// client's entry with that `op` sets it too, as the table's are checked to. A power's n is
@@ -282,16 +302,11 @@ pub const Entry = struct {
         return null;
     }
 
+    /// How a call of this entry takes lanes: its `lanes`, except for a noun, which has none of
+    /// its own whatever it says (Tapestry's nouns set no rule, and `inputs` would change them).
     pub fn lane_rule(entry: *const Entry) LaneRule {
-        return switch (entry.op) {
-            .noise, .follow, .shift, .delay => .region,
-            .wave, .tween, .spring, .newtonian, .bounce => .stagger,
-            .chase, .crossing, .map, .oscillator, .pack, .srgb, .client => .inputs,
-            .function, .minimum, .maximum => .inputs,
-            .cues, .input, .spring_mover, .newtonian_mover => .one,
-            .lanes => .makes,
-            .noun => .apart,
-        };
+        if (entry.op == .noun) return .apart;
+        return entry.lanes;
     }
 
     /// The class of the nodes a call of this entry builds itself (section 3e), from the core's
@@ -317,14 +332,7 @@ pub const Entry = struct {
     /// What an event of this call carries in its `value`, as `event.zig` says, or null for a call
     /// with no events.
     pub fn event_value(entry: *const Entry) ?[]const u8 {
-        return switch (entry.op) {
-            .bounce => "the velocity just before the hit: +speed at the top, -speed at the bottom",
-            .crossing => "the slope over the step of the crossing, in units a second",
-            .cues => "the index of the cue in its table",
-            .spring, .newtonian, .follow => "the goal reached",
-            .shift => "the value of the bucket entered",
-            else => null,
-        };
+        return entry.event;
     }
 
     /// The core function a call of this entry applies, given its `n` where it is a power (section
@@ -346,7 +354,7 @@ pub const Entry = struct {
 
     /// The index of output `name`: 0 is the call itself.
     pub fn output(entry: *const Entry, name: []const u8) ?u32 {
-        if (std.mem.eql(u8, name, "position") and entry.op == .bounce) return 0;
+        if (entry.first_output.len > 0 and std.mem.eql(u8, entry.first_output, name)) return 0;
         for (entry.outputs, 0..) |candidate, index| {
             if (std.mem.eql(u8, candidate, name)) return @intCast(index + 1);
         }

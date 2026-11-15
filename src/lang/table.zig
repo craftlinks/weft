@@ -107,18 +107,20 @@ const decel_doc = "the deceleration while slowing to stop on the goal, in units 
 const function_input_doc = "the signal it applies to, per component of a vector or a colour";
 const radians_doc = "the signal, in radians, per component of a vector or a colour";
 
+const chase_hint = "chase follows a moving value, and a follower's mover reads signals";
+
 const written = [_]Entry{
-    .{ .name = "wave", .op = .wave, .role = .signal, .summary = "a wave of a shape at a frequency", .params = &.{
+    .{ .name = "wave", .op = .wave, .role = .signal, .lanes = .stagger, .summary = "a wave of a shape at a frequency", .params = &.{
         .{ .name = "shape", .kind = .word, .positional = true, .words = wave_words, .doc = shape_doc },
         .{ .name = "hz", .kind = .frequency, .positional = true, .doc = "cycles a second" },
         .{ .name = "stagger", .kind = .time, .default = .{ .time = 0 }, .doc = "how much later each lane reads the wave, inside `lanes(n, …)`" },
     } },
-    .{ .name = "noise", .op = .noise, .role = .signal, .summary = "seeded noise, smooth or in steps", .params = &.{
+    .{ .name = "noise", .op = .noise, .role = .signal, .lanes = .region, .summary = "seeded noise, smooth or in steps", .params = &.{
         .{ .name = "shape", .kind = .word, .positional = true, .words = noise_words, .doc = "`smooth` is a curve over the drawn values with no kinks, and `steps` holds each for its cycle" },
         .{ .name = "hz", .kind = .frequency, .positional = true, .doc = "drawn values a second" },
         .{ .name = "seed", .kind = .seed, .default = .seed, .doc = seed_doc },
     } },
-    .{ .name = "tween", .op = .tween, .role = .signal, .summary = "a move from one value to another, from a cue", .params = &.{
+    .{ .name = "tween", .op = .tween, .role = .signal, .lanes = .stagger, .summary = "a move from one value to another, from a cue", .params = &.{
         .{ .name = "from", .kind = .number, .shaped = true, .default = .after, .doc = "the value it starts from at its cue; left out, the `to` of the tween `after` names" },
         .{ .name = "to", .kind = .number, .shaped = true, .doc = "the value it lands on, exactly, at the end of `over`" },
         .{ .name = "at", .kind = .cue, .by_lane = true, .doc = "the cue it starts at, or `series[lane]` for a cue a lane" },
@@ -127,14 +129,14 @@ const written = [_]Entry{
         .{ .name = "after", .kind = .signal, .shaped = true, .default = .absent, .doc = "the signal it gives before its cue; without one it holds `from` there" },
         .{ .name = "stagger", .kind = .time, .default = .{ .time = 0 }, .doc = stagger_doc },
     } },
-    .{ .name = "spring", .op = .spring, .role = .signal, .summary = "a spring toward goals at cues", .params = &.{
+    .{ .name = "spring", .op = .spring, .role = .signal, .lanes = .stagger, .event = "the goal reached", .fixed_hint = chase_hint, .summary = "a spring toward goals at cues", .params = &.{
         .{ .name = "goals", .kind = .path, .positional = true, .shaped = true, .by_lane = true, .doc = goals_doc },
         .{ .name = "from", .kind = .number, .shaped = true, .default = .{ .number = 0 }, .doc = goal_from_doc },
         .{ .name = "time", .kind = .time, .doc = spring_time_doc },
         .{ .name = "overshoot", .kind = .number, .default = .{ .number = 0 }, .doc = overshoot_doc },
         .{ .name = "stagger", .kind = .time, .default = .{ .time = 0 }, .doc = "how much later each lane heads for its goals, inside `lanes(n, …)`" },
     } },
-    .{ .name = "newtonian", .op = .newtonian, .role = .signal, .summary = "a Newtonian move toward goals at cues", .params = &.{
+    .{ .name = "newtonian", .op = .newtonian, .role = .signal, .lanes = .stagger, .event = "the goal reached", .fixed_hint = chase_hint, .summary = "a Newtonian move toward goals at cues", .params = &.{
         .{ .name = "goals", .kind = .path, .positional = true, .shaped = true, .by_lane = true, .doc = goals_doc },
         .{ .name = "from", .kind = .number, .shaped = true, .default = .{ .number = 0 }, .doc = goal_from_doc },
         .{ .name = "speed", .kind = .number, .doc = speed_doc },
@@ -153,7 +155,7 @@ const written = [_]Entry{
         .{ .name = "rate", .kind = .signal, .doc = "the signal of its cycles a second, read at each step of 1/480 s, which may be negative" },
         .{ .name = "phase", .kind = .number, .default = .{ .number = 0 }, .doc = "where in its cycle it is at the start cue, in turns, in [0, 1)" },
     } },
-    .{ .name = "follow", .op = .follow, .role = .signal, .summary = "a follower of goals drawn from regions", .params = &.{
+    .{ .name = "follow", .op = .follow, .role = .signal, .lanes = .region, .event = "the goal reached", .summary = "a follower of goals drawn from regions", .params = &.{
         .{ .name = "regions", .kind = .regions, .positional = true, .doc = "the ranges it draws its goals from, as `[low..high, …]` or their name" },
         .{ .name = "from", .kind = .number, .default = .{ .number = 0 }, .doc = start_from_doc },
         .{ .name = "by", .kind = .mover, .doc = "how it moves to each goal: `spring(time: …)` or `newtonian(speed: …, accel: …, decel: …)`" },
@@ -162,7 +164,7 @@ const written = [_]Entry{
         .{ .name = "pause", .kind = .time_range, .default = zero_pause, .doc = "the shortest and longest rest after it arrives, drawn each time" },
         .{ .name = "seed", .kind = .seed, .default = .seed, .doc = seed_doc },
     } },
-    .{ .name = "shift", .op = .shift, .role = .signal, .summary = "a shift register of drawn buckets", .params = &.{
+    .{ .name = "shift", .op = .shift, .role = .signal, .lanes = .region, .event = "the value of the bucket entered", .summary = "a shift register of drawn buckets", .params = &.{
         .{ .name = "range", .kind = .number_range, .positional = true, .doc = "the range its buckets' values are drawn from" },
         .{ .name = "buckets", .kind = .integer, .doc = "how many values it holds and visits in turn, from 1 to 64" },
         .{ .name = "period", .kind = .time, .doc = "how long one pass over every bucket takes" },
@@ -170,25 +172,25 @@ const written = [_]Entry{
         .{ .name = "shape", .kind = .word, .words = shift_words, .doc = "`steps` holds each bucket, `linear` runs to the next, `smooth` curves through the midpoints" },
         .{ .name = "seed", .kind = .seed, .default = .seed, .doc = seed_doc },
     } },
-    .{ .name = "delay", .op = .delay, .role = .signal, .summary = "its input from one step before, fed by `<-`", .params = &.{
+    .{ .name = "delay", .op = .delay, .role = .signal, .lanes = .region, .summary = "its input from one step before, fed by `<-`", .params = &.{
         .{ .name = "initial", .kind = .number, .positional = true, .doc = "its value at the start cue, before a step of 1/480 s has passed" },
     } },
-    .{ .name = "bounce", .op = .bounce, .role = .signal, .outputs = &.{"velocity"}, .summary = "a value bouncing between two walls", .params = &.{
+    .{ .name = "bounce", .op = .bounce, .role = .signal, .lanes = .stagger, .event = "the velocity just before the hit: +speed at the top, -speed at the bottom", .first_output = "position", .outputs = &.{"velocity"}, .summary = "a value bouncing between two walls", .params = &.{
         .{ .name = "range", .kind = .number_range, .positional = true, .doc = "the two walls, `low..high`" },
         .{ .name = "speed", .kind = .number, .doc = "how fast it moves between the walls, in units a second" },
         .{ .name = "at", .kind = .cue, .by_lane = true, .doc = "the cue it leaves the low wall at, going up, or `series[lane]` for a cue a lane" },
         .{ .name = "stagger", .kind = .time, .default = .{ .time = 0 }, .doc = stagger_doc },
     } },
-    .{ .name = "crossing", .op = .crossing, .role = .signal, .summary = "a gate on a level, firing at each crossing", .params = &.{
+    .{ .name = "crossing", .op = .crossing, .role = .signal, .event = "the slope over the step of the crossing, in units a second", .summary = "a gate on a level, firing at each crossing", .params = &.{
         .{ .name = "input", .kind = .signal, .positional = true, .doc = "the signal it watches, compared at each step of 1/480 s for its events" },
         .{ .name = "level", .kind = .number, .doc = "the gate is 1 while the input is at or above it, and 0 below" },
         .{ .name = "direction", .kind = .word, .default = .{ .word = 0 }, .words = direction_words, .doc = "which crossings fire an event" },
     } },
-    .{ .name = "cues", .op = .cues, .role = .signal, .summary = "the count of cues passed, firing at each", .params = &.{
+    .{ .name = "cues", .op = .cues, .role = .signal, .lanes = .one, .event = "the index of the cue in its table", .summary = "the count of cues passed, firing at each", .params = &.{
         .{ .name = "first", .kind = .cues, .positional = true, .doc = "the series it counts, by name, or the one cue it starts at" },
         .{ .name = "count", .kind = .integer, .default = .whole, .doc = "how many cues it counts from `first`, in time order; by default the whole series, or the one cue" },
     } },
-    .{ .name = "input", .op = .input, .role = .signal, .summary = "a live value the client sets", .params = &.{
+    .{ .name = "input", .op = .input, .role = .signal, .lanes = .one, .summary = "a live value the client sets", .params = &.{
         .{ .name = "range", .kind = .number_range, .positional = true, .default = .unbounded, .doc = "the range a value the client sets is clamped into" },
         .{ .name = "initial", .kind = .number, .default = .{ .number = 0 }, .doc = "its value until the client first sets one" },
     } },
@@ -252,15 +254,15 @@ const written = [_]Entry{
         .{ .name = "g", .kind = .number, .positional = true, .doc = "green, from 0 to 1" },
         .{ .name = "b", .kind = .number, .positional = true, .doc = "blue, from 0 to 1" },
     } },
-    .{ .name = "lanes", .op = .lanes, .role = .signal, .summary = "its body over n lanes, each with its own `lane`, seeds, and stagger", .params = &.{
+    .{ .name = "lanes", .op = .lanes, .role = .signal, .lanes = .makes, .summary = "its body over n lanes, each with its own `lane`, seeds, and stagger", .params = &.{
         .{ .name = "count", .kind = .integer, .positional = true, .doc = "how many lanes, numbered from 0 by `lane`" },
         .{ .name = "body", .kind = .signal, .positional = true, .shaped = true, .doc = "what each lane computes, a name bound outside shared by them all" },
     } },
-    .{ .name = "spring", .op = .spring_mover, .role = .mover, .summary = "a follower's spring", .params = &.{
+    .{ .name = "spring", .op = .spring_mover, .role = .mover, .lanes = .one, .summary = "a follower's spring", .params = &.{
         .{ .name = "time", .kind = .time, .live = true, .doc = spring_time_doc },
         .{ .name = "overshoot", .kind = .number, .live = true, .default = .{ .number = 0 }, .doc = overshoot_doc },
     } },
-    .{ .name = "newtonian", .op = .newtonian_mover, .role = .mover, .summary = "a follower's Newtonian move", .params = &.{
+    .{ .name = "newtonian", .op = .newtonian_mover, .role = .mover, .lanes = .one, .summary = "a follower's Newtonian move", .params = &.{
         .{ .name = "speed", .kind = .number, .live = true, .doc = speed_doc },
         .{ .name = "accel", .kind = .number, .live = true, .doc = accel_doc },
         .{ .name = "decel", .kind = .number, .live = true, .doc = decel_doc },
@@ -287,6 +289,7 @@ comptime {
     @setEvalBranchQuota(20_000);
     for (entries) |entry| {
         assert(entry.params.len <= params_max);
+        assert(entry.outputs.len + @intFromBool(entry.first_output.len > 0) <= schema.outputs_max);
         assert((entry.op == .function) == (entry.function != null));
         var named = false;
         for (entry.params, 0..) |param_a, index_a| {
@@ -422,6 +425,53 @@ test "a call's class comes from the core op it builds" {
     try testing.expectEqual(null, find("spring", .mover).?.class());
     const noun: Entry = .{ .name = "axes", .op = .noun, .role = .signal, .summary = "", .params = &.{} };
     try testing.expectEqual(null, noun.class());
+}
+
+// The switches this step moved onto the entries, kept as they were so every entry's fields can be
+// held to them. Step 55 removes them and the test below with the enum.
+fn old_lanes(op: Op) schema.LaneRule {
+    return switch (op) {
+        .noise, .follow, .shift, .delay => .region,
+        .wave, .tween, .spring, .newtonian, .bounce => .stagger,
+        .chase, .crossing, .map, .oscillator, .pack, .srgb, .client => .inputs,
+        .function, .minimum, .maximum => .inputs,
+        .cues, .input, .spring_mover, .newtonian_mover => .one,
+        .lanes => .makes,
+        .noun => .apart,
+    };
+}
+
+fn old_event(op: Op) ?[]const u8 {
+    return switch (op) {
+        .bounce => "the velocity just before the hit: +speed at the top, -speed at the bottom",
+        .crossing => "the slope over the step of the crossing, in units a second",
+        .cues => "the index of the cue in its table",
+        .spring, .newtonian, .follow => "the goal reached",
+        .shift => "the value of the bucket entered",
+        else => null,
+    };
+}
+
+fn old_fixed_hint(op: Op) []const u8 {
+    return switch (op) {
+        .spring, .newtonian => "chase follows a moving value, and a follower's mover reads signals",
+        else => "",
+    };
+}
+
+// Locks that every entry's `lanes`, `event`, `fixed_hint`, and `first_output` are what the old
+// switches gave: only a bounce names a first output, only a spring and a Newtonian move have a
+// fixed hint, and the seven event sentences are word for word.
+// Step 55 removes this test with the enum.
+test "the entries' fields equal the old switches" {
+    for (entries) |entry| {
+        try testing.expectEqual(old_lanes(entry.op), entry.lane_rule());
+        try testing.expectEqualDeep(old_event(entry.op), entry.event_value());
+        try testing.expectEqualStrings(old_fixed_hint(entry.op), entry.fixed_hint);
+        const expected: []const u8 = if (entry.op == .bounce) "position" else "";
+        try testing.expectEqualStrings(expected, entry.first_output);
+    }
+    try testing.expectEqual(@as(?u32, 0), find("bounce", .signal).?.output("position"));
 }
 
 // The formatter's tests, here since they format Weft's calls in the order of Weft's table (step 53).
