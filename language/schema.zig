@@ -17,6 +17,13 @@
 //! on an op for any. One rule stays by op: a noun has `apart` whatever `lanes` says, since a
 //! client's noun sets none.
 //!
+//! Step 55a adds what the checker acts on, also data on the entry and defaulted: `shape`, how the
+//! call's value is shaped from its parameters (`ShapeRule`); `fed`, whether `<-` may feed it;
+//! `after`, which parameter names the call it continues and which of its values a left-out
+//! default takes (section 3b); and `kind()`, a signal or a noun. A parameter's `by_lane` is
+//! honoured wherever it is declared, a client's included, and a parameter of kind `mover` holds
+//! its mover's signals to one lane. `assert_entry` keeps the rules every entry keeps.
+//!
 //! ## 2. Roles
 //! An entry is a signal or a mover. `spring` and `newtonian` have one of each: with goals they are
 //! signals, and in a `by:` slot, where the kind is `mover`, they are a follower's law. A lookup
@@ -172,7 +179,8 @@ pub const Param = struct {
     words: []const []const u8 = &.{},
     /// A cue that may be chosen by lane, `series[lane]` inside a region (step 28): the `at` of a
     /// `tween` and a `bounce`, which start lane g at the series' cue g, and the `goals` of a
-    /// `spring` and a `newtonian` (step 39), whose path's only goal may be at such a cue.
+    /// `spring` and a `newtonian` (step 39), whose path's only goal may be at such a cue. Any
+    /// entry's cue or path may declare it, with the `stagger` lane rule (`assert_entry`).
     by_lane: bool = false,
     /// What the parameter means, one sentence, which `describe` prints (section 3d). Every
     /// parameter of `entries` has one; a client's entry may leave it empty.
@@ -180,6 +188,45 @@ pub const Param = struct {
 };
 
 pub const Role = enum { signal, mover };
+
+/// How a call's value is shaped (step 55, section 5): a number, a vector of 2 to 4 numbers, or a
+/// colour. An entry says which of its parameters the value takes its shape from, and the checker
+/// holds no list of calls for it.
+pub const ShapeRule = union(enum) {
+    /// One value: every call not named below.
+    one,
+    /// The shape of this signal parameter: `chase`'s target, a function's input.
+    of: []const u8,
+    /// These two parameters agree, a number broadcast to a vector and never to a colour. The first
+    /// may be a path, whose goals' shape is meant.
+    agree: [2][]const u8,
+    /// These two parameters combine as `+` combines two signals: a number meets each component of
+    /// a vector, and a colour never meets a vector.
+    combine: [2][]const u8,
+    /// One component a parameter, alike or not: `vec2`, `vec3`, `oklab`, `srgb`.
+    constructor: Constructor,
+};
+
+/// What a constructor makes of its parameters (section 5).
+pub const Constructor = struct {
+    /// The value is a colour, not a vector.
+    colour: bool = false,
+    /// Its numbers, written as numbers, are converted where they are written (section 5).
+    converts: bool = false,
+};
+
+/// An entry whose call continues the call of the same entry its parameter `by` names (step 31):
+/// the parameter whose default is `.after` is left out, and takes the value of `takes` in that
+/// call.
+pub const After = struct { by: []const u8, takes: []const u8 };
+
+/// What a call is for, beyond how it is built (section 5).
+pub const EntryKind = enum {
+    /// A call whose value is a signal.
+    signal,
+    /// A call that only describes something, and is a declaration's whole value (section 3a).
+    noun,
+};
 
 /// What a back end builds for an entry.
 pub const Op = enum {
@@ -293,6 +340,13 @@ pub const Entry = struct {
     /// The class of the nodes its call builds itself, which its back end fills; null for one
     /// that builds none.
     node_class: ?NodeClass = null,
+    /// How a call's value is shaped (section 5).
+    shape: ShapeRule = .one,
+    /// A call of it may be fed by `<-`, as `delay` is, and a region of such calls is fed.
+    fed: bool = false,
+    /// Which parameter names the call this one continues, and which of that call's values this
+    /// one's `.after` default takes. Set exactly when a parameter's default is `.after`.
+    after: ?After = null,
 
     /// The index of the parameter `name`, if the entry has one.
     pub fn param(entry: *const Entry, name: []const u8) ?u32 {
@@ -305,8 +359,14 @@ pub const Entry = struct {
     /// How a call of this entry takes lanes: its `lanes`, except for a noun, which has none of
     /// its own whatever it says (Tapestry's nouns set no rule, and `inputs` would change them).
     pub fn lane_rule(entry: *const Entry) LaneRule {
-        if (entry.op == .noun) return .apart;
+        if (entry.kind() == .noun) return .apart;
         return entry.lanes;
+    }
+
+    /// Whether a call of this entry is a signal or a noun, read from its `op` since a client's
+    /// noun sets no other field (section 5).
+    pub fn kind(entry: *const Entry) EntryKind {
+        return if (entry.op == .noun) .noun else .signal;
     }
 
     /// The class of the nodes a call of this entry builds itself (section 3e), from the core's
@@ -361,6 +421,72 @@ pub const Entry = struct {
         return null;
     }
 };
+
+/// The rules every entry keeps, the table's and a client's alike (section 4): at most `params_max`
+/// parameters and `outputs_max` outputs, positional parameters before named ones, distinct
+/// names, words where a parameter takes them, and the fields of section 5 naming parameters the
+/// entry has. It holds no rule about a default's agreement with its kind, which a client's nouns
+/// do not keep (Weft's own table checks that itself).
+pub fn assert_entry(entry: *const Entry) void {
+    assert(entry.params.len <= params_max);
+    assert(entry.outputs.len + @intFromBool(entry.first_output.len > 0) <= outputs_max);
+    var named = false;
+    var after_defaults: u32 = 0;
+    var by_lane_count: u32 = 0;
+    for (entry.params, 0..) |param_a, index_a| {
+        if (param_a.positional) assert(!named) else named = true;
+        if (param_a.kind == .word or param_a.kind == .ease) assert(param_a.words.len > 0);
+        for (entry.params[index_a + 1 ..]) |param_b| assert(!std.mem.eql(u8, param_a.name, param_b.name));
+        if (param_a.default == .after) {
+            after_defaults += 1;
+            assert(param_a.kind == .number);
+            assert(param_a.shaped);
+        }
+        if (param_a.by_lane) {
+            by_lane_count += 1;
+            assert(param_a.kind == .cue or param_a.kind == .path);
+        }
+    }
+    assert(after_defaults <= 1);
+    assert((after_defaults == 1) == (entry.after != null));
+    assert(by_lane_count <= 1);
+    if (by_lane_count == 1) assert(entry.lane_rule() == .stagger);
+    if (entry.lane_rule() == .stagger) {
+        const at = entry.param("stagger");
+        assert(at != null);
+        assert(entry.params[at.?].kind == .time);
+    }
+    switch (entry.shape) {
+        .one => {},
+        .of => |name| {
+            const at = entry.param(name);
+            assert(at != null);
+            const param = entry.params[at.?];
+            assert(param.kind == .signal or (param.kind == .number and param.shaped));
+        },
+        .agree => |names| {
+            assert(entry.param(names[0]) != null);
+            assert(entry.param(names[1]) != null);
+        },
+        .combine => |names| {
+            const left = entry.param(names[0]);
+            const right = entry.param(names[1]);
+            assert(left != null);
+            assert(right != null);
+            assert(entry.params[left.?].kind == .signal);
+            assert(entry.params[right.?].kind == .signal);
+        },
+        .constructor => |constructor| {
+            assert(entry.params.len >= 2);
+            assert(entry.params.len <= 4);
+            if (constructor.converts) assert(entry.params.len == 3);
+        },
+    }
+    if (entry.after) |after| {
+        assert(entry.param(after.by) != null);
+        assert(entry.param(after.takes) != null);
+    }
+}
 
 fn words_of(comptime E: type) []const []const u8 {
     return comptime std.meta.fieldNames(E);

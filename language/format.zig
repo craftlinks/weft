@@ -159,8 +159,8 @@ const Formatter = struct {
                 const name = tree.token_text(item.token);
                 try formatter.write(name);
                 try formatter.write(": ");
-                const inner: schema.Role = if (std.mem.eql(u8, name, "by")) .mover else .signal;
-                try formatter.value(item.a, indent, inner);
+                // The role is the one `items` found for this argument from its call's entry.
+                try formatter.value(item.a, indent, role);
             },
             .goal => {
                 try formatter.value(item.a, indent, .signal);
@@ -215,7 +215,8 @@ const Formatter = struct {
         var order_buffer: [items_max]u32 = undefined;
         const order = order_buffer[0..children.len];
         for (order, 0..) |*slot, at| slot.* = @intCast(at);
-        if (item.tag == .call) order_arguments(tree, formatter.entries, item, children, order, role);
+        const entry = if (item.tag == .call) entry_of(formatter.entries, tree, item, role) else null;
+        if (entry) |found| order_arguments(tree, found, children, order);
         const open: u32 = if (item.tag == .call) item.token + 1 else item.token;
         const close = item.last;
         if (item.tag == .call) try formatter.write(tree.token_text(item.token));
@@ -227,7 +228,7 @@ const Formatter = struct {
         if (!multiline) {
             for (order, 0..) |at, position| {
                 if (position > 0) try formatter.write(", ");
-                try formatter.value(children[at], indent, role);
+                try formatter.value(children[at], indent, argument_role(tree, entry, children[at], role));
             }
             try formatter.write(if (item.tag == .call) ")" else "]");
             return;
@@ -238,7 +239,7 @@ const Formatter = struct {
             const gap_start = if (at == 0) open + 1 else tree.item(children[at - 1]).last + 1;
             try formatter.leading_comments(gap_start, child.first, inner);
             try formatter.newline(inner);
-            try formatter.value(children[at], inner, role);
+            try formatter.value(children[at], inner, argument_role(tree, entry, children[at], role));
             try formatter.write(",");
             if (formatter.trailing_comment(child.last + 1, close)) |token| {
                 try formatter.write(" ");
@@ -305,12 +306,27 @@ fn find(entries: []const schema.Entry, name: []const u8, role: schema.Role) ?*co
     return null;
 }
 
+/// The entry a call is of: in `role`, else a signal's, else a mover's; null for a module's call.
+fn entry_of(entries: []const schema.Entry, tree: *const Tree, call: parse_module.Item, role: schema.Role) ?*const schema.Entry {
+    const name = tree.token_text(call.token);
+    return find(entries, name, role) orelse find(entries, name, .signal) orelse
+        find(entries, name, .mover);
+}
+
+/// The role of the value of argument `child` of a call of `entry`: a named argument is a mover
+/// where the entry gives that parameter the kind `mover`, and a signal for any other parameter.
+/// A call whose entry is not found (a module's) keeps the role it was given.
+fn argument_role(tree: *const Tree, entry: ?*const schema.Entry, child: u32, role: schema.Role) schema.Role {
+    const found = entry orelse return role;
+    const it = tree.item(child);
+    if (it.tag != .named) return role;
+    const at = found.param(tree.token_text(it.token)) orelse return .signal;
+    return if (found.params[at].kind == .mover) .mover else .signal;
+}
+
 /// Orders a call's arguments: positional ones as written, then named ones by their entry (section
 /// 1), and names the entry does not have last, as written.
-fn order_arguments(tree: *const Tree, entries: []const schema.Entry, call: parse_module.Item, children: []const u32, order: []u32, role: schema.Role) void {
-    const name = tree.token_text(call.token);
-    const entry = find(entries, name, role) orelse find(entries, name, .signal) orelse
-        find(entries, name, .mover) orelse return;
+fn order_arguments(tree: *const Tree, entry: *const schema.Entry, children: []const u32, order: []u32) void {
     const rank = struct {
         fn of(t: *const Tree, e: *const schema.Entry, child: u32, position: usize) u32 {
             const it = t.item(child);

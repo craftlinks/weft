@@ -1033,7 +1033,7 @@ const Checker = struct {
             _ = checker.fail(it.a, .wrong_type, "a name holds a signal, a path, or regions", .{});
             return error.Checked;
         }
-        if (value.tag == .call) if (checker.lookup(checker.text(it.a), .signal)) |entry| if (entry.op == .noun) {
+        if (value.tag == .call) if (checker.lookup(checker.text(it.a), .signal)) |entry| if (entry.kind() == .noun) {
             const delays_before = checker.delay_calls;
             const call = try checker.check_call(entry, it.a);
             if (checker.delay_calls != delays_before) return checker.unreachable_delay(it.a);
@@ -1050,11 +1050,11 @@ const Checker = struct {
         if (node.tag == .call and node.b == 0) {
             const entry = checker.memory.calls[node.a].entry;
             binding.entry = entry;
-            binding.delay = entry.op == .delay;
+            binding.delay = entry.fed;
             // A region of delays is a delay, fed as one (section 9).
             if (entry.op == .lanes) {
                 const body = checker.memory.exprs[checker.memory.values[checker.memory.calls[node.a].values + 1].signal];
-                binding.delay = body.tag == .call and body.b == 0 and checker.memory.calls[body.a].entry.op == .delay;
+                binding.delay = body.tag == .call and body.b == 0 and checker.memory.calls[body.a].entry.fed;
                 binding.entry = null;
             }
         }
@@ -1177,7 +1177,7 @@ const Checker = struct {
             .call => {
                 const name = checker.text(index);
                 if (checker.lookup(name, .signal)) |entry| {
-                    if (entry.op == .noun) {
+                    if (entry.kind() == .noun) {
                         const diagnostic = checker.fail_token(index, .wrong_type, "`{s}` describes a thing, and is not a signal", .{name});
                         error_module.hint(diagnostic, "give it a line of its own, such as `name = {s}(…)`", .{name});
                         return error.Checked;
@@ -1187,7 +1187,7 @@ const Checker = struct {
                     defer checker.region = region;
                     const call = try checker.check_call(entry, index);
                     checker.region = region;
-                    if (entry.op == .delay) checker.delay_calls += 1;
+                    if (entry.fed) checker.delay_calls += 1;
                     const shape = try checker.call_shape(call, index);
                     const lanes = try checker.call_lanes(call, index);
                     if (checker.folded(call)) |number| return checker.constant(number, index);
@@ -1577,7 +1577,7 @@ const Checker = struct {
                 try checker.default_of(entry, param, index);
         }
         if (from_after) |at| {
-            checker.memory.values[first + at] = try checker.after_to(entry, index, &given, first);
+            checker.memory.values[first + at] = try checker.after_to(entry, index, &given, first, at);
         }
         const at = checker.call_count;
         checker.memory.calls[at] = .{ .entry = entry, .values = first, .item = checker.site_of(index) };
@@ -1607,36 +1607,33 @@ const Checker = struct {
     }
 
     /// The `to` of the tween a call's `after` names, for the `from` it leaves out (section 6b).
-    fn after_to(checker: *Checker, entry: *const Entry, index: u32, given: *const [schema.params_max]?u32, first: u32) Fail!Value {
+    fn after_to(checker: *Checker, entry: *const Entry, index: u32, given: *const [schema.params_max]?u32, first: u32, from_at: u32) Fail!Value {
         assert(checker.value_count >= first + entry.params.len);
-        const hint = "`from` may be left out only when `after` names a tween";
-        const after_at = entry.param("after") orelse {
-            const diagnostic = checker.fail_token(index, .missing_argument, "{s} needs `from`", .{entry.name});
-            error_module.hint(diagnostic, hint, .{});
-            return error.Checked;
-        };
+        const rule = entry.after.?;
+        const from = entry.params[from_at].name;
+        const after_at = entry.param(rule.by).?;
         const after_item = given[after_at] orelse {
-            const diagnostic = checker.fail_token(index, .missing_argument, "{s} needs `from`", .{entry.name});
-            error_module.hint(diagnostic, hint, .{});
+            const diagnostic = checker.fail_token(index, .missing_argument, "{s} needs `{s}`", .{ entry.name, from });
+            error_module.hint(diagnostic, "`{s}` may be left out only when `{s}` names a {s}", .{ from, rule.by, entry.name });
             return error.Checked;
         };
-        // A client's entry may give `.after` to a parameter whose `after` is not a signal.
+        // A client's entry may give `.after` to a parameter whose `by` is not a signal.
         const after = checker.memory.values[first + after_at];
-        const named = if (after == .signal) checker.tween_named(after.signal) else null;
+        const named = if (after == .signal) checker.tween_named(entry, after.signal) else null;
         const call = named orelse {
-            const diagnostic = checker.fail(after_item, .missing_argument, "{s} needs `from`, since `after` is not a name bound to a tween", .{entry.name});
-            error_module.hint(diagnostic, hint, .{});
+            const diagnostic = checker.fail(after_item, .missing_argument, "{s} needs `{s}`, since `{s}` is not a name bound to a {s}", .{ entry.name, from, rule.by, entry.name });
+            error_module.hint(diagnostic, "`{s}` may be left out only when `{s}` names a {s}", .{ from, rule.by, entry.name });
             return error.Checked;
         };
         const before = checker.memory.calls[call];
-        const to = checker.memory.values[before.values + before.entry.param("to").?];
+        const to = checker.memory.values[before.values + before.entry.param(rule.takes).?];
         assert(to == .number or to == .vector);
         return to;
     }
 
     /// The tween call that `expr` names (section 6b): a name bound to a tween, or to a region of
     /// one tween, or null. It reads two expressions and no more, so a chain costs nothing per link.
-    fn tween_named(checker: *const Checker, expr: u32) ?u32 {
+    fn tween_named(checker: *const Checker, entry: *const Entry, expr: u32) ?u32 {
         const name = checker.memory.exprs[expr];
         if (name.tag != .binding or name.b != 0) return null;
         const binding = checker.memory.bindings[name.a];
@@ -1644,12 +1641,17 @@ const Checker = struct {
         const node = checker.memory.exprs[binding.index];
         if (node.tag != .call or node.b != 0) return null;
         const call = checker.memory.calls[node.a];
-        if (call.entry.op == .tween) return node.a;
+        if (same_call(call.entry, entry)) return node.a;
         if (call.entry.op != .lanes) return null;
         const body = checker.memory.exprs[checker.memory.values[call.values + 1].signal];
         if (body.tag != .call or body.b != 0) return null;
-        if (checker.memory.calls[body.a].entry.op != .tween) return null;
+        if (!same_call(checker.memory.calls[body.a].entry, entry)) return null;
         return body.a;
+    }
+
+    /// Whether `found` is a call of the entry `wanted` names: the same name and role.
+    fn same_call(found: *const Entry, wanted: *const Entry) bool {
+        return found.role == wanted.role and std.mem.eql(u8, found.name, wanted.name);
     }
 
     /// The parameter `index` names in the current frame, bound to its argument (section 6).
@@ -2041,6 +2043,18 @@ const Checker = struct {
         return error.Checked;
     }
 
+    /// Holds every signal a mover reads to one lane: its law is one node (section 9).
+    fn expect_mover_one_lane(checker: *Checker, mover: u32) Fail!void {
+        const mover_entry = checker.memory.calls[mover].entry;
+        const mover_first = checker.memory.calls[mover].values;
+        const mover_values = checker.memory.values[mover_first..][0..mover_entry.params.len];
+        const mover_items = checker.memory.value_items[mover_first..][0..mover_entry.params.len];
+        assert(mover_entry.role == .mover);
+        for (mover_entry.params, mover_values, mover_items) |param, value, value_item| {
+            if (value == .signal) try checker.expect_one_lane(value_item, value.signal, param.name);
+        }
+    }
+
     /// The lanes of a call (section 9): a per-lane source's region, else the most of its signals'.
     fn call_lanes(checker: *Checker, call: u32, index: u32) Fail!u32 {
         const entry = checker.memory.calls[call].entry;
@@ -2050,15 +2064,9 @@ const Checker = struct {
         for (entry.params, values, items) |param, value, value_item| {
             if (param.live and value == .signal) try checker.expect_one_lane(value_item, value.signal, param.name);
         }
-        if (entry.op == .follow) {
-            const mover = values[2].mover;
-            const mover_entry = checker.memory.calls[mover].entry;
-            const mover_first = checker.memory.calls[mover].values;
-            const mover_values = checker.memory.values[mover_first..][0..mover_entry.params.len];
-            const mover_items = checker.memory.value_items[mover_first..][0..mover_entry.params.len];
-            for (mover_entry.params, mover_values, mover_items) |param, value, value_item| {
-                if (value == .signal) try checker.expect_one_lane(value_item, value.signal, param.name);
-            }
+        for (entry.params, values) |param, value| {
+            if (param.kind != .mover or value != .mover) continue;
+            try checker.expect_mover_one_lane(value.mover);
         }
         var lanes: u32 = 1;
         // The rule `describe` prints for the call, so the two cannot differ.
@@ -2091,19 +2099,22 @@ const Checker = struct {
         return lanes;
     }
 
-    /// Whether a call's lanes each start at their own cue (section 9a): a `tween`'s or a
-    /// `bounce`'s `at:` by lane, or the one goal by lane of a `spring`'s or a `newtonian`'s path,
-    /// whose every run, one a component, has the flag.
+    /// Whether a call's lanes each start at their own cue (section 9a): the parameter its entry
+    /// declares `by_lane` has a cue by lane, or a path whose one goal, one a run, has the flag.
     fn call_by_lane(checker: *const Checker, entry: *const Entry, values: []const Value) bool {
         assert(values.len == entry.params.len);
-        if (entry.param("at")) |at| return values[at] == .cue_by_lane;
-        const goals = entry.param("goals") orelse return false;
-        if (values[goals] != .path) return false;
-        const run = checker.memory.paths[values[goals].path];
-        assert(run.count > 0);
-        const by_lane = checker.memory.goals[run.first].cue_by_lane;
-        if (by_lane) assert(run.count == 1);
-        return by_lane;
+        for (entry.params, values) |param, value| {
+            if (!param.by_lane) continue;
+            if (param.kind == .cue) return value == .cue_by_lane;
+            assert(param.kind == .path);
+            if (value != .path) return false;
+            const run = checker.memory.paths[value.path];
+            assert(run.count > 0);
+            const by_lane = checker.memory.goals[run.first].cue_by_lane;
+            if (by_lane) assert(run.count == 1);
+            return by_lane;
+        }
+        return false;
     }
 
     /// The shape of `left` and `right` together (section 8): theirs when equal, the other's when
@@ -2137,58 +2148,85 @@ const Checker = struct {
         return error.Checked;
     }
 
-    /// The shape of a call (section 8): what its shaped parameters hold, checked to agree.
+    /// The shape of a call (section 8): what its entry says its value is, from its parameters.
     fn call_shape(checker: *Checker, call: u32, index: u32) Fail!Shape {
         const entry = checker.memory.calls[call].entry;
         const values = checker.memory.values[checker.memory.calls[call].values..][0..entry.params.len];
-        switch (entry.op) {
-            .pack => return .{
-                .components = @intCast(entry.params.len),
-                .colour = std.mem.eql(u8, entry.name, "oklab"),
+        assert(values.len == entry.params.len);
+        switch (entry.shape) {
+            .one => {
+                // `lanes` is the language's own region: its value is its body's (step 55b gives
+                // it `.of`).
+                if (entry.op == .lanes) return checker.shape_of(values[1].signal);
+                return Shape.scalar;
             },
-            .srgb => return .{ .components = 3, .colour = true },
-            .tween => {
-                const shape = try checker.agree(index, values[0].shape(), values[1].shape(), "`from` and `to`");
-                if (values[5] == .signal) {
-                    const after = checker.shape_of(values[5].signal);
-                    if (!after.eql(shape)) {
-                        _ = checker.fail(index, .wrong_shape, "`after` is {s}, and this tween {s}", .{ after.noun(), shape.noun() });
-                        return error.Checked;
-                    }
-                }
+            .of => |name| return checker.value_shape(values[entry.param(name).?]),
+            .agree => |names| {
+                const shape = try checker.call_agree(entry, values, index, names);
+                try checker.after_shape(entry, values, index, shape);
                 return shape;
             },
-            .spring, .newtonian => {
-                const path = checker.memory.paths[values[0].path].shape;
-                const from = values[1].shape();
-                // A path of numbers is one run, so a `from` with components has nowhere to go.
-                if (path.eql(Shape.scalar) and !from.eql(Shape.scalar)) {
-                    const diagnostic = checker.fail(index, .wrong_shape, "the goals are numbers, and `from` {s}", .{from.noun()});
-                    error_module.hint(diagnostic, "write the goals as {s}s too, or `from` as a number", .{from.noun()[2..]});
-                    return error.Checked;
-                }
-                return checker.agree(index, path, from, "the goals and `from`");
+            .combine => |names| {
+                const left = values[entry.param(names[0]).?].signal;
+                return checker.combine(index, left, values[entry.param(names[1]).?].signal, false);
             },
-            .chase => return checker.shape_of(values[0].signal),
-            .map => return checker.shape_of(values[0].signal),
-            .function => return checker.shape_of(values[0].signal),
-            .minimum, .maximum => {
-                return checker.combine(index, values[0].signal, values[1].signal, false);
+            .constructor => |constructor| return .{
+                .components = @intCast(entry.params.len),
+                .colour = constructor.colour,
             },
-            .lanes => return checker.shape_of(values[1].signal),
-            else => return Shape.scalar,
         }
+    }
+
+    /// The shape of one value a rule reads: a vector's own, a path's goals', a signal's.
+    fn value_shape(checker: *const Checker, value: Value) Shape {
+        return switch (value) {
+            .path => |path| checker.memory.paths[path].shape,
+            .signal => |expr| checker.shape_of(expr),
+            else => value.shape(),
+        };
+    }
+
+    /// The shape of two parameters that agree. A path of numbers is one run, so a second with
+    /// components has nowhere to go (section 8).
+    fn call_agree(checker: *Checker, entry: *const Entry, values: []const Value, index: u32, names: [2][]const u8) Fail!Shape {
+        const first = values[entry.param(names[0]).?];
+        const second = values[entry.param(names[1]).?];
+        const a = checker.value_shape(first);
+        const b = checker.value_shape(second);
+        if (first != .path) return checker.agree(index, a, b, names, false);
+        if (a.eql(Shape.scalar) and !b.eql(Shape.scalar)) {
+            const diagnostic = checker.fail(index, .wrong_shape, "the {s} are numbers, and `{s}` {s}", .{ names[0], names[1], b.noun() });
+            error_module.hint(diagnostic, "write the {s} as {s}s too, or `{s}` as a number", .{ names[0], b.noun()[2..], names[1] });
+            return error.Checked;
+        }
+        return checker.agree(index, a, b, names, true);
+    }
+
+    /// A call that continues another (section 6b) has the shape of the value it continues from:
+    /// its `by` parameter, when a signal, is held to the call's own shape.
+    fn after_shape(checker: *Checker, entry: *const Entry, values: []const Value, index: u32, shape: Shape) Fail!void {
+        const after = entry.after orelse return;
+        const value = values[entry.param(after.by).?];
+        if (value != .signal) return;
+        const found = checker.shape_of(value.signal);
+        if (found.eql(shape)) return;
+        _ = checker.fail(index, .wrong_shape, "`{s}` is {s}, and this {s} {s}", .{ after.by, found.noun(), entry.name, shape.noun() });
+        return error.Checked;
     }
 
     /// Two shapes that must agree, a number broadcast to a vector. A number is never broadcast to
     /// a colour, whose three components are not alike (section 8).
-    fn agree(checker: *Checker, index: u32, a: Shape, b: Shape, what: []const u8) Fail!Shape {
+    /// `names` are the two parameters, and `path_first` says the first is a path of goals.
+    fn agree(checker: *Checker, index: u32, a: Shape, b: Shape, names: [2][]const u8, path_first: bool) Fail!Shape {
         if (a.eql(b)) return a;
         if (!a.colour and !b.colour) {
             if (b.eql(Shape.scalar)) return a;
             if (a.eql(Shape.scalar)) return b;
         }
-        const diagnostic = checker.fail(index, .wrong_shape, "{s} differ: {s} and {s}", .{ what, a.noun(), b.noun() });
+        const diagnostic = if (path_first)
+            checker.fail(index, .wrong_shape, "the {s} and `{s}` differ: {s} and {s}", .{ names[0], names[1], a.noun(), b.noun() })
+        else
+            checker.fail(index, .wrong_shape, "`{s}` and `{s}` differ: {s} and {s}", .{ names[0], names[1], a.noun(), b.noun() });
         if ((a.colour and b.eql(Shape.scalar)) or (b.colour and a.eql(Shape.scalar))) {
             error_module.hint(diagnostic, "write the number as a colour, such as `oklab(0.5, 0, 0)`", .{});
         }
@@ -2207,7 +2245,10 @@ const Checker = struct {
         const it = checker.item(index);
         if (it.tag != .call) return null;
         const entry = checker.lookup(checker.text(index), .signal) orelse return null;
-        if (entry.op != .pack and entry.op != .srgb) return null;
+        const constructor = switch (entry.shape) {
+            .constructor => |found| found,
+            else => return null,
+        };
         const children = checker.tree.children(index);
         if (children.len != entry.params.len) return null;
         for (children) |child| {
@@ -2216,10 +2257,10 @@ const Checker = struct {
         }
         var vector: Vector = .{ .values = @splat(0), .shape = .{
             .components = @intCast(entry.params.len),
-            .colour = entry.op == .srgb or std.mem.eql(u8, entry.name, "oklab"),
+            .colour = constructor.colour,
         } };
         for (children, 0..) |child, at| vector.values[at] = try checker.fixed_number(child, "a component");
-        if (entry.op == .srgb) {
+        if (constructor.converts) {
             for (vector.values[0..3]) |channel| if (!(channel >= 0 and channel <= 1)) {
                 const diagnostic = checker.fail(index, .out_of_range, "an sRGB channel is in [0, 1]", .{});
                 error_module.hint(diagnostic, "write each of r, g, and b from 0 to 1", .{});
@@ -2336,10 +2377,7 @@ const Checker = struct {
                 return .{ .signal = expr };
             },
             .cue => {
-                // Only the table's own `tween` and `bounce`: a client's entry never gets a cue by
-                // lane, whatever its parameter says, so it never reads `.cue_by_lane`.
-                const by_lane = param.by_lane and (entry.op == .tween or entry.op == .bounce);
-                const found = try checker.cue_ref(index, if (by_lane) .taken else .refused);
+                const found = try checker.cue_ref(index, if (param.by_lane) .taken else .refused);
                 if (found.by_lane) return .{ .cue_by_lane = found.index };
                 return .{ .cue = found.index };
             },
@@ -2353,9 +2391,7 @@ const Checker = struct {
                 return .{ .span = .{ .first = try checker.cue_of(index), .count = 1 } };
             },
             .path => {
-                // As for a cue: only the table's own `spring` and `newtonian` take a goal by lane.
-                const by_lane = param.by_lane and (entry.op == .spring or entry.op == .newtonian);
-                const path = if (it.tag == .list) try checker.path_of(index, false, by_lane) else try checker.named_of(index, .path);
+                const path = if (it.tag == .list) try checker.path_of(index, false, param.by_lane) else try checker.named_of(index, .path);
                 if (!param.shaped and !checker.memory.paths[path].shape.eql(Shape.scalar)) {
                     _ = checker.fail(index, .wrong_shape, "`{s}` takes a path of numbers, found one of {s}s", .{ param.name, checker.memory.paths[path].shape.noun()[2..] });
                     return error.Checked;
@@ -3297,10 +3333,7 @@ pub fn check(tree: *const Tree, memory: Memory, diagnostics: *Diagnostics) Check
     var checker: Checker = .{ .tree = tree, .root = tree, .memory = memory, .diagnostics = diagnostics };
     const before = diagnostics.total();
     assert(memory.frames.len >= frames_max);
-    for (memory.clients) |entry| {
-        assert(entry.params.len <= schema.params_max);
-        assert(entry.outputs.len + @intFromBool(entry.first_output.len > 0) <= schema.outputs_max);
-    }
+    for (memory.clients) |*entry| schema.assert_entry(entry);
     memory.frames[0] = .{ .tree = tree };
     checker.register(tree);
     for (tree.declarations) |index| {
