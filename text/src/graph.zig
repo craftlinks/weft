@@ -35,6 +35,13 @@
 //! follows it and gives the least the slab needs, of the declarations built until then. The node
 //! array is memory the builder writes, so its limit is still refused where it runs out.
 //!
+//! To say by how much a file is past a limit (step 49), `count` builds it again as `build` does,
+//! into a node array the caller lends, with the slab only counted. The builder writes real nodes
+//! and later ones read earlier ones, so a count is a build, not a mode of one. Its refusals go to a
+//! list of one entry nobody reads, so the caller's diagnostics stay the failed build's, and it says
+//! whether the lent array ran out too or the builder refused the file for another reason. Each
+//! declaration's end in the node array is kept in `declaration_ends`, also for one that failed.
+//!
 //! ## 6. Vectors
 //! The core's vector nodes are only `pack` and `pick`, and its per-component arithmetic, map,
 //! `apply`, `minimum`, and `maximum` (`graph.zig`, sections 15 and 17), so `abs`, `min`, and
@@ -148,6 +155,20 @@ pub const Memory = struct {
     call_ids: []?Ids,
     /// One for each binding: the nodes its declaration built, for a recompile's carry (step 15).
     node_ranges: []NodeRange,
+    /// One for each checked declaration, in order: the node count once it was built, so
+    /// declaration k built the nodes from `declaration_ends[k - 1]` (0 for the first) to
+    /// `declaration_ends[k]`. A feed's nodes are its own here; `node_ranges` has none for it.
+    declaration_ends: []u32,
+};
+
+/// What `count` found (section 5).
+pub const Count = union(enum) {
+    /// The program, built in the memory given.
+    program: graph.Program,
+    /// The node array given was too small as well.
+    nodes_full,
+    /// The builder refused the file for another reason.
+    refused,
 };
 
 const Fail = error{Refused};
@@ -161,6 +182,8 @@ const Back = struct {
     diagnostics: *Diagnostics,
     /// The goal source of the last spring, Newtonian move, or chase built.
     goal: GoalSource = .none,
+    /// The node array ran out, which `count` tells apart from another refusal (section 5).
+    nodes_full: bool = false,
 
     fn fail(back: *Back, index: u32, code: error_module.Code, comptime format: []const u8, args: anytype) ?*error_module.Diagnostic {
         const span = check_module.item_bytes(back.tree, index);
@@ -331,10 +354,10 @@ const Back = struct {
             },
             .lanes => {
                 const body = (try back.eval(v[1].signal)).first;
-                const count: u32 = @intCast(v[0].integer);
-                if (builder.nodes[body.index].extent.lanes == count) return .{ .first = body };
+                const lane_count: u32 = @intCast(v[0].integer);
+                if (builder.nodes[body.index].extent.lanes == lane_count) return .{ .first = body };
                 assert(builder.nodes[body.index].extent.lanes == 1);
-                builder.lanes = count;
+                builder.lanes = lane_count;
                 const components = builder.nodes[body.index].extent.components;
                 if (components == 1) return .{ .first = try back.attempt(builder.spread(body), item, call) };
                 var ids: [graph.components_max]Id = undefined;
@@ -575,11 +598,11 @@ const Back = struct {
             },
             .cues => {
                 const span = v[0].span;
-                const count: u32 = switch (v[1]) {
+                const cue_count: u32 = switch (v[1]) {
                     .integer => |integer| std.math.cast(u32, integer) orelse std.math.maxInt(u32),
                     else => span.count,
                 };
-                const source: graph.CueSpan = .{ .first = .{ .index = span.first }, .count = count };
+                const source: graph.CueSpan = .{ .first = .{ .index = span.first }, .count = cue_count };
                 return .{ .first = try back.attempt(builder.cues(source), item, call) };
             },
             .input => {
@@ -632,6 +655,7 @@ const Back = struct {
         const At = struct { param: []const u8, message: []const u8, hint: []const u8 = "" };
         const at: At = switch (err) {
             error.NodeCapacityExceeded => {
+                back.nodes_full = true;
                 const diagnostic = back.fail(item, Code.limit, "the program needs more than {d} nodes", .{back.memory.nodes.len});
                 error_module.hint(diagnostic, "raise `Limits.nodes`", .{});
                 return error.Refused;
@@ -735,7 +759,54 @@ pub fn build(
     tables: *Tables,
     diagnostics: *Diagnostics,
 ) ?graph.Program {
+    var back = begin(checked, tree, memory, tables, diagnostics);
+    var most: Most = .{};
+    const built = build_declarations(&back, &most);
+    // Past the limit, the slab's refusal names the declaration that needs the most, after the
+    // error that stopped the build if one did, of the declarations built until then.
+    if (back.builder.slab_count > memory.slab_count_max) {
+        refuse_slab(&back, most, if (built) |_| true else |_| false);
+        return null;
+    }
+    built catch return null;
+    return back.builder.finish();
+}
+
+/// Builds `checked` as `build` does and adds no diagnostic: for counting what a file past a limit
+/// needs, in a `memory` whose `nodes` the caller lends (section 5). `memory.slab_count_max` is
+/// ignored: the slab is only counted.
+pub fn count(checked: *const Checked, tree: *const Tree, memory: Memory, tables: *Tables) Count {
     assert(checked.ok);
+    assert(memory.nodes.len >= 1);
+    // A refusal's diagnostic goes to a list of one entry that nobody reads, so the caller's list
+    // keeps the errors of the build that failed, unchanged.
+    var entries: [1]error_module.Diagnostic = undefined;
+    var diagnostics = Diagnostics.init(&entries);
+    var counting = memory;
+    counting.slab_count_max = std.math.maxInt(u32);
+    var back = begin(checked, tree, counting, tables, &diagnostics);
+    var most: Most = .{};
+    build_declarations(&back, &most) catch {
+        assert(diagnostics.total() >= 1);
+        if (back.nodes_full) return .nodes_full;
+        return .refused;
+    };
+    assert(!back.nodes_full);
+    assert(back.builder.node_count <= memory.nodes.len);
+    return .{ .program = back.builder.finish() };
+}
+
+/// Fills the tables a program reads and starts its builder (section 1): what `build` and `count`
+/// share before the declarations.
+fn begin(
+    checked: *const Checked,
+    tree: *const Tree,
+    memory: Memory,
+    tables: *Tables,
+    diagnostics: *Diagnostics,
+) Back {
+    assert(checked.ok);
+    assert(memory.declaration_ends.len >= checked.declarations.len);
     assert(memory.paths.len >= checked.paths.len);
     assert(memory.runs.len >= checked.region_runs.len);
     assert(memory.ids.len >= checked.bindings.len);
@@ -781,7 +852,7 @@ pub fn build(
         }
         memory.runs[index] = .{ .first = first, .count = run.count };
     }
-    var back: Back = .{
+    return .{
         .checked = checked,
         .tree = tree,
         .memory = memory,
@@ -799,16 +870,6 @@ pub fn build(
         }),
         .diagnostics = diagnostics,
     };
-    var most: Most = .{};
-    const built = build_declarations(&back, &most);
-    // Past the limit, the slab's refusal names the declaration that needs the most, after the
-    // error that stopped the build if one did, of the declarations built until then.
-    if (back.builder.slab_count > memory.slab_count_max) {
-        refuse_slab(&back, most, if (built) |_| true else |_| false);
-        return null;
-    }
-    built catch return null;
-    return back.builder.finish();
 }
 
 /// Builds every declaration in order (section 1), keeping in `most` the one whose nodes take the
@@ -816,7 +877,7 @@ pub fn build(
 fn build_declarations(back: *Back, most: *Most) Fail!void {
     const checked = back.checked;
     assert(most.need == 0);
-    for (checked.declarations) |declaration| {
+    for (checked.declarations, 0..) |declaration, k| {
         const first = back.builder.node_count;
         const slab_before = back.builder.slab_count;
         const built = build_declaration(back, declaration, first);
@@ -830,9 +891,15 @@ fn build_declarations(back: *Back, most: *Most) Fail!void {
             };
             most.* = .{ .need = need, .binding = binding, .item = item, .lanes = lanes_of(nodes), .per_lane = per_lane_of(nodes) };
         }
+        // Written before the error stops the loop, so a failed declaration's end is its own.
+        back.memory.declaration_ends[k] = back.builder.node_count;
         try built;
     }
     assert(most.need <= back.builder.slab_count);
+    if (checked.declarations.len > 0) {
+        const last = checked.declarations.len - 1;
+        assert(back.memory.declaration_ends[last] == back.builder.node_count);
+    }
 }
 
 /// One declaration's nodes, from `first`.
@@ -889,8 +956,8 @@ fn per_lane_of(nodes: []const graph.Node) u64 {
     var total: u64 = 0;
     for (nodes) |node| {
         if (node.extent.lanes <= 1) continue;
-        const count: u64 = node.extent.count();
-        total += std.math.divCeil(u64, count + node.op.cache_count(count), node.extent.lanes) catch unreachable;
+        const values: u64 = node.extent.count();
+        total += std.math.divCeil(u64, values + node.op.cache_count(values), node.extent.lanes) catch unreachable;
     }
     return total;
 }

@@ -27,6 +27,13 @@
 //! is built in place and never moves, as Play's `Signals` was. A full array is an error that names
 //! its field of `Limits`, never a crash.
 //!
+//! Past `Limits.nodes` or `Limits.slab`, a caller can lend memory to count what the file needs
+//! (step 49): `count_program` builds the program again into a node array of the caller's, `Lent`,
+//! with the slab only counted, and `needs_of` gives the least `Limits` of that program. Nothing of
+//! the failed compile changes but the tables and the arrays that describe the program, so the
+//! diagnostics stay as they were and `ok` stays false. `declaration_ends` splits the node array by
+//! checked declaration, for a table of what each costs.
+//!
 //! ## 2a. The Language's Part
 //! `Compiled` is two jobs in one struct (step 57). Its fields from `syntax` to `checked` are the
 //! language's, the ones `jig.File(limits.file(), table.vocabulary)` has, under the same names
@@ -254,6 +261,8 @@ pub fn Compiled(comptime limits: Limits) type {
         expr_ids: [limits.tree]?back_end.Ids,
         call_ids: [limits.tree]?back_end.Ids,
         node_ranges: [limits.names]back_end.NodeRange,
+        /// Each checked declaration's node count once built (`back_end.Memory.declaration_ends`).
+        declaration_ends: [limits.names]u32,
         /// Each binding's fingerprint (section 5), for a recompile's carry.
         fingerprints: [limits.names]u64,
         /// The file feeds a delay, so a recompile never carries its state (section 5).
@@ -273,6 +282,10 @@ pub fn Compiled(comptime limits: Limits) type {
                 assert(@FieldType(Self, name) == field_type);
             }
         }
+
+        /// Memory a caller lends `count_program` (section 2): a struct, so a field can join
+        /// without changing the call.
+        pub const Lent = struct { nodes: []graph.Node };
 
         /// Compiles `source` in place. On an error, `errors` lists what was found, and the
         /// program is not set.
@@ -308,8 +321,42 @@ pub fn Compiled(comptime limits: Limits) type {
         pub fn build_program(compiled: *Self, libraries: []const Source) error{Invalid}!void {
             assert(compiled.checked.ok);
             assert(!compiled.ok);
-            const program = back_end.build(&compiled.checked, &compiled.syntax.tree, .{
-                .nodes = &compiled.nodes,
+            const memory = compiled.memory_of(&compiled.nodes);
+            const tree = &compiled.syntax.tree;
+            const diagnostics = &compiled.syntax.diagnostics;
+            const checked = &compiled.checked;
+            const program = back_end.build(checked, tree, memory, &compiled.tables, diagnostics) orelse
+                return error.Invalid;
+            compiled.program = program;
+            if (!compiled.check_declared_ranges()) return error.Invalid;
+            compiled.fingerprint(libraries);
+            compiled.ok = true;
+        }
+
+        /// Builds the program of a file that checked into `lent`, to count what a file past
+        /// `Limits.nodes` or `Limits.slab` needs (section 2). Adds no diagnostic, leaves `ok`
+        /// false and `program` unset. The program returned reads `lent.nodes` and this
+        /// `Compiled`'s tables, and `node_ranges`, `declaration_ends`, and `ids` describe it,
+        /// until the next compile.
+        pub fn count_program(compiled: *Self, lent: Lent) back_end.Count {
+            assert(compiled.checked.ok);
+            assert(!compiled.ok);
+            assert(lent.nodes.len >= 1);
+            const errors_before = compiled.syntax.diagnostics.total();
+            const memory = compiled.memory_of(lent.nodes);
+            const tree = &compiled.syntax.tree;
+            const counted = back_end.count(&compiled.checked, tree, memory, &compiled.tables);
+            assert(compiled.syntax.diagnostics.total() == errors_before);
+            assert(!compiled.ok);
+            return counted;
+        }
+
+        /// The back end's memory: this `Compiled`'s arrays, with `nodes` for the node array.
+        fn memory_of(compiled: *Self, nodes: []graph.Node) back_end.Memory {
+            assert(nodes.len >= 1);
+            assert(compiled.checked.ok);
+            return .{
+                .nodes = nodes,
                 .slab_count_max = limits.slab,
                 .cue_times = &compiled.cue_times,
                 .goal_entries = &compiled.goal_entries,
@@ -324,11 +371,8 @@ pub fn Compiled(comptime limits: Limits) type {
                 .expr_ids = &compiled.expr_ids,
                 .call_ids = &compiled.call_ids,
                 .node_ranges = &compiled.node_ranges,
-            }, &compiled.tables, &compiled.syntax.diagnostics) orelse return error.Invalid;
-            compiled.program = program;
-            if (!compiled.check_declared_ranges()) return error.Invalid;
-            compiled.fingerprint(libraries);
-            compiled.ok = true;
+                .declaration_ends = &compiled.declaration_ends,
+            };
         }
 
         /// The least `Limits` this file compiles with, as it compiled just now: every field but
@@ -337,14 +381,23 @@ pub fn Compiled(comptime limits: Limits) type {
         /// The language's fields come from `jig.file.needs_of`; the back end adds its own.
         pub fn needs(compiled: *const Self) Limits {
             assert(compiled.ok);
+            return compiled.needs_of(compiled.program);
+        }
+
+        /// The least `Limits` for `program`, built from this `Compiled`'s checked file: `needs`
+        /// for a program `count_program` returned (section 2), whose nodes may be more than
+        /// `limits.nodes`.
+        pub fn needs_of(compiled: *const Self, program: graph.Program) Limits {
+            assert(compiled.checked.ok);
+            assert(program.nodes.len <= std.math.maxInt(u32));
             const file = jig.file.needs_of(limits.file(), compiled);
             const tables = &compiled.tables;
             return .{
                 .tokens = file.tokens,
                 .tree = file.tree,
                 .names = file.names,
-                .nodes = @intCast(compiled.program.nodes.len),
-                .slab = compiled.program.slab_count,
+                .nodes = @intCast(program.nodes.len),
+                .slab = program.slab_count,
                 .cues = @max(file.cues, @as(u32, @intCast(tables.cues.count))),
                 .goals = @max(file.goals, @as(u32, @intCast(tables.goals.count))),
                 .regions = @max(file.regions, @as(u32, @intCast(tables.regions.count))),
@@ -899,6 +952,92 @@ test "a limit is an error that names its field" {
     const found = try first_error("cue bar = 0s..1000s every 1s\n");
     try testing.expectEqual(diagnostic.Code.limit, found.code);
     try testing.expectEqualStrings("raise `Limits.cues`", found.hint_text());
+}
+
+/// A `Compiled` of 8 nodes, for a file past `Limits.nodes` (step 49).
+const Eight = Compiled(.{
+    .tokens = 1024,
+    .tree = 1024,
+    .names = 64,
+    .nodes = 8,
+    .slab = 1024,
+    .cues = 8,
+    .goals = 8,
+    .regions = 4,
+    .tracks = 2,
+    .track_samples = 4,
+});
+
+var eight: Eight = undefined;
+var lent_nodes: [32]graph.Node = undefined;
+
+/// A delay, the feed that closes it, and a sum that reads it.
+const fed = "cue c0 = 0s\nd = delay(0)\nd <- d * 0.5 + 1\nout = d + 2\n";
+
+/// Nine bindings and 17 nodes: a wave and eight sums of a fresh 1 each.
+const nine = "a = wave(sine, 1hz)\nb = a + 1\nc = b + 1\nd = c + 1\ne = d + 1\nf = e + 1\n" ++
+    "g = f + 1\nh = g + 1\ni = h + 1\n";
+
+// Locks `declaration_ends` on a fed delay: 7 nodes, a slab of 9; the delay is node 0, the feed's
+// 0.5, product, 1, and sum are 1 to 4, and `out`'s 2 and sum are 5 and 6, so the ends are 1, 5, 7.
+test "each declaration's end in the node array, a feed's own" {
+    try small.compile(fed);
+    try testing.expectEqual(@as(usize, 7), small.program.nodes.len);
+    try testing.expectEqual(@as(u32, 9), small.program.slab_count);
+    try testing.expectEqual(@as(usize, 3), small.checked.declarations.len);
+    try testing.expectEqualSlices(u32, &.{ 1, 5, 7 }, small.declaration_ends[0..3]);
+}
+
+// Locks `count_program` past `Limits.nodes` (8): `nine` fails to compile with one error; 32 lent
+// nodes build its program of 17 nodes and a slab of 17, whose least limits are 17 nodes, a slab
+// of 17, 58 tokens, a tree of 36, and 9 names. The file stays not `ok`, and its one error is
+// unchanged, byte for byte.
+test "count_program builds a file past its node limit into lent memory" {
+    try testing.expectError(error.Invalid, eight.compile(nine));
+    try testing.expectEqual(@as(usize, 1), eight.errors().len);
+    const before = eight.errors()[0];
+    const counted = eight.count_program(.{ .nodes = &lent_nodes });
+    try testing.expect(counted == .program);
+    const program = counted.program;
+    try testing.expectEqual(@as(usize, 17), program.nodes.len);
+    try testing.expectEqual(@as(u32, 17), program.slab_count);
+    const needs = eight.needs_of(program);
+    try testing.expectEqual(@as(u32, 17), needs.nodes);
+    try testing.expectEqual(@as(u32, 17), needs.slab);
+    try testing.expectEqual(@as(u32, 58), needs.tokens);
+    try testing.expectEqual(@as(u32, 36), needs.tree);
+    try testing.expectEqual(@as(u32, 9), needs.names);
+    try testing.expect(!eight.ok);
+    try testing.expectEqual(@as(usize, 1), eight.errors().len);
+    const after = eight.errors()[0];
+    try testing.expectEqual(diagnostic.Code.limit, after.code);
+    try testing.expectEqual(before.start, after.start);
+    try testing.expectEqualStrings(before.message_text(), after.message_text());
+    try testing.expectEqualStrings(before.hint_text(), after.hint_text());
+}
+
+// Locks the lent array's own bound: 16 nodes are one short of `nine`'s 17 and say so; exactly 17
+// build it.
+test "count_program says when the lent nodes are too few as well" {
+    try testing.expectError(error.Invalid, eight.compile(nine));
+    try testing.expect(eight.count_program(.{ .nodes = lent_nodes[0..16] }) == .nodes_full);
+    const counted = eight.count_program(.{ .nodes = lent_nodes[0..17] });
+    try testing.expect(counted == .program);
+    try testing.expectEqual(@as(usize, 17), counted.program.nodes.len);
+    try testing.expectEqual(@as(usize, 1), eight.errors().len);
+}
+
+// Locks a refusal that is not a limit: the checker passes an overshoot of 1 and the builder
+// refuses it, so the count is `refused`, and the one error stays the builder's.
+test "count_program says when the builder refuses the file for another reason" {
+    const refused = "cue c0 = 0s\nw = wave(sine, 1hz)\nx = chase(w, time: 1s, overshoot: 1)\n";
+    try testing.expectError(error.Invalid, small.compile(refused));
+    try testing.expect(small.checked.ok);
+    try testing.expectEqual(@as(usize, 1), small.errors().len);
+    try testing.expectEqual(diagnostic.Code.refused, small.errors()[0].code);
+    try testing.expect(small.count_program(.{ .nodes = &lent_nodes }) == .refused);
+    try testing.expectEqual(@as(usize, 1), small.errors().len);
+    try testing.expectEqualStrings("chase: `overshoot` must be in [0, 1)", small.errors()[0].message_text());
 }
 
 /// The fuzz test's inputs: random bytes, then mutations of these.

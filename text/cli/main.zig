@@ -5,15 +5,16 @@
 //!
 //! ## 1. Usage
 //! ```text
-//! weft check FILE [--use NAME=PATH]...
+//! weft check FILE [--costs] [--use NAME=PATH]...
 //! weft describe [--use NAME=PATH]...
 //! weft sample FILE [--from S] [--to S] [--step S] [--signal NAME]... [--events NAME]...
 //!                   [--lanes A..B] [--use NAME=PATH]...
 //! weft parse FILE --json
 //! ```
-//! At most two `--use`. `--events NAME` keeps the events of the signal bound to NAME, from the
-//! nodes `Compiled.event_sources` gives, and `--lanes A..B` keeps lanes A to B of every signal and
-//! event, both included.
+//! At most two `--use`. `--costs` lists what each declaration of the file costs, in tokens, nodes,
+//! and slab, the most nodes first (step 49), and only `check` takes it. `--events NAME` keeps the
+//! events of the signal bound to NAME, from the nodes `Compiled.event_sources` gives, and
+//! `--lanes A..B` keeps lanes A to B of every signal and event, both included.
 //! Times are seconds, read as decimals and turned into flicks, as the library's times are.
 //! Exit 0 on success, 1 when the file has errors, and 2 on bad arguments or a file that cannot be
 //! read.
@@ -29,7 +30,7 @@ const jig = @import("jig");
 const commands = @import("commands");
 
 const usage_text =
-    \\usage: weft check FILE [--use NAME=PATH]...
+    \\usage: weft check FILE [--costs] [--use NAME=PATH]...
     \\       weft describe [--use NAME=PATH]...
     \\       weft sample FILE [--from S] [--to S] [--step S] [--signal NAME]... [--events NAME]...
     \\                         [--lanes A..B] [--use NAME=PATH]...
@@ -58,9 +59,14 @@ pub fn main(init: std.process.Init) !u8 {
     var event_names: [names_max][]const u8 = undefined;
     var event_count: usize = 0;
     var lanes: ?[2]u32 = null;
+    var costs = false;
     var window: commands.Window = .{ .from = 0, .to = 705_600_000, .step = 70_560_000 };
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--json")) continue;
+        if (std.mem.eql(u8, arg, "--costs")) {
+            costs = true;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--use")) {
             const spec = args.next() orelse return usage();
             const equal = std.mem.indexOfScalar(u8, spec, '=') orelse return usage();
@@ -92,6 +98,8 @@ pub fn main(init: std.process.Init) !u8 {
         } else return usage();
     }
 
+    // `--costs` is `check`'s alone.
+    if (costs and !std.mem.eql(u8, command, "check")) return usage();
     var writer: std.Io.Writer = .fixed(&out_buffer);
     var status: u8 = 0;
     if (std.mem.eql(u8, command, "describe")) {
@@ -104,7 +112,10 @@ pub fn main(init: std.process.Init) !u8 {
         const text = read(io, path, &file_buffers[0]) orelse return 2;
         const source: commands.Source = .{ .name = path, .text = text };
         if (std.mem.eql(u8, command, "check")) {
-            const ok = try commands.check(&compiled, &writer, source, libraries[0..library_count], &.{});
+            const ok = if (costs)
+                try commands.check_costs(&compiled, &writer, source, libraries[0..library_count], &.{})
+            else
+                try commands.check(&compiled, &writer, source, libraries[0..library_count], &.{});
             if (!ok) status = 1;
         } else if (std.mem.eql(u8, command, "sample")) {
             if (!window.valid()) {

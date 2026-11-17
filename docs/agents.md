@@ -17,6 +17,7 @@ Then ask it, rather than guessing:
 ```bash
 zig-out/bin/weft describe --use std=src/std.jig         # every call and module, as JSON
 zig-out/bin/weft check FILE                              # ok, or errors with hints
+zig-out/bin/weft check FILE --costs                      # and what each declaration costs
 zig-out/bin/weft check FILE --use std=src/std.jig       # a file that says `use std`
 zig-out/bin/weft sample FILE --to 4 --step 0.25          # every signal's values and events
 zig-out/bin/weft sample FILE --signal NAME               # one signal

@@ -51,12 +51,13 @@
 //! client.
 //!
 //! A client compiles into its own `weft_text.Compiled(its limits)`, so `For(client_limits)` (step 37)
-//! holds `check`, `summary`, `sample`, and `sample_compiled` for that type, with the buffers its
-//! limits size; this file's `check` and the rest are `For(limits)`'s, so the `weft` command is
-//! the same code at the same sizes. A client with checks of its own has compiled already, so it
-//! calls `summary` for `check`'s lines and `sample_compiled` for `sample`'s JSON on the
-//! `Compiled` it holds, which compiles each file once, at the client's limits: a full array is
-//! an error naming the client's number, and a field larger than the command's holds. More
+//! holds `check`, `check_costs`, `summary`, `costs`, `sample`, and `sample_compiled` for that type,
+//! with the buffers its limits size; this file's `check` and the rest are `For(limits)`'s, so the
+//! `weft` command is the same code at the same sizes. A client with checks of its own has
+//! compiled already, so it calls `summary` for `check`'s lines, `costs` for `check_costs`' table,
+//! and `sample_compiled` for `sample`'s JSON on the `Compiled` it holds, which compiles each file
+//! once, at the client's limits: a full array is an error naming the client's number, and a field
+//! larger than the command's holds. More
 //! libraries than the client's `libraries` is an error, not an assert. `sample_compiled` reads
 //! the tables as the `Compiled` holds them, a track's writes included.
 //!
@@ -69,9 +70,26 @@
 //! which is Weft's, says so in one line and is false. Any other file goes on to the back end, and
 //! `check` prints the lines it always did.
 //!
+//! ## 4b. By How Much, and What Costs Most (step 49)
+//! A file past a limit gets, under its diagnostics, which stay as they were, a `limits:` line of
+//! the least `Limits` it needs, the line a file that compiles gets. Past `Limits.tokens`, the text
+//! the errors are about is counted with Jig's `token.next`, and the line is `at least .{ .tokens =
+//! N }`, since the checker stopped. Past `Limits.nodes` or `Limits.slab`, the program is built
+//! again into `counted_nodes`, `nodes_counted_factor` times the client's `nodes`, and the line has
+//! every field; past that array too, it is `at least` one node more than it holds. A refusal that
+//! is not a limit gets no line.
+//!
+//! `check_costs` prints what `check` prints, then a table of the file's declarations, where there
+//! is a program, the counted one included, or a file of a client's signals, whose rows have no
+//! nodes: each declaration's tokens, its nodes and their slab from `declaration_ends`, and its
+//! line, the most nodes first, then the most slab, the most tokens, and the earlier line. A
+//! module's nodes are in the declaration that uses it, since the checker expands it there. The
+//! last row is the tokens between declarations, the newlines, comments, and `eof`, so the rows
+//! sum to the header, which a debug build asserts.
+//!
 //! ## 5. TigerStyle Invariants
 //! - No allocation: every buffer is a file-scope variable, sized by the constants below, or one
-//!   of a `For`, sized by its client's `nodes`.
+//!   of a `For`, sized by its client's `nodes` and `names`.
 //! - Bounded: at most `samples_max` times, `signals_max` signals, and `events_max` events a run,
 //!   and at most `signals_max` walks of the window, one a signal when no two fit together.
 
@@ -102,6 +120,8 @@ pub const Compiled = weft_text.Compiled(limits);
 pub const Syntax = weft_text.Syntax(limits);
 
 pub const samples_max = 1024;
+/// How many times a client's `Limits.nodes` the command can count past it (section 4b).
+pub const nodes_counted_factor = 4;
 pub const events_max = 1024;
 pub const signals_max = 16;
 /// The values, as f64, that one walk of `sample` keeps: every signal at every time with
@@ -155,6 +175,8 @@ pub fn For(comptime client_limits: weft_text.Limits) type {
     comptime {
         assert(client_limits.nodes >= 1);
         assert(client_limits.nodes <= std.math.maxInt(u32));
+        // The count past the limit, and one more for the `at least` that says it did not fit.
+        assert(client_limits.nodes <= (std.math.maxInt(u32) - 1) / nodes_counted_factor);
     }
     return struct {
         /// The client's own `Compiled`, the type it already holds: `weft_text.Compiled(client_limits)`.
@@ -167,9 +189,18 @@ pub fn For(comptime client_limits: weft_text.Limits) type {
         var ranges: [client_limits.nodes]weft.Range = undefined;
         /// The name each node's events print with, by `name_sources` (section 3).
         var source_names: [client_limits.nodes]?[]const u8 = undefined;
+        /// The node array a file past `Limits.nodes` or `Limits.slab` is built into again, to
+        /// count what it needs (section 4b).
+        var counted_nodes: [nodes_counted_factor * client_limits.nodes]weft.Node = undefined;
+        /// The rows of `costs`' table: one a declaration of the file, and the one between them.
+        var cost_rows: [client_limits.names + 1]Cost = undefined;
+
+        /// The most nodes `check` counts: past it, the `limits:` line says `at least` one more.
+        const nodes_counted_max: u32 = nodes_counted_factor * client_limits.nodes;
 
         /// `weft check`: the file's diagnostics, or its `summary`. True when it compiles. A
         /// client's command passes its entries as `clients` (section 4); the `weft` command none.
+        /// Past a limit, a `limits:` line follows the diagnostics (section 4b).
         pub fn check(
             compiled: *ClientCompiled,
             writer: *std.Io.Writer,
@@ -177,22 +208,173 @@ pub fn For(comptime client_limits: weft_text.Limits) type {
             libraries: []const jig.Source,
             comptime clients: []const schema.Entry,
         ) !bool {
+            return Self.check_with(compiled, writer, source, libraries, clients, .lines);
+        }
+
+        /// `weft check --costs`: what `check` prints, then the table of what each declaration
+        /// costs, where there is a program or a file of a client's signals (section 4b). True
+        /// when `check` is.
+        pub fn check_costs(
+            compiled: *ClientCompiled,
+            writer: *std.Io.Writer,
+            source: Source,
+            libraries: []const jig.Source,
+            comptime clients: []const schema.Entry,
+        ) !bool {
+            return Self.check_with(compiled, writer, source, libraries, clients, .costs);
+        }
+
+        const Output = enum { lines, costs };
+
+        fn check_with(
+            compiled: *ClientCompiled,
+            writer: *std.Io.Writer,
+            source: Source,
+            libraries: []const jig.Source,
+            comptime clients: []const schema.Entry,
+            output: Output,
+        ) !bool {
             if (!try libraries_fit(writer, libraries, client_limits.libraries)) return false;
             compiled.check_client(clients, libraries, source.text) catch {
                 try render_errors(compiled, writer, source, libraries);
+                try Self.tokens_over(compiled, writer, source, libraries);
                 return false;
             };
             // A file with a client's own signal has no program to build (step 57): it checked.
             if (compiled.client_signal()) |entry| {
                 try Self.summary_no_program(compiled, writer, entry.name);
+                if (output == .costs) try Self.write_costs(compiled, writer, null);
                 return true;
             }
             compiled.build_program(libraries) catch {
                 try render_errors(compiled, writer, source, libraries);
+                const counted = try Self.limits_over(compiled, writer);
+                if (output == .costs) {
+                    if (counted) |program| try Self.write_costs(compiled, writer, program);
+                }
                 return false;
             };
             try Self.summary(compiled, writer);
+            if (output == .costs) try Self.costs(compiled, writer);
             return true;
+        }
+
+        /// After the diagnostics of a file that did not check: the tokens of the text they are
+        /// about, the failed library's or the file's, as `at least` the `Limits` it needs, when
+        /// they are more than the client's (section 4b).
+        fn tokens_over(
+            compiled: *const ClientCompiled,
+            writer: *std.Io.Writer,
+            source: Source,
+            libraries: []const jig.Source,
+        ) !void {
+            assert(!compiled.checked.ok);
+            const text = if (compiled.failed_library) |at| libraries[at].text else source.text;
+            const tokens = token_count(text);
+            assert(tokens >= 1);
+            if (tokens <= client_limits.tokens) return;
+            try writer.print("limits: at least .{{ .tokens = {d} }}\n", .{tokens});
+        }
+
+        /// After the diagnostics of a file the back end refused on a limit: the program built
+        /// again into `counted_nodes`, and the least `Limits` it needs, every field, or `at least`
+        /// the nodes when it does not fit there either (section 4b). The program, for the
+        /// table, or null.
+        fn limits_over(compiled: *ClientCompiled, writer: *std.Io.Writer) !?weft.Program {
+            assert(compiled.checked.ok);
+            assert(!compiled.ok);
+            for (compiled.errors()) |found| {
+                if (found.code == .limit) break;
+            } else return null;
+            switch (compiled.count_program(.{ .nodes = &counted_nodes })) {
+                .program => |program| {
+                    assert(program.nodes.len <= nodes_counted_max);
+                    try write_limits(writer, compiled.needs_of(program));
+                    return program;
+                },
+                .nodes_full => {
+                    const line = "limits: at least .{{ .nodes = {d} }}\n";
+                    try writer.print(line, .{nodes_counted_max + 1});
+                    return null;
+                },
+                .refused => return null,
+            }
+        }
+
+        /// The table of what each declaration of a file that compiled costs (section 4b), from
+        /// a `Compiled` the client already holds.
+        pub fn costs(compiled: *const ClientCompiled, writer: *std.Io.Writer) !void {
+            assert(compiled.ok);
+            assert(compiled.program.nodes.len <= client_limits.nodes);
+            try Self.write_costs(compiled, writer, compiled.program);
+        }
+
+        /// The table of `program`, which `declaration_ends` describes, or of a file with no
+        /// program, every row 0 nodes and 0 slab (section 4b).
+        fn write_costs(
+            compiled: *const ClientCompiled,
+            writer: *std.Io.Writer,
+            program: ?weft.Program,
+        ) !void {
+            assert(compiled.checked.ok);
+            const tree = &compiled.syntax.tree;
+            const rows = Self.cost_rows_of(compiled, program);
+            const nodes: usize = if (program) |built| built.nodes.len else 0;
+            const slab: u32 = if (program) |built| built.slab_count else 0;
+            const head = "costs: {d} tokens, {d} nodes, a slab of {d}\n";
+            try writer.print(head, .{ tree.tokens.len, nodes, slab });
+            try writer.writeAll(" tokens   nodes    slab    line  declaration\n");
+            var tokens: u64 = 0;
+            for (rows) |row| {
+                const columns = "{d: >7} {d: >7} {d: >7} {d: >7}  {s} {s}\n";
+                try writer.print(columns, .{ row.tokens, row.nodes, row.slab, row.line, row.word, row.name });
+                tokens += row.tokens;
+            }
+            assert(tokens <= tree.tokens.len);
+            const between = tree.tokens.len - tokens;
+            const last = "{d: >7} {d: >7} {d: >7}       -  between declarations\n";
+            try writer.print(last, .{ between, 0, 0 });
+        }
+
+        /// One row a declaration of the file's tree, in text order, each `bind` and `feed` the
+        /// checker kept with its nodes and slab, then sorted (section 4b).
+        fn cost_rows_of(compiled: *const ClientCompiled, program: ?weft.Program) []const Cost {
+            const tree = &compiled.syntax.tree;
+            const declarations = compiled.checked.declarations;
+            assert(tree.declarations.len <= client_limits.names);
+            var checked_at: usize = 0;
+            var nodes_total: u64 = 0;
+            var slab_total: u64 = 0;
+            for (tree.declarations, cost_rows[0..tree.declarations.len]) |index, *row| {
+                const item = tree.item(index);
+                row.* = .{
+                    .tokens = item.last - item.first + 1,
+                    .nodes = 0,
+                    .slab = 0,
+                    .line = compiled.place_of(compiled.item_bytes(index)).line,
+                    .word = word_of(item.tag),
+                    .name = tree.text(index),
+                };
+                const built = program orelse continue;
+                if (checked_at == declarations.len) continue;
+                if (item_of(compiled, declarations[checked_at]) != index) continue;
+                const first = if (checked_at == 0) 0 else compiled.declaration_ends[checked_at - 1];
+                const nodes = built.nodes[first..compiled.declaration_ends[checked_at]];
+                row.nodes = @intCast(nodes.len);
+                row.slab = slab_of(nodes);
+                nodes_total += row.nodes;
+                slab_total += row.slab;
+                checked_at += 1;
+            }
+            // Every node and every value of the slab is in one row.
+            if (program) |built| {
+                assert(checked_at == declarations.len);
+                assert(nodes_total == built.nodes.len);
+                assert(slab_total == built.slab_count);
+            }
+            const rows = cost_rows[0..tree.declarations.len];
+            std.sort.insertion(Cost, rows, {}, cost_before);
+            return rows;
         }
 
         /// What `check` prints of a file that checked and has a client's signal `name`, which
@@ -247,16 +429,7 @@ pub fn For(comptime client_limits: weft_text.Limits) type {
                 if (report.stepped) "stepped" else "closed form",
             });
             // The least `Limits` the file compiles with, to paste (step 22).
-            const needs = compiled.needs();
-            try writer.writeAll("limits: .{");
-            inline for (@typeInfo(weft_text.Limits).@"struct".field_names, 0..) |name, at| {
-                const chosen = comptime std.mem.eql(u8, name, "track_samples") or
-                    std.mem.eql(u8, name, "errors");
-                if (chosen) continue;
-                const comma = if (at == 0) "" else ",";
-                try writer.print("{s} .{s} = {d}", .{ comma, name, @field(needs, name) });
-            }
-            try writer.writeAll(" }\n");
+            try write_limits(writer, compiled.needs());
             const lane_cost = slab_per_lane(program);
             if (lane_cost > 0) try writer.print("a lane costs {d} of the slab\n", .{lane_cost});
         }
@@ -447,7 +620,9 @@ pub fn For(comptime client_limits: weft_text.Limits) type {
 
 const weft_command = For(limits);
 pub const check = weft_command.check;
+pub const check_costs = weft_command.check_costs;
 pub const summary = weft_command.summary;
+pub const costs = weft_command.costs;
 pub const sample = weft_command.sample;
 pub const sample_compiled = weft_command.sample_compiled;
 
@@ -459,6 +634,98 @@ fn libraries_fit(writer: *std.Io.Writer, libraries: []const jig.Source, librarie
     const refusal = "error: at most {d} libraries, given {d}\n";
     try writer.print(refusal, .{ libraries_max, libraries.len });
     return false;
+}
+
+/// The `limits:` line: every field of `needs` a client's `Limits` must hold, to paste (step 22).
+fn write_limits(writer: *std.Io.Writer, needs: weft_text.Limits) !void {
+    assert(needs.nodes <= std.math.maxInt(u32));
+    try writer.writeAll("limits: .{");
+    inline for (@typeInfo(weft_text.Limits).@"struct".field_names, 0..) |name, at| {
+        const chosen = comptime std.mem.eql(u8, name, "track_samples") or
+            std.mem.eql(u8, name, "errors");
+        if (chosen) continue;
+        const comma = if (at == 0) "" else ",";
+        try writer.print("{s} .{s} = {d}", .{ comma, name, @field(needs, name) });
+    }
+    try writer.writeAll(" }\n");
+}
+
+/// The tokens Jig's tokenizer writes for `text` into an array large enough, the `eof` included
+/// (section 4b): one a token from `jig.token.next` at each byte that is not a space, a tab, or a
+/// carriage return. Bounded by the text's length, since each token takes at least one byte.
+fn token_count(text: []const u8) u64 {
+    assert(text.len < std.math.maxInt(u32));
+    var count: u64 = 0;
+    var index: u32 = 0;
+    while (index < text.len) {
+        const byte = text[index];
+        if (byte == ' ' or byte == '\t' or byte == '\r') {
+            index += 1;
+            continue;
+        }
+        const found = jig.token.next(text, index);
+        assert(found.len > 0);
+        index += found.len;
+        count += 1;
+    }
+    assert(count <= text.len);
+    return count + 1;
+}
+
+/// One row of `costs`' table (section 4b).
+const Cost = struct {
+    tokens: u32,
+    nodes: u32,
+    slab: u64,
+    /// The line of the declaration's first token, from 1.
+    line: u32,
+    /// What it declares, `bind` or `cue` and the rest.
+    word: []const u8,
+    /// The text of its token: its name, or a seed's or a tempo's number.
+    name: []const u8,
+};
+
+/// Most nodes first, then most slab, then most tokens, then the earlier line.
+fn cost_before(_: void, a: Cost, b: Cost) bool {
+    assert(a.line != b.line);
+    if (a.nodes != b.nodes) return a.nodes > b.nodes;
+    if (a.slab != b.slab) return a.slab > b.slab;
+    if (a.tokens != b.tokens) return a.tokens > b.tokens;
+    return a.line < b.line;
+}
+
+/// The word of a declaration's row: its tag, with a series of cues a `cue`.
+fn word_of(tag: jig.parse.Tag) []const u8 {
+    assert(tag.is_declaration());
+    return switch (tag) {
+        .cue, .cue_series => "cue",
+        .seed, .tempo, .start, .track, .bind, .feed, .module, .use => @tagName(tag),
+        else => unreachable,
+    };
+}
+
+/// The item of the file's tree a checked declaration was written as.
+fn item_of(compiled: anytype, declaration: jig.check.Declaration) u32 {
+    const bindings = compiled.checked.bindings;
+    const item = switch (declaration) {
+        .signal => |signal| bindings[signal.binding].item,
+        .noun => |noun| bindings[noun.binding].item,
+        .feed => |feed| feed.item,
+    };
+    assert(item < compiled.syntax.tree.items.len);
+    return item;
+}
+
+/// The values `nodes` take of the slab, as the builder counts them: each node's values and its
+/// cache.
+fn slab_of(nodes: []const weft.Node) u64 {
+    var total: u64 = 0;
+    for (nodes) |node| {
+        const values: u64 = node.extent.count();
+        total += values + node.op.cache_count(values);
+    }
+    assert(total >= nodes.len);
+    return total;
 }
 
 /// The f64 each lane of a region adds to the slab: each node of more than one lane's values and
