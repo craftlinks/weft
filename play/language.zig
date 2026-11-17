@@ -15,8 +15,9 @@
 //! keyword      seed, tempo, start, cue, track, module, use first on a line; in and every anywhere
 //! call         a name right before `(`, a primitive or a module
 //! name         any other name: a declaration, a cue, a parameter, a word
-//! number       a number, a time, or a frequency, with its unit; a string, which only a client's
-//!              nouns take, so Play's own files hold none and it has no colour of its own
+//! number       a number, a time, or a frequency, with its unit; a string, and a line of text
+//!              after `\\` (Jig step 4), which only a client's entries take, so Play's own files
+//!              hold neither and they have no colour of their own
 //! operator     = <- + - * ..
 //! punctuation  ( ) [ ] , : .
 //! comment      # to the end of the line
@@ -93,7 +94,7 @@ fn class_of(line: []const u8, start: u32, end: u32, tag: token.Tag) Class {
             while (after < line.len and line[after] == ' ') after += 1;
             break :name if (after < line.len and line[after] == '(') .call else .name;
         },
-        .number, .time, .frequency, .string => .number,
+        .number, .time, .frequency, .string, .line_text => .number,
         .equal, .feed, .plus, .minus, .star, .slash, .dot_dot => .operator,
         .comma, .colon, .dot, .l_paren, .r_paren, .l_bracket, .r_bracket => .punctuation,
         .comment => .comment,
@@ -126,4 +127,19 @@ test "each token of a line has its class" {
     try testing.expectEqualSlices(Class, &.{ .name, .operator, .call, .punctuation, .name, .punctuation, .number, .punctuation, .name, .punctuation, .number, .punctuation, .comment }, classes("noise = noise(smooth, 1hz, seed: 1) # a comment", &out));
     try testing.expectEqualSlices(Class, &.{ .keyword, .operator, .name, .comment }, classes("cue = c0 #… ×", &out));
     try testing.expectEqualSlices(Class, &.{ .name, .invalid, .invalid, .invalid }, classes("x × ? 3zz", &out));
+}
+
+// Locks Jig step 4: a line of text after `\\` is one token, a number's class, to the end of its
+// line, its `#` and quotes included; a lone `\` is invalid.
+test "a line of text is one token of a number's class" {
+    var out: [8]Class = undefined;
+    const line = "    \\\\return \"x\"; # text";
+    try testing.expectEqualSlices(Class, &.{.number}, classes(line, &out));
+    var at: u32 = 0;
+    var state: State = .normal;
+    const found = next(line, &at, &state).?;
+    try testing.expectEqual(@as(u32, 4), found.start);
+    try testing.expectEqual(@as(u32, line.len), found.end);
+    try testing.expectEqual(@as(?Token, null), next(line, &at, &state));
+    try testing.expectEqualSlices(Class, &.{ .invalid, .name }, classes("\\x", &out));
 }

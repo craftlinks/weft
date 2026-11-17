@@ -13,7 +13,9 @@
 //! - a file with nouns formats to canonical text and back;
 //! - an entry may take `schema.params_max` parameters, 24 since step 36, every one by name;
 //! - a word or a noun of the wrong entry is refused with a hint naming every word the parameter
-//!   takes, up to six (step 35).
+//!   takes, up to six (step 35);
+//! - a noun that takes lines of text under it (Jig step 4) builds no node, reads its lines back,
+//!   formats to itself, and a byte of its text changes its own fingerprint and no other.
 //!
 //! ## 2. The Nouns
 //! Four entries shaped like an explainer's, and the score that uses them, are in `score.zig`,
@@ -244,4 +246,71 @@ test "a hint names every word a parameter takes, up to six" {
     try testing.expectEqualStrings("it takes `smooth` or `steps`", try hint_of("n = noise(wiggly, 1hz)\n"));
     try testing.expectEqualStrings("it takes `linear`, `in`, `out`, or `in_out`", try hint_of("cue c = 0s\nt = tween(from: 0, to: 1, at: c, over: 1s, ease: bouncy)\n"));
     try testing.expectEqualStrings("did you mean `triangle`?", try hint_of("w = wave(triangel, 1hz)\n"));
+}
+
+/// A client's noun that takes lines of text under it (Jig step 4), as Tapestry's `code` does.
+const code_nouns = [_]schema.Entry{.{
+    .name = "code",
+    .op = .noun,
+    .role = .signal,
+    .summary = "a block of source code",
+    .params = &.{
+        .{ .name = "size", .kind = .number, .default = .{ .number = 30 } },
+        .{ .name = "lines", .kind = .lines },
+    },
+}};
+
+const code_source =
+    \\w = wave(sine, 1hz)
+    \\rs = code(size: 24) # the residual
+    \\    \\fn residual_step(x: f64) f64 {
+    \\    \\
+    \\    \\    if (x < -1) return "low"; # kept
+    \\    \\}
+    \\
+;
+
+// Locks Jig step 4 in Weft: a `code` noun with four lines of text compiles to `w`'s one node and
+// none for the noun, its lines read back as written, line 2 at line 5, column 7, and the file
+// formats to itself.
+test "a noun's lines of text build nothing and read back" {
+    try compiled.compile_client(&code_nouns, &.{}, code_source);
+    try testing.expectEqual(@as(usize, 1), compiled.program.nodes.len);
+    const rs = compiled.noun("rs").?;
+    try testing.expectEqual(@as(f64, 24), rs.values[0].number);
+    const lines = rs.values[1].lines;
+    try testing.expectEqual(@as(u32, 4), lines.count);
+    try testing.expectEqualStrings("fn residual_step(x: f64) f64 {", compiled.line_text(lines, 0));
+    try testing.expectEqualStrings("", compiled.line_text(lines, 1));
+    const third = compiled.line_text(lines, 2);
+    try testing.expectEqualStrings("    if (x < -1) return \"low\"; # kept", third);
+    const place = compiled.place_of(compiled.line_bytes(lines, 2));
+    try testing.expectEqual(@as(u32, 5), place.line);
+    try testing.expectEqual(@as(u32, 7), place.column);
+    const call = compiled.checked.declarations[1].noun.call;
+    const run = compiled.argument_named(call, "lines").?;
+    const run_text = code_source[run.bytes.start..run.bytes.end()];
+    try testing.expect(std.mem.startsWith(u8, run_text, "\\\\fn residual_step"));
+    try testing.expect(std.mem.endsWith(u8, run_text, "\\\\}"));
+    try testing.expectEqualStrings(code_source, try compiled.syntax.format_into(&output));
+}
+
+// Locks Jig step 4's fingerprint: the run is part of its binding's tokens, so one byte of its
+// text changes `rs`'s fingerprint and not `w`'s, while moving the run's indentation changes
+// neither.
+test "a byte of the text changes its binding's fingerprint only" {
+    try compiled.compile_client(&code_nouns, &.{}, code_source);
+    const before = compiled.fingerprints;
+    var edited: [code_source.len]u8 = code_source.*;
+    const at = std.mem.indexOf(u8, code_source, "low").?;
+    edited[at] = 'L';
+    try compiled.compile_client(&code_nouns, &.{}, &edited);
+    try testing.expectEqual(before[0], compiled.fingerprints[0]);
+    try testing.expect(before[1] != compiled.fingerprints[1]);
+    const shifted = "w = wave(sine, 1hz)\nrs = code(size: 24) # the residual\n" ++
+        "\\\\fn residual_step(x: f64) f64 {\n\\\\\n" ++
+        "\\\\    if (x < -1) return \"low\"; # kept\n\\\\}\n";
+    try compiled.compile_client(&code_nouns, &.{}, shifted);
+    try testing.expectEqual(before[0], compiled.fingerprints[0]);
+    try testing.expectEqual(before[1], compiled.fingerprints[1]);
 }
