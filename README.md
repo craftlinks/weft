@@ -1092,7 +1092,7 @@ text and compiling again is what moves a beat and every cue written against it.
 needs no window, no GPU, and no Patchwork, and each command is a thin call into the library:
 
 ```bash
-weft check FILE [--use NAME=PATH]...            # diagnostics, or a summary and its limits
+weft check FILE [--costs] [--use NAME=PATH]...  # diagnostics, or a summary and its limits
 weft describe [--use NAME=PATH]...              # primitives and modules, as JSON
 weft sample FILE [--from S] [--to S] [--step S] [--signal NAME]...   # values and events, as JSON
           [--events NAME]... [--lanes A..B]     # only these sources' events, only these lanes
@@ -1111,7 +1111,9 @@ $ weft sample play/signals.jig --to 1 --step 0.5 --signal wave
 - **`check`'s limits line** is the least `Limits` the file compiles with, ready to paste, from
   `Compiled.needs()`: `track_samples` and `errors` are left to the client. A file with a lane
   region adds `a lane costs N of the slab`. A `Compiled` at the default `Limits` is about 1 MB
-  whatever the file, so a client short of static memory sizes one from this line.
+  whatever the file, so a client short of static memory sizes one from this line. A file past a
+  limit gets the line under its errors too, and `--costs` adds each declaration's tokens, nodes,
+  and slab, the most nodes first (step 49).
 - **`sample`** allocates its reader's slab, so a file of any slab size can be sampled (v0.1.0's
   command held 262,144 values). One reader walks the window once for every signal it names and
   for the events (step 38), so a stepped file costs one replay, not one a signal. The walk keeps

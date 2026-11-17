@@ -37,6 +37,7 @@ const check_ok_golden = @embedFile("golden/cli/check_ok.txt");
 const check_client_golden = @embedFile("golden/cli/check_client.txt");
 const sample_golden = @embedFile("golden/cli/sample.json");
 const sample_filtered_golden = @embedFile("golden/cli/sample_filtered.json");
+const check_costs_golden = @embedFile("golden/cli/check_costs.txt");
 
 const sequence =
     \\seed 7
@@ -624,7 +625,8 @@ test "a client checks and samples its own Compiled, at its own limits" {
 }
 
 // Locks step 37's limit errors: each names the client's number, not the command's. Nine nodes
-// are past the client's 8, which the command holds; two libraries are past its one.
+// are past the client's 8, which the command holds; two libraries are past its one. Under the
+// node error, the least `Limits` the file needs, counted past the limit (step 49): 17 nodes.
 test "a client's limit errors name the client's limits" {
     const nine: commands.Source = .{ .name = "nine.jig", .text = nine_nodes };
     var writer: std.Io.Writer = .fixed(&output);
@@ -632,7 +634,8 @@ test "a client's limit errors name the client's limits" {
     writer = .fixed(&output);
     try testing.expect(!try client_command.check(&client_compiled, &writer, nine, &.{}, &.{}));
     try testing.expectEqualStrings("nine.jig:5:5: error: the program needs more than 8 nodes\n" ++
-        "    e = d + 1\n        ^^^^^\n    hint: raise `Limits.nodes`\n", writer.buffered());
+        "    e = d + 1\n        ^^^^^\n    hint: raise `Limits.nodes`\n" ++
+        "limits: .{ .tokens = 58, .tree = 36, .names = 9, .nodes = 17, .slab = 17, .cues = 0, .goals = 0, .regions = 0, .tracks = 0, .modules = 0, .libraries = 0 }\n", writer.buffered());
 
     const two: []const jig.Source = &.{
         .{ .name = "std", .text = weft_text.std_library },
@@ -688,20 +691,24 @@ var tiny_compiled: weft_text.Compiled(tiny_limits) = undefined;
 // its values and lanes, and the client's limit. `plot` needs 1100 of the 1101 values, at 100 lanes
 // of 11 values each, so the hint says fewer lanes first, then the `Limits.slab` that fits. A file
 // of one lane each says only the limit, 3; a build the node limit stopped gives its error, then
-// the least the slab needs, 6, of the declarations built until then, with `a`'s 4 lanes.
+// the least the slab needs, 6, of the declarations built until then, with `a`'s 4 lanes. Each
+// refusal is followed by the least `Limits` the file needs, counted again (step 49): a slab of
+// 1101, of 3, and, past the 3 nodes as well, 4 nodes and a slab of 7.
 test "a slab refusal names the declaration that needs the most" {
     var writer: std.Io.Writer = .fixed(&output);
     const plot: commands.Source = .{ .name = "plot.jig", .text = big_plot };
     try testing.expect(!try slab_command.check(&slab_compiled, &writer, plot, wobble_library, &.{}));
     try testing.expectEqualStrings("plot.jig:4:1: error: the slab needs 1101 values, more than 1024; `plot` needs 1100 of them, at 100 lanes\n" ++
         "    plot = lanes(100, wobble(noise(smooth, 1hz)) + wobble(noise(steps, 2hz)))\n    ^^^^\n" ++
-        "    hint: give `plot` fewer lanes, which cost 11 of the slab each, or raise `Limits.slab` to 1101\n", writer.buffered());
+        "    hint: give `plot` fewer lanes, which cost 11 of the slab each, or raise `Limits.slab` to 1101\n" ++
+        "limits: .{ .tokens = 45, .tree = 19, .names = 4, .nodes = 6, .slab = 1101, .cues = 1, .goals = 0, .regions = 0, .tracks = 0, .modules = 1, .libraries = 1 }\n", writer.buffered());
 
     writer = .fixed(&output);
     const one_lane: commands.Source = .{ .name = "one.jig", .text = "a = wave(sine, 1hz)\nb = wave(saw, 1hz)\nc = wave(square, 1hz)\n" };
     try testing.expect(!try tiny_command.check(&tiny_compiled, &writer, one_lane, &.{}, &.{}));
     try testing.expectEqualStrings("one.jig:1:1: error: the slab needs 3 values, more than 2; `a` needs 1 of them\n" ++
-        "    a = wave(sine, 1hz)\n    ^\n    hint: raise `Limits.slab` to 3\n", writer.buffered());
+        "    a = wave(sine, 1hz)\n    ^\n    hint: raise `Limits.slab` to 3\n" ++
+        "limits: .{ .tokens = 28, .tree = 12, .names = 3, .nodes = 3, .slab = 3, .cues = 0, .goals = 0, .regions = 0, .tracks = 0, .modules = 0, .libraries = 0 }\n", writer.buffered());
 
     writer = .fixed(&output);
     const four: commands.Source = .{ .name = "four.jig", .text = "a = lanes(4, noise(smooth, 1hz))\nb = wave(sine, 1hz)\nc = wave(saw, 1hz)\nd = wave(square, 1hz)\n" };
@@ -710,5 +717,209 @@ test "a slab refusal names the declaration that needs the most" {
         "    d = wave(square, 1hz)\n        ^^^^^^^^^^^^^^^^^\n    hint: raise `Limits.nodes`\n" ++
         "four.jig:1:1: error: the slab needs at least 6 values, more than 2; `a` needs 4 of them, at 4 lanes\n" ++
         "    a = lanes(4, noise(smooth, 1hz))\n    ^\n" ++
-        "    hint: give `a` fewer lanes, which cost 1 of the slab each, or raise `Limits.slab`\n", writer.buffered());
+        "    hint: give `a` fewer lanes, which cost 1 of the slab each, or raise `Limits.slab`\n" ++
+        "limits: .{ .tokens = 42, .tree = 18, .names = 4, .nodes = 4, .slab = 7, .cues = 0, .goals = 0, .regions = 0, .tracks = 0, .modules = 0, .libraries = 0 }\n", writer.buffered());
+}
+
+/// Two waves and `count` sums, each of the one before and a number of its own, 1 to `count`:
+/// 2 + 2 * `count` nodes, each of one value.
+fn waves_and_sums(comptime count: u32) []const u8 {
+    comptime var text: []const u8 = "a = wave(sine, 1hz)\nb = wave(saw, 1hz)\ns1 = b + 1\n";
+    inline for (2..count + 1) |k| {
+        text = text ++ std.fmt.comptimePrint("s{d} = s{d} + {d}\n", .{ k, k - 1, k });
+    }
+    return text;
+}
+
+/// The last line of `output`, without its newline.
+fn last_line(printed: []const u8) []const u8 {
+    const body = std.mem.trimEnd(u8, printed, "\n");
+    const start = if (std.mem.lastIndexOfScalar(u8, body, '\n')) |at| at + 1 else 0;
+    return body[start..];
+}
+
+// Locks step 49's count at the edge of the lent nodes, four times the client's 8: two waves and
+// 15 sums are 32 nodes, which it counts exactly, and a slab of 32; with a sixteenth sum they are
+// 34, past the 32 it holds, so the line says at least 33. Both checks are false.
+test "check counts nodes up to four times the limit, and says at least past it" {
+    var writer: std.Io.Writer = .fixed(&output);
+    const exact: commands.Source = .{ .name = "exact.jig", .text = waves_and_sums(15) };
+    try testing.expect(!try client_command.check(&client_compiled, &writer, exact, &.{}, &.{}));
+    const line = last_line(writer.buffered());
+    try testing.expect(std.mem.startsWith(u8, line, "limits: .{ "));
+    try testing.expect(std.mem.indexOf(u8, line, ".nodes = 32, .slab = 32,") != null);
+
+    writer = .fixed(&output);
+    const past: commands.Source = .{ .name = "past.jig", .text = waves_and_sums(16) };
+    try testing.expect(!try client_command.check(&client_compiled, &writer, past, &.{}, &.{}));
+    try testing.expect(std.mem.endsWith(u8, writer.buffered(), "\nlimits: at least .{ .nodes = 33 }\n"));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, writer.buffered(), "error: "));
+}
+
+const token_limits: weft_text.Limits = .{ .tokens = 16 };
+const token_command = commands.For(token_limits);
+var token_compiled: weft_text.Compiled(token_limits) = undefined;
+
+// Locks step 49's token count past `Limits.tokens` (16): a file of 16 tokens, the newlines and
+// the `eof` among them, checks; two more, `+ 1`, make 18, which the line under the error gives.
+test "check gives the tokens a file needs past the limit" {
+    var writer: std.Io.Writer = .fixed(&output);
+    const fits: commands.Source = .{ .name = "fits.jig", .text = "w = wave(sine, 1hz)\nx = w * 2\n" };
+    try testing.expect(try token_command.check(&token_compiled, &writer, fits, &.{}, &.{}));
+    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "limits: .{ .tokens = 16,") != null);
+
+    writer = .fixed(&output);
+    const over: commands.Source = .{ .name = "over.jig", .text = "w = wave(sine, 1hz)\nx = w * 2 + 1\n" };
+    try testing.expect(!try token_command.check(&token_compiled, &writer, over, &.{}, &.{}));
+    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "error: ") != null);
+    try testing.expect(std.mem.endsWith(u8, writer.buffered(), "\nlimits: at least .{ .tokens = 18 }\n"));
+}
+
+/// The file of `check_costs.txt`: a comment, a seed, a cue, a module used twice, and lanes.
+const costs_source =
+    \\# a comment
+    \\
+    \\seed 7
+    \\cue c0 = 0s
+    \\module twice(v) = v * 2
+    \\w = wave(sine, 1hz)
+    \\x = twice(w) + twice(w * 3)
+    \\row = lanes(4, lane * 0.25)
+    \\
+;
+
+// Locks `check --costs` (step 49), worked by hand: `x` is 2, a product, 3, a product, 2, a
+// product, and a sum, 7 nodes, the module's at each use; `row` is `lane` (4 values), 0.25, and a
+// product (4 values), 3 nodes and a slab of 9; the module's own row has its 9 tokens and no node;
+// the last row is the comment, eight newlines, and the `eof`. `check`'s lines come first, byte for
+// byte as `check` prints them.
+test "check_costs lists each declaration's tokens, nodes, and slab" {
+    var writer: std.Io.Writer = .fixed(&output);
+    const source: commands.Source = .{ .name = "costs.jig", .text = costs_source };
+    try testing.expect(try commands.check_costs(&compiled, &writer, source, &.{}, &.{}));
+    try testing.expectEqualStrings(check_costs_golden, writer.buffered());
+    var lines: std.Io.Writer = .fixed(&wide_output[0]);
+    try testing.expect(try commands.check(&compiled, &lines, source, &.{}, &.{}));
+    try testing.expect(std.mem.startsWith(u8, check_costs_golden, lines.buffered()));
+    var table: std.Io.Writer = .fixed(&wide_output[1]);
+    try commands.costs(&compiled, &table);
+    try testing.expectEqualStrings(check_costs_golden[lines.buffered().len..], table.buffered());
+}
+
+/// The header and the column names of `costs`' table.
+const costs_head = " tokens   nodes    slab    line  declaration\n";
+
+// Locks a feed's own row (step 49): the delay is `d`'s node, a slab of 3 with its cache; the
+// feed's 0.5, product, 1, and sum are its own 4; `out`'s 2 and sum are 2.
+test "check_costs gives a feed its own row" {
+    var writer: std.Io.Writer = .fixed(&output);
+    const source: commands.Source = .{ .name = "fed.jig", .text = "cue c0 = 0s\nd = delay(0)\nd <- d * 0.5 + 1\nout = d + 2\n" };
+    try testing.expect(try commands.check_costs(&compiled, &writer, source, &.{}, &.{}));
+    const table = writer.buffered()[std.mem.indexOf(u8, writer.buffered(), "costs: ").?..];
+    try testing.expectEqualStrings("costs: 27 tokens, 7 nodes, a slab of 9\n" ++ costs_head ++
+        "      7       4       4       3  feed d\n" ++
+        "      5       2       2       4  bind out\n" ++
+        "      6       1       3       2  bind d\n" ++
+        "      4       0       0       1  cue c0\n" ++
+        "      5       0       0       -  between declarations\n", table);
+}
+
+// Locks the table of a file past the client's 8 nodes (step 49): it is the counted program's, 17
+// nodes, after the error and the `limits:` line; each sum is 2 nodes, its 1 and itself, in line
+// order, then `a`'s wave.
+test "check_costs past the node limit gives the counted program's table" {
+    var writer: std.Io.Writer = .fixed(&output);
+    const nine: commands.Source = .{ .name = "nine.jig", .text = nine_nodes };
+    try testing.expect(!try client_command.check_costs(&client_compiled, &writer, nine, &.{}, &.{}));
+    try testing.expectEqualStrings("nine.jig:5:5: error: the program needs more than 8 nodes\n" ++
+        "    e = d + 1\n        ^^^^^\n    hint: raise `Limits.nodes`\n" ++
+        "limits: .{ .tokens = 58, .tree = 36, .names = 9, .nodes = 17, .slab = 17, .cues = 0, .goals = 0, .regions = 0, .tracks = 0, .modules = 0, .libraries = 0 }\n" ++
+        "costs: 58 tokens, 17 nodes, a slab of 17\n" ++ costs_head ++
+        "      5       2       2       2  bind b\n" ++
+        "      5       2       2       3  bind c\n" ++
+        "      5       2       2       4  bind d\n" ++
+        "      5       2       2       5  bind e\n" ++
+        "      5       2       2       6  bind f\n" ++
+        "      5       2       2       7  bind g\n" ++
+        "      5       2       2       8  bind h\n" ++
+        "      5       2       2       9  bind i\n" ++
+        "      8       1       1       1  bind a\n" ++
+        "     10       0       0       -  between declarations\n", writer.buffered());
+}
+
+/// Play's five files and the starter's, as their apps compile them.
+const real_files = [_]commands.Source{
+    .{ .name = "bouncers.jig", .text = @embedFile("play_bouncers") },
+    .{ .name = "lanes.jig", .text = @embedFile("play_lanes") },
+    .{ .name = "signals.jig", .text = @embedFile("play_signals") },
+    .{ .name = "swarm.jig", .text = @embedFile("play_swarm") },
+    .{ .name = "vectors.jig", .text = @embedFile("play_vectors") },
+    .{ .name = "motion.jig", .text = @embedFile("starter_motion") },
+};
+
+/// The three numbers of a row or a header of `costs`' table, in its order.
+fn three_numbers(line: []const u8) ![3]u64 {
+    var numbers: [3]u64 = undefined;
+    var words = std.mem.tokenizeAny(u8, line, " ,:");
+    var found: usize = 0;
+    while (words.next()) |word| {
+        if (found == numbers.len) break;
+        numbers[found] = std.fmt.parseInt(u64, word, 10) catch continue;
+        found += 1;
+    }
+    if (found < numbers.len) return error.TestUnexpectedResult;
+    return numbers;
+}
+
+// Locks the table's sums on real files (step 49): on each of Play's five files and the starter's,
+// the rows' tokens, nodes, and slab sum to the header's, and the header's nodes and slab are the
+// `ok:` line's, its tokens the file's own.
+test "check_costs' rows sum to check's totals on real files" {
+    for (real_files) |source| {
+        errdefer std.debug.print("costs of {s}\n", .{source.name});
+        var writer: std.Io.Writer = .fixed(&output);
+        try testing.expect(try commands.check_costs(&compiled, &writer, source, &.{}, &.{}));
+        const printed = writer.buffered();
+        var ok_line: [96]u8 = undefined;
+        const ok = try std.fmt.bufPrint(&ok_line, "ok: {d} nodes, a slab of {d},", .{
+            compiled.program.nodes.len,
+            compiled.program.slab_count,
+        });
+        try testing.expect(std.mem.startsWith(u8, printed, ok));
+        var header_line: [96]u8 = undefined;
+        const header = try std.fmt.bufPrint(&header_line, "\ncosts: {d} tokens, {d} nodes, a slab of {d}\n", .{
+            compiled.syntax.tree.tokens.len,
+            compiled.program.nodes.len,
+            compiled.program.slab_count,
+        });
+        const table_at = std.mem.indexOf(u8, printed, header).? + header.len;
+        var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, printed[table_at..], "\n"), '\n');
+        try testing.expectEqualStrings(costs_head[0 .. costs_head.len - 1], lines.next().?);
+        var sums: [3]u64 = .{ 0, 0, 0 };
+        var rows: usize = 0;
+        while (lines.next()) |line| {
+            const numbers = try three_numbers(line);
+            for (&sums, numbers) |*sum, number| sum.* += number;
+            rows += 1;
+        }
+        try testing.expectEqual(compiled.syntax.tree.declarations.len + 1, rows);
+        try testing.expectEqual(@as(u64, compiled.syntax.tree.tokens.len), sums[0]);
+        try testing.expectEqual(@as(u64, compiled.program.nodes.len), sums[1]);
+        try testing.expectEqual(@as(u64, compiled.program.slab_count), sums[2]);
+    }
+}
+
+// Locks the table of a file of a client's signals (step 49), the file of `check_client.txt`: no
+// program, so every row has 0 nodes and 0 slab, after `check`'s lines unchanged; its 20 tokens
+// are `x`'s 6 and `y`'s 6, the cue's 4, and three newlines and the `eof`.
+test "check_costs on a file Weft does not build gives no nodes" {
+    const clients = [_]jig.schema.Entry{ osc_signal, tap_signal };
+    const text = "cue c0 = 0s\nx = osc(2)\ny = tap(x)\n";
+    var writer: std.Io.Writer = .fixed(&output);
+    try testing.expect(try commands.check_costs(&compiled, &writer, .{ .name = "client.jig", .text = text }, &.{}, &clients));
+    try testing.expectEqualStrings(check_client_golden ++ "costs: 20 tokens, 0 nodes, a slab of 0\n" ++ costs_head ++
+        "      6       0       0       2  bind x\n" ++
+        "      6       0       0       3  bind y\n" ++
+        "      4       0       0       1  cue c0\n" ++
+        "      4       0       0       -  between declarations\n", writer.buffered());
 }

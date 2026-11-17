@@ -955,7 +955,15 @@ The limits worth knowing before you design around Weft:
 - **Ranges are conservative.** A declared module range such as `in -1..1` can be refused because
   the proven bound is a hair wider (`-1.0000000000000018..1.0000000000000018`).
 - **Everything is sized up front.** A full table is an error that names its `Limits` field, never
-  a crash. Render `compiled.errors()` to see which.
+  a crash. Render `compiled.errors()` to see which. `check` prints the least `Limits` under the
+  error too: every field when the file parses and checks, and `at least` the field that stopped
+  it otherwise. The command counts nodes up to four times the limit.
+- **What is counted.** A token is every word, number, and sign, and also every newline and every
+  comment, so a blank line is one token and a commented line two. A library's tokens are not
+  added to the file's: `Limits.tokens` must hold the largest of the file and each library. A
+  node is every number each time it is written and every call each time it is written, a module's
+  at each use; a bound name read again is none. `weft check FILE --costs` lists each
+  declaration's tokens, nodes, and slab, the most nodes first.
 
 What 0.1 promises to keep stable: the exports of `src/weft.zig`, the language `describe` lists,
 the command's JSON fields, and the rules (a function of `t`, no allocation, the same bits on every

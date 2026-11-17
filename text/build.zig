@@ -115,6 +115,18 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    // Play's files and the starter's, whose tables `check --costs` sums (step 49).
+    const real_files = [_][2][]const u8{
+        .{ "play_bouncers", "../play/bouncers.jig" },
+        .{ "play_lanes", "../play/lanes.jig" },
+        .{ "play_signals", "../play/signals.jig" },
+        .{ "play_swarm", "../play/swarm.jig" },
+        .{ "play_vectors", "../play/vectors.jig" },
+        .{ "starter_motion", "examples/starter/motion.jig" },
+    };
+    for (real_files) |file| {
+        cli_tests.root_module.addAnonymousImport(file[0], .{ .root_source_file = b.path(file[1]) });
+    }
     const cli_run = b.addRunArtifact(cli_tests);
     b.step("test-cli", "Compare the weft command's output with its goldens").dependOn(&cli_run.step);
     test_step.dependOn(&cli_run.step);
