@@ -57,8 +57,10 @@
 //! for a span and its line, `argument_of` and `argument_named` for what is written for a call's
 //! parameter, `constructor_parts` for a `vec2`'s parts, `declaration_of`, `declaration_of_cue`,
 //! and `names` for where a name is declared and the names in order, `setting_of` for `seed`,
-//! `tempo`, and `start`, and `readers_of` for the items that read a binding. A comptime block
-//! holds fields equal, not methods, so a method added to `jig.File` is added here by hand.
+//! `tempo`, and `start`, and `readers_of` for the items that read a binding, and `line_text` and
+//! `line_bytes` for a line of the text under a call (Jig step 4), whose `lines` value a client's
+//! entry declares; Weft's own calls take none, and its back end builds nothing for one. A comptime
+//! block holds fields equal, not methods, so a method added to `jig.File` is added here by hand.
 //!
 //! ## 4. Modules and Libraries
 //! A module (step 13) is checked where it is used: the checker expands it into the arrays a
@@ -617,6 +619,19 @@ pub fn Compiled(comptime limits: Limits) type {
             return jig.file.place_of(&compiled.syntax.tree, bytes);
         }
 
+        /// The text of line `index` of `lines`, a `lines` parameter's value, `\\` left out
+        /// (section 3b).
+        pub fn line_text(compiled: *const Self, lines: check.Lines, index: u32) []const u8 {
+            assert(compiled.ok);
+            return check.line_text(&compiled.syntax.tree, lines, index);
+        }
+
+        /// The bytes of line `index` of `lines`, `\\` left out (section 3b).
+        pub fn line_bytes(compiled: *const Self, lines: check.Lines, index: u32) check.Bytes {
+            assert(compiled.ok);
+            return check.line_bytes(&compiled.syntax.tree, lines, index);
+        }
+
         /// The argument written for parameter `param` of the call `call` in `checked.calls`:
         /// null when none is written (section 3b).
         pub fn argument_of(compiled: *const Self, call: u32, param: u32) ?jig.file.Argument {
@@ -863,6 +878,8 @@ test "errors name the problem and suggest the fix" {
         .{ .source = "w = wave(sine, hz: 1hz, 2)\n", .code = .positional_after_named, .hint = "write it first, or give it its name" },
         .{ .source = "s = spring(time: 1s)\n", .code = .missing_argument, .hint = "add `goals: goals, such as [c1: 1]`" },
         .{ .source = "x = 2sec\n", .code = .bad_unit, .hint = "a unit is s, ms, b, or hz, right after the number" },
+        .{ .source = "cue c = 0s\n    \\\\a\n", .code = .stray_lines, .hint = "put them directly under a `name = call(…)` line, with no blank or comment line between; a blank line of text is a bare `\\\\`" },
+        .{ .source = "w = wave(sine, 1hz)\n    \\\\a\n", .code = .wrong_type, .hint = "no call here takes lines of text; a string is written `\"…\"`" },
     };
     for (cases) |case| {
         const found = try first_error(case.source);
@@ -928,6 +945,10 @@ const fuzz_seeds = [_][]const u8{
         "cue bar = s[1] + 1s..s[1] + 5s every 2s\ntrack t = 2 * 0.25 in -pi..tau\ntrack u = 1e-1 in 0..1\n",
     // A tempo and times in beats (Jig step 1): a list, and a series whose cues are rounded once.
     "tempo 174\ncue c = [1b, 2.5b]\ncue s = 0b..4b every 1b\n",
+    // Lines of text (Jig step 4): a run under a call that takes none, a `\\` after code, and a
+    // stray run after a blank line.
+    "w = wave(sine, 1hz) # w\n    \\\\fn x() {\n\\\\    \"q\" # t\n    \\\\\n" ++
+        "x = w \\\\ y\n\n\\\\stray\n",
     // A loop that runs away within half a second, so the reader meets the bound (step 19).
     "cue c0 = 0s\nfb = delay(0)\nloop = chase(1 + fb * 1e100, time: 0.01s)\nfb <- loop\nx = loop * loop * loop\n",
 };
@@ -1006,7 +1027,7 @@ test "random bytes never crash the front end" {
     var prng = std.Random.DefaultPrng.init(0x5eed_12);
     const random = prng.random();
     var buffer: [512]u8 = undefined;
-    const alphabet = "abcehimnorstvz019._ =<-,:()[]#+*/\n\t\x00\xff";
+    const alphabet = "abcehimnorstvz019._ =<-,:()[]#+*/\\\n\t\x00\xff";
     for (0..fuzz_count) |_| {
         const len = random.uintAtMost(usize, 256);
         for (buffer[0..len]) |*byte| {
