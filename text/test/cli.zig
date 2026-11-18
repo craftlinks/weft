@@ -10,7 +10,7 @@
 //!
 //! ## 2. Inputs
 //! Every input is inline or the standard library, which is embedded in the library, so the tests
-//! read no file and need no working directory.
+//! read no file and need no working directory, but for section 5's.
 //!
 //! ## 3. A Client's Nouns
 //! A fake client registers `dot`, which the checker accepts beside the primitives and Weft's back
@@ -22,6 +22,11 @@
 //! checks and samples through `commands.For` (step 37): once compiled, its `summary` and
 //! `sample_compiled` print what `check` and `sample` would, and its limit errors name its own
 //! numbers. A client's slab refusal names the declaration that needs the most (step 35).
+//!
+//! ## 5. A File Whole, or Refused
+//! `read_whole`, which the command reads each file with (step 60), runs over files it writes in
+//! a `std.testing.tmpDir`, at the command's 64 KiB: a file that fits exactly, one byte more, and
+//! an empty file.
 
 const std = @import("std");
 const testing = std.testing;
@@ -922,4 +927,43 @@ test "check_costs on a file Weft does not build gives no nodes" {
         "      6       0       0       3  bind y\n" ++
         "      4       0       0       1  cue c0\n" ++
         "      4       0       0       -  between declarations\n", writer.buffered());
+}
+
+/// The command's cap, `file_bytes_max` in `cli/main.zig`.
+const read_bytes_max = 64 << 10;
+var read_buffer: [read_bytes_max]u8 = undefined;
+const read_data: [read_bytes_max + 1]u8 = @splat('#');
+
+/// The bytes `read_whole` returns for a file of `size` bytes of `read_data`, written in `dir`.
+fn read_whole_of(dir: std.Io.Dir, size: usize) ![]const u8 {
+    std.debug.assert(size <= read_data.len);
+    try dir.writeFile(testing.io, .{ .sub_path = "file.jig", .data = read_data[0..size] });
+    return commands.read_whole(testing.io, dir, "file.jig", &read_buffer);
+}
+
+// Locks the boundary of the 64 KiB buffer: a file of exactly 65,536 bytes comes back whole, all
+// 65,536 of them and the same bytes, with the buffer's own pointer.
+test "read_whole reads a file of exactly the buffer's size" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const text = try read_whole_of(tmp.dir, 65_536);
+    try testing.expectEqual(@as(usize, 65_536), text.len);
+    try testing.expectEqual(@as([*]const u8, &read_buffer), text.ptr);
+    try testing.expectEqualSlices(u8, read_data[0..65_536], text);
+}
+
+// Locks the refusal: a file of 65,537 bytes, one past the buffer, is `error.TooLarge`, where
+// `readFile` returned its first 65,536 bytes.
+test "read_whole refuses a file one byte larger than the buffer" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try testing.expectError(error.TooLarge, read_whole_of(tmp.dir, 65_537));
+}
+
+// Locks the empty file: 0 bytes, not an error.
+test "read_whole reads an empty file as no bytes" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const text = try read_whole_of(tmp.dir, 0);
+    try testing.expectEqual(@as(usize, 0), text.len);
 }

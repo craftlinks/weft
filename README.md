@@ -1139,7 +1139,7 @@ $ weft sample play/signals.jig --to 1 --step 0.5 --signal wave
   as an unbounded range, is `null`. The output of every command is locked by a golden in
   `text/test/golden/cli`, so a change to it is a reviewed change.
 - **Exit codes**: 0 on success, 1 when the file has errors, 2 for bad arguments or a file that
-  cannot be read.
+  cannot be read or is larger than the 65,536 bytes the command reads.
 - **A client's nouns**: `Compiled.compile_client` takes comptime entries beside the table of
   primitives, and `describe` lists them under `nouns`. The `weft` command itself registers none,
   so a client's own command checks its files (see A Client's Nouns).
