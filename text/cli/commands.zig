@@ -87,6 +87,12 @@
 //! last row is the tokens between declarations, the newlines, comments, and `eof`, so the rows
 //! sum to the header, which a debug build asserts.
 //!
+//! ## 4c. A File Whole, or Refused (step 60)
+//! `read_whole` reads a file into a caller's buffer and returns all of it, or `error.TooLarge`
+//! when the file holds more bytes than the buffer, so a command never checks the part of a file
+//! that fits and passes the rest unread. A full buffer is ambiguous, so it reads one byte more
+//! to tell a file that fits exactly from a larger one, which holds for a pipe as for a file.
+//!
 //! ## 5. TigerStyle Invariants
 //! - No allocation: every buffer is a file-scope variable, sized by the constants below, or one
 //!   of a `For`, sized by its client's `nodes` and `names`.
@@ -1222,4 +1228,34 @@ pub fn json_string(writer: *std.Io.Writer, text: []const u8) !void {
         else => try writer.writeByte(byte),
     };
     try writer.writeAll("\"");
+}
+
+pub const ReadError = std.Io.Dir.ReadFileError || error{TooLarge};
+
+/// The whole of the file at `path` in `dir`, in `buffer`, or `error.TooLarge` when the file holds
+/// more bytes than `buffer`: a file of exactly `buffer.len` bytes is read whole (section 4c).
+pub fn read_whole(
+    io: std.Io,
+    dir: std.Io.Dir,
+    path: []const u8,
+    buffer: []u8,
+) ReadError![]const u8 {
+    assert(buffer.len > 0);
+    var file = try dir.openFile(io, path, .{ .allow_directory = true });
+    defer file.close(io);
+    var reader = file.reader(io, &.{});
+    const count = reader.interface.readSliceShort(buffer) catch |err| switch (err) {
+        error.ReadFailed => return reader.err.?,
+    };
+    assert(count <= buffer.len);
+    if (count == buffer.len) {
+        // The one byte past the buffer: none means the file fits exactly.
+        var spare: [1]u8 = undefined;
+        const spare_count = reader.interface.readSliceShort(&spare) catch |err| switch (err) {
+            error.ReadFailed => return reader.err.?,
+        };
+        assert(spare_count <= spare.len);
+        if (spare_count > 0) return error.TooLarge;
+    }
+    return buffer[0..count];
 }

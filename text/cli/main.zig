@@ -17,7 +17,8 @@
 //! `--lanes A..B` keeps lanes A to B of every signal and event, both included.
 //! Times are seconds, read as decimals and turned into flicks, as the library's times are.
 //! Exit 0 on success, 1 when the file has errors, and 2 on bad arguments or a file that cannot be
-//! read.
+//! read. A file or a library larger than `file_bytes_max` is refused with its size, and exit 2,
+//! since no check ran on the part of it that did not fit (step 60).
 //!
 //! ## 2. Memory
 //! Each file is read into a buffer of its own, `file_buffers`, and the output is written into one
@@ -25,6 +26,7 @@
 //! the file, so a file of any slab can be sampled; nothing else allocates.
 
 const std = @import("std");
+const assert = std.debug.assert;
 const weft = @import("weft");
 const jig = @import("jig");
 const commands = @import("commands");
@@ -134,11 +136,39 @@ pub fn main(init: std.process.Init) !u8 {
     return status;
 }
 
+/// The whole file, or null after a line on stderr: a file it cannot open or read, or one larger
+/// than `buffer`, which is refused rather than checked in part (step 60).
 fn read(io: std.Io, path: []const u8, buffer: []u8) ?[]const u8 {
-    return std.Io.Dir.cwd().readFile(io, path, buffer) catch |err| {
-        std.debug.print("weft: cannot read {s}: {s}\n", .{ path, @errorName(err) });
+    assert(buffer.len == file_bytes_max);
+    const text = commands.read_whole(io, std.Io.Dir.cwd(), path, buffer) catch |err| {
+        if (err == error.TooLarge) {
+            read_too_large(io, path);
+        } else {
+            std.debug.print("weft: cannot read {s}: {s}\n", .{ path, @errorName(err) });
+        }
         return null;
     };
+    assert(text.len <= file_bytes_max);
+    return text;
+}
+
+/// The size line: the file's size from its `stat`, or `more than` the cap when the size is not
+/// to be had, as for a pipe, whose `stat` gives no size, or a file that shrank since the read.
+fn read_too_large(io: std.Io, path: []const u8) void {
+    // The file opened and read past the cap, so it has a name.
+    assert(path.len > 0);
+    const stat = std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = true }) catch null;
+    if (stat) |known| {
+        if (known.size > file_bytes_max) {
+            std.debug.print("weft: {s} is {d} bytes, and the command reads at most {d}\n", .{
+                path, known.size, file_bytes_max,
+            });
+            return;
+        }
+    }
+    std.debug.print("weft: {s} is more than {d} bytes, and the command reads at most {d}\n", .{
+        path, file_bytes_max, file_bytes_max,
+    });
 }
 
 /// A time in seconds, as flicks; null when it is not a number, or is beyond a day either way.
