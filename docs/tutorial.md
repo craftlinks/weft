@@ -166,8 +166,9 @@ it divides evenly by every common frame rate (24, 30, 60, 120, 144) and audio ra
 48,000, 96,000). So a frame time or a sample time is exact, and whole numbers do not drift: the
 ten-thousandth frame is exactly ten thousand frames after the first.
 
-In a file, a time is exact to five decimal places of a second or two of a millisecond. Anything
-finer is refused, with the nearest flick named.
+In a file, a time has a literal exactly when it is a whole multiple of 441 flicks, so
+`4.475625ms` is exact. A time between two of them, such as `4.4756ms`, is refused, and the hint
+names the nearest literal.
 
 In Zig:
 
@@ -988,7 +989,7 @@ target).
 | `'x' is used before it is declared` | A name below its use, **or the line that declares it has an error of its own** | Fix the first error first; for a loop, use a `delay` |
 | `` `start` is a keyword `` | A reserved word as a name | Rename it |
 | `'hz' takes a frequency` | A bare number | Write `2hz`, `500ms`, `1.5s` |
-| `not a whole number of flicks` | A time finer than the grid | Round to 5 places of a second |
+| `not a whole number of flicks` | A time finer than the grid | Write the literal the hint names |
 | `4 lanes and 5 lanes do not go together` | Two regions of different sizes | Make the counts equal |
 | `` `n` is a whole number from 2 to 8 `` | `pow(x, 1)`, `pow(x, 10)`, `pow(x, 0.5)`, or `pow(x, k)` with k a name | Write `x`, multiply powers, use `sqrt`, or write the number |
 | A `floor` of a chase steps between frames, or at a frame you did not expect | `floor` reads the chase's value interpolated between its fixed steps | Expected: a step falls where the smooth value crosses a whole number |

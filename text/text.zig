@@ -948,7 +948,7 @@ test "errors name the problem and suggest the fix" {
         .{ .source = "a = chase(b, time: 1s)\nb = wave(sine, 1hz)\n", .code = .used_before_declared, .hint = "move it up, or go through a delay" },
         .{ .source = "w = wav(sine, 1hz)\n", .code = .unknown_call, .hint = "did you mean `wave`?" },
         .{ .source = "w = wave(sin, 1hz)\n", .code = .unknown_word, .hint = "did you mean `sine`?" },
-        .{ .source = "cue c = 0.000001s\n", .code = .not_whole_flicks, .hint = "the nearest is 706 flicks; seconds are exact to 5 places, ms to 2" },
+        .{ .source = "cue c = 0.000001s\n", .code = .not_whole_flicks, .hint = "the nearest time a literal holds is `0.00000125s`" },
         .{ .source = "w = wave(sine, 1hz)\nw = wave(sine, 2hz)\n", .code = .duplicate_name, .hint = "it was declared on line 1" },
         .{ .source = "cue c0 = 0s\ncue c1 = 1s\nm = [c1: 1]\nw = wave(sine, 1hz)\ns = spring(m, time: w)\n", .code = .not_live, .hint = "chase follows a moving value, and a follower's mover reads signals" },
         .{ .source = "cue c0 = 0s\nm = [c0: 1]\ns = spring(m, time: 1s, overshoot: 1.5)\n", .code = .refused, .hint = "0 settles without passing the goal; 0.5 is bouncy" },
