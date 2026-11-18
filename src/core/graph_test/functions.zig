@@ -450,3 +450,114 @@ test "a function of a value has its input's class" {
     try testing.expectEqual(graph_module.Class.pure, classes[stepped.index]);
     try testing.expectEqual(graph_module.Class.simulated, classes[chase_floor.index]);
 }
+
+/// The inputs of step 51's node tests, the zeros of both signs and the tiniest magnitudes among
+/// them; a constant node holds finite values only, so the infinities are `Function.of`'s alone.
+const step_51_inputs = [_]f64{ -2, -1, -1e-300, -0.0, 0, 1e-300, 2, 3, -1e300, 1e300 };
+
+// Locks `step` (section 17): -1 is 0, -1e-300 is 0, -0 is 1, 0 is 1, 1e-300 is 1, 2 is 1, -inf is
+// 0, +inf is 1, and NaN is NaN; every result has the bits of +0 or 1; and a node of each input
+// gives the same bits.
+test "step is 0 below 0 and 1 from 0 on, -0 included" {
+    const cases = [_][2]f64{
+        .{ -1, 0 }, .{ -1e-300, 0 }, .{ -0.0, 1 }, .{ 0, 1 }, .{ 1e-300, 1 },
+        .{ 2, 1 },  .{ -inf, 0 },    .{ inf, 1 },
+    };
+    for (cases) |case| {
+        try testing.expectEqual(bits(case[1]), bits(Function.of(.step, case[0])));
+    }
+    try testing.expect(std.math.isNan(Function.of(.step, std.math.nan(f64))));
+    try expect_nodes_agree(.step);
+}
+
+// Locks `sign` (section 17): -2 is -1, -1e-300 is -1, -0 is +0 by its bits, 0 is +0, 1e-300 is 1,
+// 3 is 1, -inf is -1, +inf is 1, and NaN is NaN; and a node of each input gives the same bits.
+test "sign is -1, +0, or 1, a zero of either sign +0" {
+    const cases = [_][2]f64{
+        .{ -2, -1 }, .{ -1e-300, -1 }, .{ -0.0, 0 }, .{ 0, 0 }, .{ 1e-300, 1 },
+        .{ 3, 1 },   .{ -inf, -1 },    .{ inf, 1 },
+    };
+    for (cases) |case| {
+        try testing.expectEqual(bits(case[1]), bits(Function.of(.sign, case[0])));
+    }
+    try testing.expectEqual(bits(0), bits(Function.of(.sign, -0.0)));
+    try testing.expect(std.math.isNan(Function.of(.sign, std.math.nan(f64))));
+    try expect_nodes_agree(.sign);
+}
+
+/// That `function` of a constant node of each of step 51's inputs is `Function.of`, bit for bit.
+fn expect_nodes_agree(function: Function) !void {
+    for (step_51_inputs) |x| {
+        var nodes: [2]Node = undefined;
+        var builder = Builder.init(&nodes, .{ .slab_count_max = 2 });
+        const applied = try builder.apply(function, try builder.constant(x));
+        var slab: [2]f64 = undefined;
+        var state = State.init(builder.finish(), &slab);
+        state.eval(.{ .flicks = 0 });
+        try testing.expectEqual(bits(function.of(x)), bits(state.value(applied)));
+    }
+}
+
+/// The range of `function` over an input node of `ends`, and the least and largest values seen
+/// with the input set across it (`wide_points_of`), each inside the range.
+fn sampled_range(function: Function, ends: [2]f64) !struct { range: Range, seen: Seen } {
+    var nodes: [2]Node = undefined;
+    var builder = Builder.init(&nodes, .{ .slab_count_max = 2 });
+    const initial = std.math.clamp(0, ends[0], ends[1]);
+    const input = try builder.input(.{ .low = ends[0], .high = ends[1], .initial = initial });
+    const applied = try builder.apply(function, input);
+    const program = builder.finish();
+    var ranges: [2]Range = undefined;
+    program.ranges(&ranges);
+    const range = ranges[applied.index];
+    var slab: [2]f64 = undefined;
+    var state = State.init(program, slab[0..program.slab_count]);
+    var buffer: [wide_points + 64]f64 = undefined;
+    var seen: Seen = .{};
+    for (wide_points_of(ends, &buffer)) |x| {
+        state.set_input(input, x);
+        state.eval(.{ .flicks = 0 });
+        const value = state.value(applied);
+        errdefer std.debug.print("{any} of {e} over {any}: {e} outside [{e}, {e}]\n", .{
+            function, x, ends, value, range.low, range.high,
+        });
+        try testing.expect(range.contains(value));
+        seen.add(value);
+    }
+    return .{ .range = range, .seen = seen };
+}
+
+// Locks step 51's range rules (`range.zig`, section 2b), each end reached by sampling: step over
+// [-1, 1] is [0, 1], over [0.5, 2] [1, 1], over [-2, -0.5] [0, 0], over [-1, 0] [0, 1], and over
+// an unbounded input [0, 1]; sign over [-1, 1] is [-1, 1], over [0, 1] [0, 1], over [1, 6] [1, 1],
+// and over [-3, 0] [-1, 0]. And over every range of step 33's test, each is sound, and exact
+// where the input is bounded.
+test "the ranges of step and sign are exact" {
+    const cases = [_]struct { function: Function, input: [2]f64, range: Range }{
+        .{ .function = .step, .input = .{ -1, 1 }, .range = .{ .low = 0, .high = 1 } },
+        .{ .function = .step, .input = .{ 0.5, 2 }, .range = .{ .low = 1, .high = 1 } },
+        .{ .function = .step, .input = .{ -2, -0.5 }, .range = .{ .low = 0, .high = 0 } },
+        .{ .function = .step, .input = .{ -1, 0 }, .range = .{ .low = 0, .high = 1 } },
+        .{ .function = .sign, .input = .{ -1, 1 }, .range = .{ .low = -1, .high = 1 } },
+        .{ .function = .sign, .input = .{ 0, 1 }, .range = .{ .low = 0, .high = 1 } },
+        .{ .function = .sign, .input = .{ 1, 6 }, .range = .{ .low = 1, .high = 1 } },
+        .{ .function = .sign, .input = .{ -3, 0 }, .range = .{ .low = -1, .high = 0 } },
+    };
+    for (cases) |case| {
+        const sampled = try sampled_range(case.function, case.input);
+        errdefer std.debug.print("{any} over {any}\n", .{ case.function, case.input });
+        try testing.expectEqual(case.range, sampled.range);
+        try testing.expect(sampled.seen.low == case.range.low);
+        try testing.expect(sampled.seen.high == case.range.high);
+    }
+    const unbounded = try sampled_range(.step, .{ -inf, inf });
+    try testing.expectEqual(Range{ .low = 0, .high = 1 }, unbounded.range);
+    for ([_]Function{ .step, .sign }) |function| for (wide_ranges) |ends| {
+        const sampled = try sampled_range(function, ends);
+        if (!std.math.isFinite(ends[0])) continue;
+        if (!std.math.isFinite(ends[1])) continue;
+        errdefer std.debug.print("{any} over {any}\n", .{ function, ends });
+        try testing.expect(sampled.range.low == sampled.seen.low);
+        try testing.expect(sampled.range.high == sampled.seen.high);
+    };
+}

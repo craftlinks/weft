@@ -91,7 +91,14 @@
 //! `to` after it, with no value between. They come last, so every line before them is a line of
 //! step 33.
 //!
-//! ## 14. TigerStyle Invariants
+//! ## 14. Step and Sign
+//! Two graphs read step 51's `step` and `sign` at every epoch: `step` of the drift, a gate that
+//! opens and shuts as the drift crosses 0, and `sign` of a slow wave, which is 0 exactly at its
+//! start in the zero epoch. They read `step` and `sign` only through `Function.of`, so each line is
+//! 0, +0, 1, or -1, the same on native and wasm. They come last, so every line before them is a
+//! line of step 44.
+//!
+//! ## 15. TigerStyle Invariants
 //! - The text fits in `text_size_max` by construction, so `render` cannot fail.
 
 const std = @import("std");
@@ -238,6 +245,15 @@ const StepGraph = enum {
 
 const step_graphs = std.enums.values(StepGraph);
 
+/// The graphs of section 14, each built by `sign_graph_build`, after the step. The language's
+/// test names them `fn_step` and `fn_sign`, as section 12's.
+const SignGraph = enum {
+    step,
+    sign,
+};
+
+const sign_graphs = std.enums.values(SignGraph);
+
 /// The inputs of section 12's run of constants, for each function.
 const function_inputs = [_]struct { function: weft.graph.Function, name: []const u8, inputs: []const f64 }{
     .{ .function = .round, .name = "round", .inputs = &.{ -2.5, -1.5, -0.5, -0.4, -0.0, 0.5, 1.5, 2.5, 0.49999999999999994, 4503599627370495.5, -4503599627370495.5 } },
@@ -308,9 +324,12 @@ const function_input_count = count: {
 /// Section 13's samples: its graphs at every epoch.
 const step_sample_count = step_graphs.len * epochs.len * samples_per_run;
 
+/// Section 14's samples: its graphs at every epoch.
+const sign_sample_count = sign_graphs.len * epochs.len * samples_per_run;
+
 pub const sample_count = wave_sample_count + noise_sample_count + graph_sample_count +
     runaway_sample_count + value_sample_count + zero_sample_count + function_sample_count +
-    function_input_count + step_sample_count;
+    function_input_count + step_sample_count + sign_sample_count;
 
 pub const event_count = count: {
     var count: u32 = 0;
@@ -340,6 +359,7 @@ comptime {
     assert(function_sample_count == 768);
     assert(function_input_count == 68);
     assert(step_sample_count == 96);
+    assert(sign_sample_count == 192);
     assert(Graph.slab_count_max >= Graph.nodes_count_max + 2 * weft.motion.cursor_count);
     assert(text_size_max < 1 << 20);
     for (signals) |signal| assert(weft.Rate.from_hz(signal.rate_hz) != null);
@@ -378,6 +398,9 @@ pub fn render(text: *[text_size_max]u8) []const u8 {
     }
     render_function_inputs(&writer);
     for (step_graphs) |graph| {
+        for (&epochs) |*epoch| render_graph_run(&writer, graph, epoch);
+    }
+    for (sign_graphs) |graph| {
         for (&epochs) |*epoch| render_graph_run(&writer, graph, epoch);
     }
     assert(writer.buffered().len > line_count);
@@ -853,8 +876,10 @@ pub fn graph_nodes(name: []const u8, nodes: *[Graph.nodes_count_max]weft.Node) ?
         graph_build(graph, &builder) catch unreachable
     else if (std.meta.stringToEnum(ValueGraph, name)) |graph|
         value_graph_build(graph, &builder) catch unreachable
-    else if (function_graph_name(name)) |graph|
+    else if (function_graph_name(FunctionGraph, name)) |graph|
         function_graph_build(graph, &builder) catch unreachable
+    else if (function_graph_name(SignGraph, name)) |graph|
+        sign_graph_build(graph, &builder) catch unreachable
     else if (std.meta.stringToEnum(StepGraph, name)) |graph|
         step_graph_build(graph, &builder) catch unreachable
     else
@@ -870,15 +895,17 @@ fn build_any(graph: anytype, builder: *weft.Builder) weft.Builder.Error!weft.Id 
         ValueGraph => value_graph_build(graph, builder),
         FunctionGraph => function_graph_build(graph, builder),
         StepGraph => step_graph_build(graph, builder),
+        SignGraph => sign_graph_build(graph, builder),
         else => @compileError("not a catalog graph"),
     };
 }
 
-/// The `FunctionGraph` the language's test names `fn_NAME`, since `abs`, `min`, and `max` name
-/// graphs of section 11 already and these would read as calls.
-fn function_graph_name(name: []const u8) ?FunctionGraph {
+/// The `FunctionGraph` or `SignGraph` the language's test names `fn_NAME`, since `abs`, `min`,
+/// and `max` name graphs of section 11 already and these would read as calls.
+fn function_graph_name(comptime Graphs: type, name: []const u8) ?Graphs {
+    comptime assert(Graphs == FunctionGraph or Graphs == SignGraph);
     if (!std.mem.startsWith(u8, name, "fn_")) return null;
-    return std.meta.stringToEnum(FunctionGraph, name[3..]);
+    return std.meta.stringToEnum(Graphs, name[3..]);
 }
 
 fn function_graph_build(graph: FunctionGraph, builder: *weft.Builder) weft.Builder.Error!weft.Id {
@@ -896,6 +923,15 @@ fn function_graph_build(graph: FunctionGraph, builder: *weft.Builder) weft.Build
         .floor => return builder.apply(.floor, try builder.multiply(wave, try builder.constant(3))),
         .round => return builder.apply(.round, try builder.multiply(wave, try builder.constant(2.5))),
         .pow => return builder.apply(.{ .pow = 3 }, try builder.multiply(wave, try builder.constant(1.5))),
+    }
+}
+
+fn sign_graph_build(graph: SignGraph, builder: *weft.Builder) weft.Builder.Error!weft.Id {
+    switch (graph) {
+        // The drift's gate: 1 while the drift is at or above 0, and 0 below it.
+        .step => return builder.apply(.step, try graph_build(.drift, builder)),
+        // A slow wave's sign, 0 where the wave is 0, at the start of the zero epoch.
+        .sign => return builder.apply(.sign, try builder.wave(.{ .shape = .sine, .hz = 0.7 })),
     }
 }
 
@@ -1106,6 +1142,34 @@ test "a step has the same bits at every epoch, and no value between" {
             try testing.expect(std.mem.indexOf(u8, text, line) != null);
         }
     }
+}
+
+// Locks section 14: every sample of `step` is 0 or 1 and of `sign` -1, +0, or 1, and both reach
+// each of their values; the first sample of `sign` in the zero epoch is +0, the wave's 0.
+test "step and sign take only their values" {
+    const text = render(&text_a);
+    for (sign_graphs) |graph| {
+        var seen = [_]bool{ false, false, false };
+        for (epochs) |epoch| {
+            for (0..samples_per_run) |index| {
+                var buffer: [line_size_max]u8 = undefined;
+                const start = try std.fmt.bufPrint(&buffer, "graph {t} {s} {d} ", .{
+                    graph, epoch.name, index,
+                });
+                const line_start = std.mem.indexOf(u8, text, start).?;
+                const line_end = std.mem.indexOfScalarPos(u8, text, line_start, '\n').?;
+                const value = try std.fmt.parseFloat(f64, text[line_start + start.len .. line_end]);
+                try testing.expect(value == -1 or value == 0 or value == 1);
+                if (value == 0) try testing.expect(!std.math.signbit(value));
+                if (graph == .step) try testing.expect(value != -1);
+                seen[@intFromFloat(value + 1)] = true;
+            }
+        }
+        try testing.expect(seen[1] and seen[2]);
+        if (graph == .sign) try testing.expect(seen[0]);
+    }
+    const first = "graph sign zero 0 0x0.0p0\n";
+    try testing.expect(std.mem.indexOf(u8, text, first) != null);
 }
 
 // Locks the same for events: each event graph's lines at zero, with their index, time after the

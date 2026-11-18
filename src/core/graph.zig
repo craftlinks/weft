@@ -257,6 +257,11 @@
 //! one included. abs, min, max, sqrt, floor, round, and pow round nothing out of order, so their
 //! ranges are exact for independent inputs; exp, ln, sin, and cos are within a small margin.
 //!
+//! Step 51 adds `step`, 0 below 0 and 1 from 0 on, and `sign`, -1, +0, or 1, so a gate needs no
+//! stepped node and a choice is arithmetic: `a + step(c) * (b - a)`. Both are total, pass a NaN
+//! through, answer a signed zero once (`step(-0)` is 1, `sign(-0)` is +0), and are
+//! non-decreasing, so their ranges are the function at the input's ends, exact (`monotone`).
+//!
 //! A function is pure, so its node has its input's class: `floor` of a wave is pure and
 //! seekable, and `floor` of a chase is simulated. Of a simulated input it is the function of the
 //! interpolated value (section 9), so a step of `floor` falls where the interpolation crosses a
@@ -688,6 +693,12 @@ pub const Function = union(enum) {
     /// `pow(x, 2)` is `x * x` bit for bit, with an exact range that knows both factors are x, so
     /// over [-1, 1] it is [0, 1] where the product's is [-1, 1].
     pow: u8,
+    /// 0 below 0 and 1 from 0 on (`elementary.step`). `step(-0)` is 1: -0 is 0, and a signed
+    /// zero has one answer. NaN passes through; an infinity is below or above 0 as any number.
+    step,
+    /// -1 below 0, 1 above, and +0 at either zero, its sign bit cleared as `abs` clears it
+    /// (`elementary.sign`). NaN passes through; an infinity is below or above 0 as any number.
+    sign,
 
     /// The function's value at `x`, the same bits on every target.
     pub fn of(function: Function, x: f64) f64 {
@@ -701,6 +712,8 @@ pub const Function = union(enum) {
             .floor => @floor(x),
             .round => elementary.round_half_away(x),
             .pow => |n| elementary.power(x, n),
+            .step => elementary.step(x),
+            .sign => elementary.sign(x),
         };
     }
 
@@ -2136,6 +2149,8 @@ fn function_range(function: Function, input: Range) Range {
         .floor => range_module.monotone(input, floor_of),
         .round => range_module.monotone(input, elementary.round_half_away),
         .pow => |n| range_module.power(input, n),
+        .step => range_module.monotone(input, elementary.step),
+        .sign => range_module.monotone(input, elementary.sign),
     };
 }
 

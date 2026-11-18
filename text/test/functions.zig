@@ -1,7 +1,7 @@
 //! The functions of a value in the language: `abs`, `min`, and `max` (step 26), `sin`, `cos`,
-//! `exp`, `ln`, `sqrt`, `floor`, `round`, and `pow` (step 33), and `std`'s `clamp` and
-//! `quantize`: what they build, what they fold to, their shapes and lanes, their ranges, and
-//! their errors.
+//! `exp`, `ln`, `sqrt`, `floor`, `round`, and `pow` (step 33), `step` and `sign` (step 51), and
+//! `std`'s `clamp` and `quantize`: what they build, what they fold to, their shapes and lanes,
+//! their ranges, and their errors.
 //!
 //! # Deep Architectural Guide for Reviewers:
 //!
@@ -388,4 +388,72 @@ test "pow and quantize refuse what is not a fixed number" {
         },
     };
     for (cases) |case| try expect_one(case);
+}
+
+/// The values of the signal `name` of `compiled` at `seconds`.
+fn values_at(compiled: *const Compiled, name: []const u8, seconds: f64) ![]const f64 {
+    var state = weft.State.init(compiled.program, slab[0..compiled.program.slab_count]);
+    const flicks: i64 = @intFromFloat(seconds * weft.time.flicks_per_second);
+    state.eval(.{ .flicks = flicks });
+    const id = compiled.signal(name) orelse return error.TestUnexpectedResult;
+    return state.values(id);
+}
+
+// Locks step 51's values through text: a wave and its step and sign are 3 nodes; at 0 s, where
+// the sine is 0, `gate` is 1 and `s` is +0 by its bits; at 0.25 s, 1 and 1; at 0.75 s, 0 and -1.
+// `gate`'s range is [0, 1] and `s`'s [-1, 1], with no margin. And `step(w)` written twice is
+// one node, apart from `sign(w)`: the tag keys a shared function, with no payload.
+test "step and sign of a wave are a gate and its sign" {
+    try compile(&with_module, "w = wave(sine, 1hz)\ngate = step(w)\ns = sign(w)\n");
+    try testing.expectEqual(@as(usize, 3), with_module.program.nodes.len);
+    const times = [_]f64{ 0, 0.25, 0.75 };
+    const gates = [_]f64{ 1, 1, 0 };
+    const signs = [_]f64{ 0, 1, -1 };
+    for (times, gates, signs) |seconds, gate, sign| {
+        errdefer std.debug.print("at {d} s\n", .{seconds});
+        try testing.expectEqual(bits(gate), bits((try values_at(&with_module, "gate", seconds))[0]));
+        try testing.expectEqual(bits(sign), bits((try values_at(&with_module, "s", seconds))[0]));
+    }
+    try testing.expectEqual(weft.Range{ .low = 0, .high = 1 }, range_of(&with_module, "gate"));
+    try testing.expectEqual(weft.Range{ .low = -1, .high = 1 }, range_of(&with_module, "s"));
+    try compile(&with_module, "w = wave(sine, 1hz)\na = step(w)\nb = step(w)\nc = sign(w)\n");
+    try testing.expectEqual(@as(usize, 3), with_module.program.nodes.len);
+    try testing.expectEqual(with_module.signal("a").?, with_module.signal("b").?);
+    try testing.expect(with_module.signal("a").?.index != with_module.signal("c").?.index);
+}
+
+// Locks step 51's folding: step(-2) is 0, step(0) is 1, sign(-2) is -1, and sign(-0) is +0 by its
+// bits, each a constant. The +0 of `a` and of `d` is one node (step 50), so the four are 3 nodes.
+test "step and sign of numbers fold to the core's constant" {
+    try compile(&with_module, "a = step(-2)\nb = step(0)\nc = sign(-2)\nd = sign(-0)\n");
+    try testing.expectEqual(@as(usize, 3), with_module.program.nodes.len);
+    const expected = [_]struct { []const u8, f64 }{
+        .{ "a", 0 }, .{ "b", 1 }, .{ "c", -1 }, .{ "d", 0 },
+    };
+    for (expected) |pair| {
+        const node = with_module.program.nodes[with_module.signal(pair[0]).?.index];
+        errdefer std.debug.print("{s}: {any}\n", .{ pair[0], node.op });
+        try testing.expectEqual(bits(pair[1]), bits(node.op.constant));
+    }
+    try testing.expectEqual(with_module.signal("a").?, with_module.signal("d").?);
+}
+
+// Locks the tutorial's choice, `a + step(c) * (b - a)`: 2 + step(w) * (5 - 2) reads 5 at 0.25 s,
+// where the wave is 1, and 2 at 0.75 s, where it is -1, exactly.
+test "a choice is arithmetic over a step" {
+    try compile(&with_module, "w = wave(sine, 1hz)\nout = 2 + step(w) * (5 - 2)\n");
+    try testing.expectEqual(bits(5), bits((try values_at(&with_module, "out", 0.25))[0]));
+    try testing.expectEqual(bits(2), bits((try values_at(&with_module, "out", 0.75))[0]));
+}
+
+// Locks step 51's shapes and lanes: step(vec2(-1, 0.5)) is (0, 1), one node of two components;
+// and lanes(3, sign(lane - 1)) is -1, +0, 1, the middle lane's zero +0 by its bits.
+test "step and sign work per component and per lane" {
+    try compile(&with_module, "v = step(vec2(-1, 0.5))\nl = lanes(3, sign(lane - 1))\n");
+    try testing.expectEqualSlices(f64, &.{ 0, 1 }, try values_at_zero(&with_module, "v"));
+    const program = with_module.program;
+    try testing.expectEqual(@as(u32, 2), program.nodes[with_module.signal("v").?.index].extent.components);
+    const lanes = try values_at_zero(&with_module, "l");
+    try testing.expectEqualSlices(f64, &.{ -1, 0, 1 }, lanes);
+    try testing.expectEqual(bits(0), bits(lanes[1]));
 }

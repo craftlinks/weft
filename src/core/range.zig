@@ -34,7 +34,8 @@
 //! Each of these is the function of `elementary.zig`, section 4a, at a range's ends, which is why
 //! each is total: an end of minus or plus infinity has a value too.
 //! - `sqrt`, `floor`, and `round` are monotone and correctly rounded, so their computed values are
-//!   monotone too: the range is the function at the two ends, exact (`monotone`).
+//!   monotone too: the range is the function at the two ends, exact (`monotone`). So are step
+//!   51's `step` and `sign`, which round nothing: over [-1, 1] they are [0, 1] and [-1, 1].
 //! - `pow` with an odd n is monotone, so the same. With an even n it is monotone in |x|: the
 //!   larger of the ends' values, and a low end of 0 where the input spans 0. A product rounds
 //!   monotonically for each sign, so these are exact, and `pow(x, 2)` over [-1, 1] is [0, 1].

@@ -8,8 +8,8 @@
 //! locked by the regress golden. If a graph's text compiles to the same nodes, field for field,
 //! the text gives the same samples, with no second golden. Fourteen of the fifteen are here: the
 //! recorded one plays a client's samples, which the language does not have. So are the four
-//! graphs of `abs`, `min`, and `max` (step 26), the eight of step 33, named `fn_NAME`, and the
-//! step of step 44, `tween_step`.
+//! graphs of `abs`, `min`, and `max` (step 26), the eight of step 33, named `fn_NAME`, the
+//! step of step 44, `tween_step`, and step 51's `fn_step` and `fn_sign`.
 //!
 //! ## 2. One Preamble
 //! Every graph reads the catalog's tables, so each text starts with the same preamble: its three
@@ -101,6 +101,8 @@ const cases = [_]Case{
     .{ .name = "fn_round", .text = "out = round(wave(sine, 0.7hz) * 2.5)\n" },
     .{ .name = "fn_pow", .text = "out = pow(wave(sine, 0.7hz) * 1.5, 3)\n" },
     .{ .name = "tween_step", .text = "out = tween(from: 0.54, to: 0.6, at: c1, over: 0s)\n" },
+    .{ .name = "fn_step", .text = "out = step(wave(sine, 0.7hz) + wave(saw, 1hz) * 0.5)\n" },
+    .{ .name = "fn_sign", .text = "out = sign(wave(sine, 0.7hz))\n" },
 };
 
 var compiled: weft_text.Compiled(.{ .tokens = 1024, .tree = 512, .names = 64, .nodes = 64, .slab = 256, .cues = 8, .goals = 16, .regions = 8, .tracks = 4, .track_samples = 4 }) = undefined;

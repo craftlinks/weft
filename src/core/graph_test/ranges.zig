@@ -640,7 +640,7 @@ const Drawn = struct {
             23 => try builder.apply(.abs, any),
             24 => try builder.minimum(any, other),
             25 => try builder.maximum(any, other),
-            26 => try builder.apply(switch (random.uintLessThan(u8, 8)) {
+            26 => try builder.apply(switch (random.uintLessThan(u8, 10)) {
                 0 => .sin,
                 1 => .cos,
                 2 => .exp,
@@ -648,6 +648,8 @@ const Drawn = struct {
                 4 => .sqrt,
                 5 => .floor,
                 6 => .round,
+                7 => .step,
+                8 => .sign,
                 else => .{ .pow = random.intRangeAtMost(u8, 2, 8) },
             }, any),
             else => try builder.add(any, any),

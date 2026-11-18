@@ -363,7 +363,8 @@ const value = state.value(output);
 ```
 
 The ops are `constant`, `add`, `multiply`, `minimum`, `maximum`, `apply` (a `Function` of one
-value: `.abs`, `.sin`, `.cos`, `.exp`, `.ln`, `.sqrt`, `.floor`, `.round`, or `.{ .pow = n }`),
+value: `.abs`, `.sin`, `.cos`, `.exp`, `.ln`, `.sqrt`, `.floor`, `.round`, `.{ .pow = n }`, `.step`,
+or `.sign`),
 `map_range`, `wave`, `noise`, `tween`, `spring`, `newtonian`, `chase`, `follow`, `shift`, `delay`,
 `bounce`, `crossing`, `cues`, `input`, `recorded`, `oscillator`, and `track`. The builder refuses
 by name what does not fit or cannot be evaluated: `error.NodeCapacityExceeded`, `error.SlabCapacityExceeded`, `error.UnknownNode`,
@@ -630,7 +631,8 @@ state.record(level, &recording);               // what each pass reads, written 
 ```
 
 A range is conservative: a stated bound is never wrong, though it can be wider than the truth.
-Sums, products, `abs`, `min`, `max`, `sqrt`, `floor`, `round`, `pow`, waves, and noise are exact;
+Sums, products, `abs`, `min`, `max`, `sqrt`, `floor`, `round`, `pow`, `step`, `sign`, waves, and
+noise are exact;
 an interpolation, a map, a tween, a motion, `exp`, and `ln` are widened by a margin relative to
 their scale, and `sin` and `cos` by a few ulps, reaching 1 or -1 only where a peak or a trough
 lies inside the input's range. A spring's range includes its overshoot: one move from
@@ -782,6 +784,12 @@ const goal = compiled.goal("spring");        // a path and its from, a chase's t
   class: of a chase they are simulated, and step where the chase's interpolation crosses, between
   the fixed steps. `std`'s `quantize(x, step)` is `round(x / step) * step`, so `step` is a number
   fixed when the program is built, as a divisor is.
+- **`step(x)` and `sign(x)`** (step 51) are the same kind of call again. `step` is 0 below 0 and
+  1 from 0 on, so `step(-0)` is 1; `sign` is -1 below 0, 1 above, and +0 at either zero. Both
+  are exact and pure, with exact ranges: over [-1, 1] they are [0, 1] and [-1, 1], and over a
+  range on one side of 0 the one number. So a gate needs no stepped node, `step(w - 0.25)` is 1
+  while a wave is at or above a level, and a choice is arithmetic, `a + step(c) * (b - a)`. There
+  is no comparison and no `if`.
 - **Seeds**: an explicit `seed:` wins; otherwise it is a hash of the declaration's name, so a new
   line never reshuffles another.
 - **Errors** give a line, a column, a reason, and a hint, as Zig prints its own:
