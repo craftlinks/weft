@@ -41,7 +41,8 @@
 //! A tween is one more pure node, so keyframes are not a second system. It refers to a cue and not
 //! to a time, so moving the cue moves the tween, and it measures its progress as a difference of
 //! integers, so it keeps every bit however far it is from zero. At and after its end it returns
-//! `to` itself, not a computed value, so it lands exactly.
+//! `to` itself, not a computed value, so it lands exactly. A tween of duration zero ends at its
+//! cue, so it is a step: what it follows before the cue, and `to` from the cue on.
 //!
 //! The cue table is the one thing a program reads that can change, which `cue.zig` explains. A move
 //! can change which tweens overlap at any time, long after building, so an overlap cannot be
@@ -400,7 +401,8 @@ fn assert_cue_by_lane(program: Program, node: *const Node, start: Cue) void {
 pub const Tween = struct {
     from: f64,
     to: f64,
-    /// How long the move takes, above zero. Measured from the cue, so it moves with the cue.
+    /// How long the move takes, at least zero. Zero is a step: `from` (or `previous`) before the
+    /// cue and `to` from the cue on. Measured from the cue, so it moves with the cue.
     duration: Time,
     ease: Ease,
     start: Cue,
@@ -415,7 +417,7 @@ pub const Tween = struct {
     /// The value at or after `start_time`.
     pub fn value_after(tween: *const Tween, time: Time, start_time: Time) f64 {
         assert(time.flicks >= start_time.flicks);
-        assert(tween.duration.flicks > 0);
+        assert(tween.duration.flicks >= 0);
         // Wrapping, because the distance between two i64 only fits in a u64.
         const elapsed: u64 = @bitCast(time.flicks -% start_time.flicks);
         const duration: u64 = @intCast(tween.duration.flicks);
@@ -1380,9 +1382,10 @@ pub const Builder = struct {
         /// A cue that the table given in `Options` does not have, including the start cue of a
         /// simulated node, and a cue span that is empty or runs past the table.
         UnknownCue,
-        /// A tween or a spring time that is not above zero, or a shift register period that is not
-        /// above zero, is longer than `simulation.period_flicks_max`, or gives a bucket less than
-        /// one step, or a bounce leg shorter than a flick or too long to time exactly.
+        /// A tween duration below zero, a spring time that is not above zero, or a shift register
+        /// period that is not above zero, is longer than `simulation.period_flicks_max`, or gives
+        /// a bucket less than one step, or a bounce leg shorter than a flick or too long to time
+        /// exactly.
         InvalidDuration,
         /// A tween whose ease fails `Ease.valid`.
         InvalidEase,
@@ -1585,7 +1588,7 @@ pub const Builder = struct {
         if (source.start.index >= builder.cue_table.count) return error.UnknownCue;
         if (!std.math.isFinite(source.from)) return error.NotFinite;
         if (!std.math.isFinite(source.to)) return error.NotFinite;
-        if (source.duration.flicks <= 0) return error.InvalidDuration;
+        if (source.duration.flicks < 0) return error.InvalidDuration;
         if (!source.ease.valid()) return error.InvalidEase;
         var extent = try builder.cued_extent(source.start, source.cue_by_lane, source.stagger);
         if (source.previous) |previous| extent = try joined(&.{ extent, builder.nodes[previous.index].extent });

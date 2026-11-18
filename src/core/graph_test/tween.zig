@@ -226,8 +226,6 @@ test "the builder refuses a tween it cannot evaluate" {
     try testing.expectError(error.NotFinite, builder.tween(tween_of(0, nan, cue, .linear)));
 
     var source = tween_of(0, 1, cue, .linear);
-    source.duration = .{ .flicks = 0 };
-    try testing.expectError(error.InvalidDuration, builder.tween(source));
     source.duration = .{ .flicks = -1 };
     try testing.expectError(error.InvalidDuration, builder.tween(source));
 
@@ -268,4 +266,134 @@ test "a tween loops over the extent of its node" {
         const elapsed: f64 = @floatFromInt(@max(0, 705_600_000 - 176_400_000 * @as(i64, @intCast(lane))));
         try testing.expectEqual(elapsed / (3 * 352_800_000), value);
     }
+}
+
+/// A step from 0.54 to 0.6 at `cue`: a tween over no time at all (step 44).
+fn step_of(cue: Cue) Tween {
+    var source = tween_of(0.54, 0.6, cue, .linear);
+    source.duration = .{ .flicks = 0 };
+    return source;
+}
+
+/// The values of a step's lanes at `flicks`.
+fn lanes_at(state: *State, step: graph_module.Id, flicks: i64) []const f64 {
+    state.eval(.{ .flicks = flicks });
+    return state.values(step);
+}
+
+// Locks a step of step 44, a tween of duration 0 from 0.54 to 0.6 at a cue at 1 s: one flick
+// before the cue, 705,599,999 flicks, it is 0.54, and from the cue's own flick on, 705,600,000,
+// 705,600,001, and 10 s, it is 0.6, bit for bit.
+test "a tween over no time is a step at its cue" {
+    var times: [1]Time = undefined;
+    var cues = Cues.init(&times);
+    const cue = try cues.add(.{ .flicks = 705_600_000 });
+    var nodes: [1]Node = undefined;
+    var builder = Builder.init(&nodes, .{ .slab_count_max = 1, .cues = &cues });
+    const step = try builder.tween(step_of(cue));
+    var slab: [1]f64 = undefined;
+    var state = State.init(builder.finish(), &slab);
+
+    const rows = [_]struct { flicks: i64, value: f64 }{
+        .{ .flicks = 705_599_999, .value = 0.54 },
+        .{ .flicks = 705_600_000, .value = 0.6 },
+        .{ .flicks = 705_600_001, .value = 0.6 },
+        .{ .flicks = 10 * 705_600_000, .value = 0.6 },
+    };
+    for (rows) |row| {
+        state.eval(.{ .flicks = row.flicks });
+        const bits: u64 = @bitCast(state.value(step));
+        try testing.expectEqual(@as(u64, @bitCast(row.value)), bits);
+    }
+}
+
+// Locks that a step's range is the range of the same tween over 1 s: the hull of 0.54 and 0.6,
+// widened by the rounding margin every tween has, equal in both ends.
+test "a step has the range of any tween between its values" {
+    var times: [1]Time = undefined;
+    var cues = Cues.init(&times);
+    const cue = try cues.add(.{ .flicks = 705_600_000 });
+    var nodes: [2]Node = undefined;
+    var builder = Builder.init(&nodes, .{ .slab_count_max = 2, .cues = &cues });
+    const step = try builder.tween(step_of(cue));
+    var timed = step_of(cue);
+    timed.duration = .{ .flicks = 705_600_000 };
+    const move = try builder.tween(timed);
+    const program = builder.finish();
+    var ranges: [2]graph_module.Range = undefined;
+    program.ranges(&ranges);
+    try testing.expectEqual(ranges[move.index], ranges[step.index]);
+    try testing.expect(ranges[step.index].low <= 0.54);
+    try testing.expect(ranges[step.index].low > 0.53);
+    try testing.expect(ranges[step.index].high >= 0.6);
+    try testing.expect(ranges[step.index].high < 0.61);
+}
+
+// Locks a step that follows a wave: before its cue at 1 s it gives the wave's value at that
+// time, sample for sample, and from the cue on 0.6.
+test "a step follows its previous signal until its cue" {
+    var times: [1]Time = undefined;
+    var cues = Cues.init(&times);
+    const cue = try cues.add(.{ .flicks = 705_600_000 });
+    var nodes: [2]Node = undefined;
+    var builder = Builder.init(&nodes, .{ .slab_count_max = 2, .cues = &cues });
+    const wave = try builder.wave(swell);
+    var source = step_of(cue);
+    source.previous = wave;
+    const step = try builder.tween(source);
+    var slab: [2]f64 = undefined;
+    var state = State.init(builder.finish(), &slab);
+
+    for ([_]i64{ 0, 123_456_789, 705_599_999 }) |flicks| {
+        state.eval(.{ .flicks = flicks });
+        try testing.expectEqual(swell.sample(.{ .flicks = flicks }), state.value(step));
+    }
+    for ([_]i64{ 705_600_000, 2 * 705_600_000 }) |flicks| {
+        state.eval(.{ .flicks = flicks });
+        try testing.expectEqual(@as(f64, 0.6), state.value(step));
+    }
+}
+
+// Locks steps by lane, in a region of 3 lanes: staggered by 100 ms from a cue at 1 s, the lanes
+// read 0.6, 0.54, 0.54 at 1.05 s, 0.6, 0.6, 0.54 at 1.15 s, and all 0.6 at 1.2 s, lane 2's own
+// start. With a cue a lane over cues at 1 s, 2 s, and 3 s they read 0.6, 0.6, 0.54 at 2 s.
+test "a step by lane starts each lane at its own time" {
+    var times: [3]Time = undefined;
+    var cues = Cues.init(&times);
+    const cue = try cues.add(.{ .flicks = 705_600_000 });
+    _ = try cues.add(.{ .flicks = 2 * 705_600_000 });
+    _ = try cues.add(.{ .flicks = 3 * 705_600_000 });
+    var nodes: [2]Node = undefined;
+    var builder = Builder.init(&nodes, .{ .slab_count_max = 6, .cues = &cues });
+    builder.lanes = 3;
+    var staggered = step_of(cue);
+    staggered.stagger = .{ .flicks = 70_560_000 };
+    const step = try builder.tween(staggered);
+    var by_lane = step_of(cue);
+    by_lane.cue_by_lane = true;
+    const each = try builder.tween(by_lane);
+    var slab: [6]f64 = undefined;
+    var state = State.init(builder.finish(), &slab);
+
+    try testing.expectEqualSlices(f64, &.{ 0.6, 0.54, 0.54 }, lanes_at(&state, step, 740_880_000));
+    try testing.expectEqualSlices(f64, &.{ 0.6, 0.6, 0.54 }, lanes_at(&state, step, 811_440_000));
+    try testing.expectEqualSlices(f64, &.{ 0.6, 0.6, 0.6 }, lanes_at(&state, step, 846_720_000));
+    try testing.expectEqualSlices(f64, &.{ 0.6, 0.6, 0.54 }, lanes_at(&state, each, 1_411_200_000));
+}
+
+// Locks the refusals of a step: a duration of -1 flick is `InvalidDuration`, and a step whose
+// ease has an x1 of 2 is `InvalidEase`, as for any tween, though a step never reads its ease.
+test "the builder refuses a step below zero or with an invalid ease" {
+    var times: [1]Time = undefined;
+    var cues = Cues.init(&times);
+    const cue = try cues.add(.{ .flicks = 705_600_000 });
+    var nodes: [1]Node = undefined;
+    var builder = Builder.init(&nodes, .{ .slab_count_max = 1, .cues = &cues });
+    var source = step_of(cue);
+    source.duration = .{ .flicks = -1 };
+    try testing.expectError(error.InvalidDuration, builder.tween(source));
+    source = step_of(cue);
+    source.ease = .{ .x1 = 2, .y1 = 0, .x2 = 1, .y2 = 1 };
+    try testing.expectError(error.InvalidEase, builder.tween(source));
+    try testing.expectEqual(@as(u32, 0), builder.node_count);
 }

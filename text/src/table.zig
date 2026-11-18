@@ -181,7 +181,7 @@ const written = [_]Entry{
         .{ .name = "from", .kind = .number, .shaped = true, .default = .after, .doc = "the value it starts from at its cue; left out, the `to` of the tween `after` names" },
         .{ .name = "to", .kind = .number, .shaped = true, .doc = "the value it lands on, exactly, at the end of `over`" },
         .{ .name = "at", .kind = .cue, .by_lane = true, .doc = "the cue it starts at, or `series[lane]` for a cue a lane" },
-        .{ .name = "over", .kind = .time, .doc = "how long the move takes from its cue" },
+        .{ .name = "over", .kind = .time, .doc = "how long the move takes from its cue; `0s` is a step, `to` from the cue on" },
         .{ .name = "ease", .kind = .ease, .default = .{ .word = 0 }, .words = ease_words, .doc = "the curve of the move: a word, or a cubic Bezier's `[x1, y1, x2, y2]`" },
         .{ .name = "after", .kind = .signal, .shaped = true, .default = .absent, .doc = "the signal it gives before its cue; without one it holds `from` there" },
         .{ .name = "stagger", .kind = .time, .default = .{ .time = 0 }, .doc = stagger_doc },

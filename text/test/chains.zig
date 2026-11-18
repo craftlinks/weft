@@ -13,6 +13,11 @@
 //! Each refusal has a case with its code, its message, its hint, and the text under its span, and
 //! each is one error: a name used before it is declared, or a cycle through `after`, is reported
 //! where it is written and stops there, with no loop to follow.
+//!
+//! ## 3. Steps
+//! A tween over `0s` is a step (step 44): what it follows before its cue, `to` from the cue on.
+//! It is one node like any tween, so it chains as any tween does, and these tests read its values
+//! through a `State` as a client does, bit for bit. A negative `over` is still refused.
 
 const std = @import("std");
 const testing = std.testing;
@@ -268,4 +273,58 @@ test "from is required unless after names a tween" {
         },
     };
     for (cases) |case| try expect_one(case);
+}
+
+var step_slab: [limits.slab]f64 = undefined;
+
+/// The values of `name` in `short`, read at `milliseconds` after time zero.
+fn values_at(state: *weft.State, name: []const u8, milliseconds: i64) []const f64 {
+    state.eval(.{ .flicks = milliseconds * @divExact(weft.time.flicks_per_second, 1000) });
+    return state.values(short.signal(name).?);
+}
+
+// Locks section 3 on the swing of Thrum's score: a tween from 0.54 to 0.6 at a cue at 1 s over
+// 0s compiles to one node, and reads 0.54 at 0.999 s and 0.6 at 1 s and at 2 s, bit for bit.
+test "a tween over 0s is one node and a step at its cue" {
+    const source = "cue c0 = 0s\ncue b6 = 1s\nswing = tween(from: 0.54, to: 0.6, at: b6, over: 0s)\n";
+    short.compile(source) catch |err| return report(&short, source, err);
+    try testing.expectEqual(@as(usize, 1), short.program.nodes.len);
+    var state = weft.State.init(short.program, step_slab[0..short.program.slab_count]);
+    try testing.expectEqualSlices(f64, &.{0.54}, values_at(&state, "swing", 999));
+    try testing.expectEqualSlices(f64, &.{0.6}, values_at(&state, "swing", 1000));
+    try testing.expectEqualSlices(f64, &.{0.6}, values_at(&state, "swing", 2000));
+}
+
+// Locks section 3 for a chain and a vector: `b` follows the step `a` until its own cue, so it is
+// 0 at 0.5 s, 1 at 1.5 s, and 3 at 2 s; and a vector step is (0, 0) at 0.999 s and (1, 2) at 1 s
+// and at 5 s.
+test "a step chains after a step, and a vector steps whole" {
+    const source =
+        \\cue c0 = 0s
+        \\cue c1 = 1s
+        \\cue c2 = 2s
+        \\a = tween(from: 0, to: 1, at: c1, over: 0s)
+        \\b = tween(to: 3, at: c2, over: 0s, after: a)
+        \\v = tween(from: vec2(0, 0), to: vec2(1, 2), at: c1, over: 0s)
+        \\
+    ;
+    short.compile(source) catch |err| return report(&short, source, err);
+    var state = weft.State.init(short.program, step_slab[0..short.program.slab_count]);
+    try testing.expectEqualSlices(f64, &.{0}, values_at(&state, "b", 500));
+    try testing.expectEqualSlices(f64, &.{1}, values_at(&state, "b", 1500));
+    try testing.expectEqualSlices(f64, &.{3}, values_at(&state, "b", 2000));
+    try testing.expectEqualSlices(f64, &.{ 0, 0 }, values_at(&state, "v", 999));
+    try testing.expectEqualSlices(f64, &.{ 1, 2 }, values_at(&state, "v", 1000));
+    try testing.expectEqualSlices(f64, &.{ 1, 2 }, values_at(&state, "v", 5000));
+}
+
+// Locks section 3's refusal: `over: -1s` is one error, code `refused`, message "tween: `over`
+// must be at least 0s", with no hint, under the `-1s` it was given.
+test "a negative over is refused with the bound of a step" {
+    try expect_one(.{
+        .source = "cue c0 = 0s\nx = tween(from: 0, to: 1, at: c0, over: -1s)\n",
+        .code = .refused,
+        .message = "tween: `over` must be at least 0s",
+        .span = "-1s",
+    });
 }

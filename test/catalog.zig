@@ -84,7 +84,14 @@
 //! arguments, `exp` past its ceiling and floor, `ln` at and below 0 and at a subnormal, `sqrt`
 //! of negatives, and powers. They come last, so every line before them is a line of step 26.
 //!
-//! ## 13. TigerStyle Invariants
+//! ## 13. A Step
+//! A tween over no time at all is a step (step 44): `tween_step` goes from 0.54 to 0.6 at the
+//! second cue, 1.5 s into each epoch, as a value set at a moment would. It reads only the cue, so
+//! it too is the same at every epoch, and its runs lock that it holds `from` before the cue and
+//! `to` after it, with no value between. They come last, so every line before them is a line of
+//! step 33.
+//!
+//! ## 14. TigerStyle Invariants
 //! - The text fits in `text_size_max` by construction, so `render` cannot fail.
 
 const std = @import("std");
@@ -224,6 +231,13 @@ const FunctionGraph = enum {
 
 const function_graphs = std.enums.values(FunctionGraph);
 
+/// The graphs of section 13, each built by `step_graph_build`, after the function inputs.
+const StepGraph = enum {
+    tween_step,
+};
+
+const step_graphs = std.enums.values(StepGraph);
+
 /// The inputs of section 12's run of constants, for each function.
 const function_inputs = [_]struct { function: weft.graph.Function, name: []const u8, inputs: []const f64 }{
     .{ .function = .round, .name = "round", .inputs = &.{ -2.5, -1.5, -0.5, -0.4, -0.0, 0.5, 1.5, 2.5, 0.49999999999999994, 4503599627370495.5, -4503599627370495.5 } },
@@ -291,9 +305,12 @@ const function_input_count = count: {
     break :count count;
 };
 
+/// Section 13's samples: its graphs at every epoch.
+const step_sample_count = step_graphs.len * epochs.len * samples_per_run;
+
 pub const sample_count = wave_sample_count + noise_sample_count + graph_sample_count +
     runaway_sample_count + value_sample_count + zero_sample_count + function_sample_count +
-    function_input_count;
+    function_input_count + step_sample_count;
 
 pub const event_count = count: {
     var count: u32 = 0;
@@ -322,6 +339,7 @@ comptime {
     assert(zero_sample_count == 18);
     assert(function_sample_count == 768);
     assert(function_input_count == 68);
+    assert(step_sample_count == 96);
     assert(Graph.slab_count_max >= Graph.nodes_count_max + 2 * weft.motion.cursor_count);
     assert(text_size_max < 1 << 20);
     for (signals) |signal| assert(weft.Rate.from_hz(signal.rate_hz) != null);
@@ -359,6 +377,9 @@ pub fn render(text: *[text_size_max]u8) []const u8 {
         for (&epochs) |*epoch| render_graph_run(&writer, graph, epoch);
     }
     render_function_inputs(&writer);
+    for (step_graphs) |graph| {
+        for (&epochs) |*epoch| render_graph_run(&writer, graph, epoch);
+    }
     assert(writer.buffered().len > line_count);
     assert(writer.buffered()[writer.buffered().len - 1] == '\n');
     return writer.buffered();
@@ -834,6 +855,8 @@ pub fn graph_nodes(name: []const u8, nodes: *[Graph.nodes_count_max]weft.Node) ?
         value_graph_build(graph, &builder) catch unreachable
     else if (function_graph_name(name)) |graph|
         function_graph_build(graph, &builder) catch unreachable
+    else if (std.meta.stringToEnum(StepGraph, name)) |graph|
+        step_graph_build(graph, &builder) catch unreachable
     else
         return null;
     const program = builder.finish();
@@ -846,6 +869,7 @@ fn build_any(graph: anytype, builder: *weft.Builder) weft.Builder.Error!weft.Id 
         Graph => graph_build(graph, builder),
         ValueGraph => value_graph_build(graph, builder),
         FunctionGraph => function_graph_build(graph, builder),
+        StepGraph => step_graph_build(graph, builder),
         else => @compileError("not a catalog graph"),
     };
 }
@@ -872,6 +896,20 @@ fn function_graph_build(graph: FunctionGraph, builder: *weft.Builder) weft.Build
         .floor => return builder.apply(.floor, try builder.multiply(wave, try builder.constant(3))),
         .round => return builder.apply(.round, try builder.multiply(wave, try builder.constant(2.5))),
         .pow => return builder.apply(.{ .pow = 3 }, try builder.multiply(wave, try builder.constant(1.5))),
+    }
+}
+
+fn step_graph_build(graph: StepGraph, builder: *weft.Builder) weft.Builder.Error!weft.Id {
+    switch (graph) {
+        // From 0.54 to 0.6 at the second cue, over no time: a value set at a moment.
+        .tween_step => return builder.tween(.{
+            .from = 0.54,
+            .to = 0.6,
+            .duration = .{ .flicks = 0 },
+            .ease = .linear,
+            .start = .{ .index = 1 },
+            .previous = null,
+        }),
     }
 }
 
@@ -1050,6 +1088,22 @@ test "tweens, motions, and simulations have the same bits at every epoch" {
                 });
                 try testing.expect(std.mem.indexOf(u8, text, line) != null);
             }
+        }
+    }
+}
+
+// Locks section 13: at every epoch `tween_step` is 0.54 at its first nine samples, the last at
+// 1.365 s, and 0.6 from the tenth, at 1.536 s, past its cue at 1.5 s, with no value between.
+test "a step has the same bits at every epoch, and no value between" {
+    const text = render(&text_a);
+    for (epochs) |epoch| {
+        for (0..samples_per_run) |index| {
+            const value: f64 = if (index < 9) 0.54 else 0.6;
+            var buffer: [line_size_max]u8 = undefined;
+            const line = try std.fmt.bufPrint(&buffer, "graph tween_step {s} {d} {x}\n", .{
+                epoch.name, index, value,
+            });
+            try testing.expect(std.mem.indexOf(u8, text, line) != null);
         }
     }
 }

@@ -221,6 +221,8 @@ fall = tween(to: 0.25, at: drop, over: 500ms, ease: out, after: rise)
 ```
 
 - Before its cue, a tween holds `from`. After its end it returns `to` exactly, bit for bit.
+- **`over: 0s` is a step**: a value that changes at a moment, `from` before the cue and `to` from
+  the cue on, with no value between.
 - `ease` is `linear` (the default), `in`, `out`, or `in_out`.
 - **`after:` chains tweens into a sequence.** `fall` follows `rise` until `drop`, then takes over.
   Sampled at 0, 1, 2, and 3 s, `fall` reads `0, 1, 1, 0.25`.
