@@ -833,7 +833,7 @@ const Back = struct {
             },
             error.InvalidOvershoot => .{ .param = "overshoot", .message = "`overshoot` must be in [0, 1)", .hint = "0 settles without passing the goal; 0.5 is bouncy" },
             error.InvalidDuration => switch (op orelse .wave) {
-                .tween => .{ .param = "over", .message = "`over` must be above 0s" },
+                .tween => .{ .param = "over", .message = "`over` must be at least 0s" },
                 .shift => .{ .param = "period", .message = "`period` must be above 0s, at most 2^53 flicks, and at least one step of 1/480 s a bucket" },
                 .bounce => .{ .param = "speed", .message = "a leg, `range` at `speed`, must last at least a flick and under 2^53 flicks" },
                 else => .{ .param = "time", .message = "`time` must be above 0s" },

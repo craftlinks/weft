@@ -78,6 +78,7 @@ track speed = 0.5 in 0..2                # a value a client writes, from a time 
 wave = wave(sine, 0.5hz)                 # pure: a function of t
 noise = noise(smooth, 1hz)               # pure, seeded from its name
 rise = tween(from: 0, to: 1, at: c0, over: 1s, ease: in_out)
+swing = tween(from: 0.54, to: 0.6, at: c0, over: 0s)   # over 0s: a step, `to` from the cue on
 moves = [c0: 1, bar[2]: -0.5]            # a path: goals at cues
 spring = spring(moves, time: 0.5s, overshoot: 0.2)      # exact between goals
 chase = chase(noise, time: speed)        # simulated: follows a signal; a track sets its time

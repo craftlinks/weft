@@ -1120,6 +1120,10 @@ const fuzz_seeds = [_][]const u8{
     // stray run after a blank line.
     "w = wave(sine, 1hz) # w\n    \\\\fn x() {\n\\\\    \"q\" # t\n    \\\\\n" ++
         "x = w \\\\ y\n\n\\\\stray\n",
+    // Steps (step 44): a tween over 0s, one after it, and steps by lane, staggered and by cue.
+    "cue c0 = 0s\ncue c1 = 1s\ncue beat = [1s, 2s, 3s]\na = tween(from: 0.54, to: 0.6, at: c1, over: 0s)\n" ++
+        "b = tween(to: 1, at: c1, over: 0s, after: a)\ns = lanes(3, tween(from: 0, to: 1, at: c0, over: 0s, stagger: 100ms))\n" ++
+        "u = lanes(3, tween(from: 0, to: 1, at: beat[lane], over: 0s) + lane)\n",
     // A loop that runs away within half a second, so the reader meets the bound (step 19).
     "cue c0 = 0s\nfb = delay(0)\nloop = chase(1 + fb * 1e100, time: 0.01s)\nfb <- loop\nx = loop * loop * loop\n",
 };
