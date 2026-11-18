@@ -961,9 +961,14 @@ The limits worth knowing before you design around Weft:
 - **What is counted.** A token is every word, number, and sign, and also every newline and every
   comment, so a blank line is one token and a commented line two. A library's tokens are not
   added to the file's: `Limits.tokens` must hold the largest of the file and each library. A
-  node is every number each time it is written and every call each time it is written, a module's
-  at each use; a bound name read again is none. `weft check FILE --costs` lists each
-  declaration's tokens, nodes, and slab, the most nodes first.
+  node is every call each time it is written, a module's at each use, and every number; a bound
+  name read again is none, and so is a number or a pure call written twice: `w * 2` on two lines,
+  or a module used twice on one input, is built once, as if it were bound by hand. A `noise`,
+  `follow`, or `shift` (seeded from its declaration), a simulated call such as `chase`, a
+  `bounce`, `cues`, or motion (each a source of events), and an `input` are never shared, and a
+  `wave`, `tween`, or `lane` only in a region of the same lanes. `weft check FILE --costs` lists
+  each declaration's tokens, nodes, and slab, the most nodes first; the first line to build a
+  shared node pays for it.
 
 What 0.1 promises to keep stable: the exports of `src/weft.zig`, the language `describe` lists,
 the command's JSON fields, and the rules (a function of `t`, no allocation, the same bits on every

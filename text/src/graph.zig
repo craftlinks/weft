@@ -12,7 +12,8 @@
 //! ## 2. Expressions
 //! An expression builds its operands left to right, then itself, so `a + b * c` is the nodes a, b,
 //! c, product, sum: the order a hand-written builder call gives. A track's node is built where it
-//! is first read, and shared after. A bound name builds nothing: it is its binding's ids.
+//! is first read, and shared after. A bound name builds nothing: it is its binding's ids. Nor does
+//! a number or a pure call whose equal is built already (section 10): it is that node.
 //!
 //! ## 3. Parameters From Signals
 //! Where a signal sets a parameter, the node's fixed value is never read (`graph.zig`, section 14:
@@ -66,6 +67,33 @@
 //! arguments, in parameter order, and nothing for the call: the client reads the values from
 //! `Checked` and each signal's node from `expr_ids`. The nodes are the binding's, so a recompile
 //! carries a simulated signal inside a noun as it carries any other.
+//!
+//! ## 10. Sharing
+//! A number or a pure call written twice is built once (step 50), so the readable way to write a
+//! file costs what binding it by hand costs. Before it calls the builder for a node that may be
+//! shared, the back end makes the `graph.Op` the builder would store, which for each such op is the
+//! struct it is given, and looks it up; on a miss it builds, asserts the node stored is that op,
+//! and keeps it. Nothing is built and dropped, and the `Builder` is untouched: a hand-written
+//! client builds exactly what it asks for.
+//! ```text
+//! shared                                      never shared, and why
+//! constant, of equal bits                     noise, follow, shift: seeded from the declaration
+//! add, multiply, minimum, maximum             chase, follow, shift, delay, crossing, oscillator:
+//! apply, map_range                              simulated, a history of their own
+//! pack, pick                                  bounce, cues, motion, crossing, follow, shift: fire
+//! wave, tween, lane, spread: in the same        events, each a source of its own
+//!   region only                               input: live. track: shared already, `track_nodes`
+//! ```
+//! Two nodes are the same when the op is the same kind and every field is equal: an `f64` by its
+//! bits, so 0 and -0 stay two, an input by its node, a pack's inputs up to its count. A per-lane
+//! source takes its lanes from the builder's region, so the region's count is part of its key; the
+//! other ops take their extent from their inputs alone. Nothing is reordered: `a + b` and `b + a`
+//! are two nodes. Two names of one node have one `signal(name)`; a declaration whose nodes all
+//! exist already has an empty `node_ranges` entry: the first line to build a node pays for it.
+//!
+//! The table is the caller's, `Memory.shared`, at least twice the node array, with open
+//! addressing and linear probing over an FNV-1a key, reset at each build. At most one entry a
+//! node, so it is never more than half full and every probe ends at an empty slot.
 //!
 //! ## 7. TigerStyle Invariants
 //! - Every table is the caller's and sized by `Limits`; the checker already refused what would
@@ -159,7 +187,23 @@ pub const Memory = struct {
     /// declaration k built the nodes from `declaration_ends[k - 1]` (0 for the first) to
     /// `declaration_ends[k]`. A feed's nodes are its own here; `node_ranges` has none for it.
     declaration_ends: []u32,
+    /// The sharing table (section 10), at least twice `nodes.len` slots.
+    shared: []Shared,
 };
+
+/// A slot of the sharing table (section 10): a node that may be shared, and the region it was
+/// built in for a per-lane source (0 outside one, and for every other kind).
+pub const Shared = struct {
+    node: u32 = empty,
+    region: u32 = 0,
+
+    pub const empty = std.math.maxInt(u32);
+};
+
+comptime {
+    // 8 bytes a slot, so the table of a `Compiled` is `16 * Limits.nodes` bytes.
+    assert(@sizeOf(Shared) == 8);
+}
 
 /// What `count` found (section 5).
 pub const Count = union(enum) {
@@ -222,15 +266,26 @@ const Back = struct {
                 assert(expr.b == 1);
                 return .{ .first = ids.second.? };
             },
-            .constant => return .{ .first = try back.attempt(back.builder.constant(expr.number), expr.item, null) },
+            .constant => {
+                const op: graph.Op = .{ .constant = expr.number };
+                if (back.reuse(op)) |id| return .{ .first = id };
+                const result = back.builder.constant(expr.number);
+                return .{ .first = try back.kept(op, result, expr.item, null) };
+            },
             .add, .multiply => {
                 const left = (try back.eval(expr.a)).first;
                 const right = (try back.eval(expr.b)).first;
+                const pair: graph.Binary = .{ .left = left, .right = right };
+                const op: graph.Op = if (expr.tag == .add)
+                    .{ .add = pair }
+                else
+                    .{ .multiply = pair };
+                if (back.reuse(op)) |id| return .{ .first = id };
                 const result = if (expr.tag == .add)
                     back.builder.add(left, right)
                 else
                     back.builder.multiply(left, right);
-                return .{ .first = try back.attempt(result, expr.item, null) };
+                return .{ .first = try back.kept(op, result, expr.item, null) };
             },
             .binding => {
                 const ids = back.memory.ids[expr.a];
@@ -251,7 +306,8 @@ const Back = struct {
                 const saved = back.builder.lanes;
                 defer back.builder.lanes = saved;
                 back.builder.lanes = region_of(expr);
-                return .{ .first = try back.attempt(back.builder.lane(), expr.item, null) };
+                if (back.reuse(.lane)) |id| return .{ .first = id };
+                return .{ .first = try back.kept(.lane, back.builder.lane(), expr.item, null) };
             },
         }
     }
@@ -283,13 +339,32 @@ const Back = struct {
                 assert(k < packed_ids.count);
                 return packed_ids.inputs[k];
             },
-            else => return back.attempt(back.builder.pick(id, k), item, null),
+            else => {
+                const op: graph.Op = .{ .pick = .{ .input = id, .component = k } };
+                if (back.reuse(op)) |found| return found;
+                return back.kept(op, back.builder.pick(id, k), item, null);
+            },
         }
     }
 
     /// Packs one node a component, built by `each`, into a vector (section 6).
     fn pack(back: *Back, ids: []const Id, item: u32, call: u32) Fail!Ids {
-        return .{ .first = try back.attempt(back.builder.pack(ids), item, call) };
+        assert(ids.len >= 2);
+        assert(ids.len <= graph.components_max);
+        var source: graph.Pack = .{ .inputs = undefined, .count = @intCast(ids.len) };
+        @memcpy(source.inputs[0..ids.len], ids);
+        const op: graph.Op = .{ .pack = source };
+        if (back.reuse(op)) |id| return .{ .first = id };
+        return .{ .first = try back.kept(op, back.builder.pack(ids), item, call) };
+    }
+
+    /// The one-lane node `id` spread over the open region's lanes (section 8), shared in it.
+    fn spread(back: *Back, id: Id, item: u32, call: u32) Fail!Id {
+        assert(back.builder.lanes != null);
+        assert(back.builder.nodes[id.index].extent.lanes == 1);
+        const op: graph.Op = .{ .spread = id };
+        if (back.reuse(op)) |found| return found;
+        return back.kept(op, back.builder.spread(id), item, call);
     }
 
     const Param = struct { fixed: f64, from: ?Id };
@@ -350,7 +425,9 @@ const Back = struct {
                     .hz = v[1].frequency,
                     .stagger = .{ .flicks = v[2].time },
                 };
-                return .{ .first = try back.attempt(builder.wave(source), item, call) };
+                const op: graph.Op = .{ .wave = source };
+                if (back.reuse(op)) |id| return .{ .first = id };
+                return .{ .first = try back.kept(op, builder.wave(source), item, call) };
             },
             .lanes => {
                 const body = (try back.eval(v[1].signal)).first;
@@ -359,11 +436,11 @@ const Back = struct {
                 assert(builder.nodes[body.index].extent.lanes == 1);
                 builder.lanes = lane_count;
                 const components = builder.nodes[body.index].extent.components;
-                if (components == 1) return .{ .first = try back.attempt(builder.spread(body), item, call) };
+                if (components == 1) return .{ .first = try back.spread(body, item, call) };
                 var ids: [graph.components_max]Id = undefined;
                 for (ids[0..components], 0..) |*id, k| {
                     const one = try back.component(body, @intCast(k), item);
-                    id.* = try back.attempt(builder.spread(one), item, call);
+                    id.* = try back.spread(one, item, call);
                 }
                 return back.pack(ids[0..components], item, call);
             },
@@ -388,7 +465,14 @@ const Back = struct {
                 };
                 const lab = colour.from_srgb(.{ v[0].number, v[1].number, v[2].number });
                 var ids: [3]Id = undefined;
-                for (&ids, lab) |*id, value| id.* = try back.attempt(builder.constant(value), item, call);
+                for (&ids, lab) |*id, value| {
+                    const op: graph.Op = .{ .constant = value };
+                    if (back.reuse(op)) |found| {
+                        id.* = found;
+                    } else {
+                        id.* = try back.kept(op, builder.constant(value), item, call);
+                    }
+                }
                 return back.pack(&ids, item, call);
             },
             .tween => {
@@ -410,7 +494,12 @@ const Back = struct {
                             .previous = if (after) |vector| try back.component(vector, @intCast(k), item) else null,
                             .stagger = .{ .flicks = v[6].time },
                         };
-                        id.* = try back.attempt(builder.tween(source), item, call);
+                        const op: graph.Op = .{ .tween = source };
+                        if (back.reuse(op)) |found| {
+                            id.* = found;
+                        } else {
+                            id.* = try back.kept(op, builder.tween(source), item, call);
+                        }
                     }
                     return back.pack(ids[0..components], item, call);
                 }
@@ -428,7 +517,9 @@ const Back = struct {
                     .previous = previous,
                     .stagger = .{ .flicks = v[6].time },
                 };
-                return .{ .first = try back.attempt(builder.tween(source), item, call) };
+                const op: graph.Op = .{ .tween = source };
+                if (back.reuse(op)) |id| return .{ .first = id };
+                return .{ .first = try back.kept(op, builder.tween(source), item, call) };
             },
             .spring => {
                 const components = checked.paths[v[0].path].shape.components;
@@ -622,22 +713,32 @@ const Back = struct {
                     .output_low = v[2].number_range[0],
                     .output_high = v[2].number_range[1],
                 };
-                return .{ .first = try back.attempt(builder.map_range(source), item, call) };
+                const op: graph.Op = .{ .map_range = source };
+                if (back.reuse(op)) |id| return .{ .first = id };
+                return .{ .first = try back.kept(op, builder.map_range(source), item, call) };
             },
             .function => {
                 const input = try back.signal_id(v[0]);
                 const n = if (v.len == 2) v[1].integer else 0;
-                const result = builder.apply(table.core_function(entry.function_of(n).?), input);
-                return .{ .first = try back.attempt(result, item, call) };
+                const function = table.core_function(entry.function_of(n).?);
+                const op: graph.Op = .{ .apply = .{ .input = input, .function = function } };
+                if (back.reuse(op)) |id| return .{ .first = id };
+                return .{ .first = try back.kept(op, builder.apply(function, input), item, call) };
             },
             .minimum, .maximum => {
                 const a = try back.signal_id(v[0]);
                 const b = try back.signal_id(v[1]);
+                const pair: graph.Binary = .{ .left = a, .right = b };
+                const op: graph.Op = switch (table.op_of(entry)) {
+                    .minimum => .{ .minimum = pair },
+                    else => .{ .maximum = pair },
+                };
+                if (back.reuse(op)) |id| return .{ .first = id };
                 const result = switch (table.op_of(entry)) {
                     .minimum => builder.minimum(a, b),
                     else => builder.maximum(a, b),
                 };
-                return .{ .first = try back.attempt(result, item, call) };
+                return .{ .first = try back.kept(op, result, item, call) };
             },
             .spring_mover, .newtonian_mover => unreachable,
         }
@@ -645,6 +746,69 @@ const Back = struct {
 
     fn attempt(back: *Back, result: Builder.Error!Id, item: u32, call: ?u32) Fail!Id {
         return result catch |err| back.refuse(err, item, call);
+    }
+
+    /// The node built already that `op` would be in the open region, or null (section 10). The
+    /// caller builds `op` on a miss and passes the builder's result to `kept`.
+    fn reuse(back: *const Back, op: graph.Op) ?Id {
+        return back.find(op, back.region_for(op));
+    }
+
+    /// The node the builder just built for `op`, a miss of `reuse`, kept in the sharing table
+    /// (section 10), or the builder's refusal.
+    fn kept(back: *Back, op: graph.Op, result: Builder.Error!Id, item: u32, call: ?u32) Fail!Id {
+        const id = try back.attempt(result, item, call);
+        back.keep(op, back.region_for(op), id);
+        return id;
+    }
+
+    /// The region `op` is shared in (section 10): the builder's open region for a per-lane source,
+    /// 0 outside one, and 0 for every other op, whose extent follows from its inputs.
+    fn region_for(back: *const Back, op: graph.Op) u32 {
+        assert(shareable(op));
+        if (!per_lane(op)) return 0;
+        const region = back.builder.lanes orelse 0;
+        assert(region <= graph.lanes_max);
+        return region;
+    }
+
+    /// The node built already that is `op` in `region`, or null (section 10).
+    fn find(back: *const Back, op: graph.Op, region: u32) ?Id {
+        const slots = back.memory.shared;
+        assert(slots.len >= 2 * back.memory.nodes.len);
+        var slot: usize = @intCast(key(op, region) % slots.len);
+        // At most `nodes.len` slots are full, half the table, so an empty slot ends every probe.
+        for (0..slots.len) |_| {
+            const entry = slots[slot];
+            if (entry.node == Shared.empty) return null;
+            assert(entry.node < back.builder.node_count);
+            if (entry.region == region) {
+                if (same(back.builder.nodes[entry.node].op, op)) return .{ .index = entry.node };
+            }
+            slot = (slot + 1) % slots.len;
+        }
+        unreachable;
+    }
+
+    /// Records `id`, the node the builder just stored for `op` in `region`, in the sharing table
+    /// (section 10). `find` missed it, so no equal node is in the table.
+    fn keep(back: *Back, op: graph.Op, region: u32, id: Id) void {
+        assert(id.index + 1 == back.builder.node_count);
+        // The back end looked up the op the builder would store: a drift between the two fails
+        // here, before a node is shared that is not the one asked for.
+        assert(same(back.builder.nodes[id.index].op, op));
+        const slots = back.memory.shared;
+        var slot: usize = @intCast(key(op, region) % slots.len);
+        for (0..slots.len) |_| {
+            const entry = slots[slot];
+            if (entry.node == Shared.empty) {
+                slots[slot] = .{ .node = id.index, .region = region };
+                return;
+            }
+            assert(entry.region != region or !same(back.builder.nodes[entry.node].op, op));
+            slot = (slot + 1) % slots.len;
+        }
+        unreachable;
     }
 
     /// A builder error as a diagnostic on the argument it is about (section 4).
@@ -716,6 +880,155 @@ const Back = struct {
         return record.item;
     }
 };
+
+/// Whether a node of `op` may stand for another of the same op (section 10): a pure node whose
+/// value is its fields' and its inputs' alone. A seeded node is the declaration's own, a
+/// simulated one keeps a history, an event-firing one is a source of its own, an input is live,
+/// and a track is shared already, by `track_nodes`. No `else`, so a new op must be sorted here.
+fn shareable(op: graph.Op) bool {
+    return switch (op) {
+        .constant, .add, .multiply, .minimum, .maximum, .apply, .map_range => true,
+        .pack, .pick, .wave, .tween, .lane, .spread => true,
+        .noise, .follow, .shift => false,
+        .chase, .delay, .crossing, .oscillator => false,
+        .bounce, .cues, .motion => false,
+        .input, .recorded, .track => false,
+    };
+}
+
+/// Whether a node of `op` takes its lanes from the builder's region, so that the region is part
+/// of what it is (section 10). The other shared ops take their extent from their inputs alone.
+fn per_lane(op: graph.Op) bool {
+    assert(shareable(op));
+    return switch (op) {
+        .wave, .tween, .lane, .spread => true,
+        else => false,
+    };
+}
+
+/// The fields of a shareable op as words in a fixed order, which `same` compares and `key` hashes
+/// (section 10).
+const Words = struct {
+    buffer: [max]u64 = undefined,
+    count: u32 = 0,
+
+    /// The most words an op has: a tween's.
+    const max = 11;
+
+    fn put(into: *Words, word: u64) void {
+        assert(into.count < max);
+        into.buffer[into.count] = word;
+        into.count += 1;
+    }
+
+    fn slice(of: *const Words) []const u64 {
+        assert(of.count <= max);
+        return of.buffer[0..of.count];
+    }
+
+    comptime {
+        // `of_op` lists each shared op's fields by hand, so a field or a tag the core adds to one
+        // of these would be left out of `same` and `key`, and two different nodes shared. A count
+        // that changes fails the build here: extend `of_op` with the new field, then this list.
+        const counts = .{
+            .{ graph.Tween, 8 }, .{ wave.Wave, 3 },  .{ Ease, 4 },        .{ graph.MapRange, 5 },
+            .{ graph.Pack, 2 },  .{ graph.Pick, 2 }, .{ graph.Apply, 2 }, .{ graph.Binary, 2 },
+            .{ graph.Id, 1 },    .{ Time, 1 },       .{ Cue, 1 },
+        };
+        for (counts) |pair| assert(@typeInfo(pair[0]).@"struct".field_names.len == pair[1]);
+        assert(@typeInfo(graph.Function).@"union".field_names.len == 9);
+        // A tween's words: its 11 are the most an op has.
+        assert(max == 11);
+    }
+
+    /// The words of `op`: an `f64` by its bits, so 0 and -0 are two, an input by its node's
+    /// index, and a pack's inputs up to its count only, since the slots past it are undefined.
+    fn of_op(op: graph.Op) Words {
+        assert(shareable(op));
+        var result: Words = .{};
+        switch (op) {
+            .constant => |value| result.put(@bitCast(value)),
+            .add, .multiply, .minimum, .maximum => |pair| {
+                result.put(pair.left.index);
+                result.put(pair.right.index);
+            },
+            .apply => |apply| {
+                result.put(apply.input.index);
+                result.put(@backingInt(std.meta.activeTag(apply.function)));
+                result.put(switch (apply.function) {
+                    .pow => |n| n,
+                    else => 0,
+                });
+            },
+            .map_range => |map| {
+                result.put(map.input.index);
+                result.put(@bitCast(map.input_low));
+                result.put(@bitCast(map.input_high));
+                result.put(@bitCast(map.output_low));
+                result.put(@bitCast(map.output_high));
+            },
+            .pack => |pack| {
+                assert(pack.count >= 2 and pack.count <= graph.components_max);
+                result.put(pack.count);
+                for (pack.inputs[0..pack.count]) |id| result.put(id.index);
+            },
+            .pick => |pick| {
+                result.put(pick.input.index);
+                result.put(pick.component);
+            },
+            .wave => |source| {
+                result.put(@backingInt(source.shape));
+                result.put(@bitCast(source.hz));
+                result.put(@bitCast(source.stagger.flicks));
+            },
+            .tween => |source| {
+                result.put(@bitCast(source.from));
+                result.put(@bitCast(source.to));
+                result.put(@bitCast(source.duration.flicks));
+                result.put(@bitCast(source.ease.x1));
+                result.put(@bitCast(source.ease.y1));
+                result.put(@bitCast(source.ease.x2));
+                result.put(@bitCast(source.ease.y2));
+                result.put(source.start.index);
+                // Past any index, so a tween with no `previous` differs from every one with one.
+                const previous: u64 = if (source.previous) |id| id.index else std.math.maxInt(u64);
+                result.put(previous);
+                result.put(@bitCast(source.stagger.flicks));
+                result.put(@intFromBool(source.cue_by_lane));
+            },
+            .lane => {},
+            .spread => |id| result.put(id.index),
+            else => unreachable,
+        }
+        return result;
+    }
+};
+
+/// Whether `a` and `b`, shareable, are the same node: the same op, every field equal (section 10).
+fn same(a: graph.Op, b: graph.Op) bool {
+    assert(shareable(a));
+    assert(shareable(b));
+    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+    const a_words = Words.of_op(a);
+    const b_words = Words.of_op(b);
+    // A pack's count is its first word, so packs of different counts differ there.
+    return std.mem.eql(u64, a_words.slice(), b_words.slice());
+}
+
+/// The sharing table's hash of `op` built in `region`: FNV-1a over the op's tag, the region, and
+/// the words `same` compares, in the same order (section 10).
+fn key(op: graph.Op, region: u32) u64 {
+    assert(shareable(op));
+    if (!per_lane(op)) assert(region == 0);
+    const op_words = Words.of_op(op);
+    const tag: u64 = @backingInt(std.meta.activeTag(op));
+    const region_word: u64 = region;
+    var hash = std.hash.Fnv1a_64.init();
+    hash.update(std.mem.asBytes(&tag));
+    hash.update(std.mem.asBytes(&region_word));
+    hash.update(std.mem.sliceAsBytes(op_words.slice()));
+    return hash.final();
+}
 
 /// The builder's region for an expression checked in `expr.region`, or null outside one.
 fn region_of(expr: check_module.Expr) ?u32 {
@@ -815,6 +1128,9 @@ fn begin(
     assert(memory.expr_ids.len >= checked.exprs.len);
     assert(memory.call_ids.len >= checked.calls.len);
     assert(memory.node_ranges.len >= checked.bindings.len);
+    // The sharing table is at most half full, so every probe ends at an empty slot (section 10).
+    assert(memory.shared.len >= 2 * memory.nodes.len);
+    @memset(memory.shared, .{});
     @memset(memory.node_ranges[0..checked.bindings.len], .{ .first = 0, .end = 0 });
     @memset(memory.expr_ids[0..checked.exprs.len], null);
     @memset(memory.call_ids[0..checked.calls.len], null);
@@ -996,4 +1312,62 @@ fn goal_source(back: *const Back, expr_index: u32) GoalSource {
         .spring, .newtonian, .chase => back.goal,
         else => .none,
     };
+}
+
+// Locks section 10's equality and hash (Weft step 50): a constant of 0 and one of -0 differ; two
+// tweens equal in every field are the same, with one key, and differ when `stagger` differs by one
+// flick; a pack of two inputs reads only its two, whatever its unused slots hold; and a `lane`
+// built in a region of 4 lanes is found in that region and not in one of 5, nor outside one.
+test "the sharing table's equality, hash, and regions" {
+    const zero: graph.Op = .{ .constant = 0 };
+    const negative_zero: graph.Op = .{ .constant = -0.0 };
+    try std.testing.expect(same(zero, zero));
+    try std.testing.expect(!same(zero, negative_zero));
+    try std.testing.expect(key(zero, 0) != key(negative_zero, 0));
+
+    const tween: graph.Tween = .{
+        .from = 0,
+        .to = 1,
+        .duration = .{ .flicks = flicks_per_second },
+        .ease = Ease.in_out,
+        .start = .{ .index = 0 },
+        .previous = null,
+    };
+    var later = tween;
+    later.stagger = .{ .flicks = 1 };
+    try std.testing.expect(same(.{ .tween = tween }, .{ .tween = tween }));
+    try std.testing.expectEqual(key(.{ .tween = tween }, 4), key(.{ .tween = tween }, 4));
+    try std.testing.expect(!same(.{ .tween = tween }, .{ .tween = later }));
+
+    var two: graph.Pack = .{ .inputs = @splat(.{ .index = 3 }), .count = 2 };
+    two.inputs[1] = .{ .index = 7 };
+    var other = two;
+    other.inputs[2] = .{ .index = 99 };
+    other.inputs[3] = .{ .index = 5 };
+    try std.testing.expect(same(.{ .pack = two }, .{ .pack = other }));
+    try std.testing.expectEqual(key(.{ .pack = two }, 0), key(.{ .pack = other }, 0));
+    other.inputs[1] = .{ .index = 8 };
+    try std.testing.expect(!same(.{ .pack = two }, .{ .pack = other }));
+
+    var nodes: [4]graph.Node = undefined;
+    var slots: [2 * nodes.len]Shared = @splat(.{});
+    var memory: Memory = undefined;
+    memory.nodes = &nodes;
+    memory.shared = &slots;
+    var back: Back = .{
+        .checked = undefined,
+        .tree = undefined,
+        .memory = memory,
+        .tables = undefined,
+        .builder = Builder.init(&nodes, .{ .slab_count_max = 64 }),
+        .diagnostics = undefined,
+    };
+    back.builder.lanes = 4;
+    const lane = try back.builder.lane();
+    back.keep(.lane, back.region_for(.lane), lane);
+    try std.testing.expectEqual(@as(?Id, lane), back.reuse(.lane));
+    try std.testing.expectEqual(@as(?Id, lane), back.find(.lane, 4));
+    try std.testing.expectEqual(@as(?Id, null), back.find(.lane, 5));
+    back.builder.lanes = null;
+    try std.testing.expectEqual(@as(?Id, null), back.reuse(.lane));
 }

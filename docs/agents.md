@@ -40,7 +40,9 @@ zig-out/bin/weft sample FILE --signal NAME               # one signal
   its `follow`'s law.
 - **`check`** prints `ok:` with the program's counts and whether it is seekable and stepped,
   then `limits: .{ … }`, the least `Limits` the file compiles with, ready to paste, and for a
-  file with a region what a lane costs of the slab. Or it prints each error with a line, a
+  file with a region what a lane costs of the slab. A number or a pure call written twice is one
+  node, so binding it by hand saves no node; a seeded, simulated, event-firing, or live call is
+  a node each time it is written. Or it prints each error with a line, a
   column, and a hint. The hint is usually the fix. A file with a client's own signal, which Weft
   does not build, prints `ok:` with the checker's counts, `no program: …`, and the least limits
   of the language's tables, and exits 0.
@@ -291,7 +293,10 @@ reads as one in `text/test/lang.zig`, so step 33's are `fn_NAME`.
    Fold with the core's own function in the table's `fold`, so the bits are the node's. Say which
    in the guide.
 6. **`text/src/graph.zig`**: its arm in `build_call`, and a message in `refuse` for each builder
-   error a checked file can still reach.
+   error a checked file can still reach. Sort it in `shareable` (the compiler names it): a pure,
+   unseeded op that fires no event and is not live is shared, looked up with `reuse` before the
+   builder call and recorded with `kept` after it, its fields in `Words.of_op`, and in `per_lane`
+   if it takes its lanes from the region (section 10).
 7. **The language's tests**: the catalog's new graph as text in `text/test/lang.zig`; a test file of
    the op in `test/` with a guide at its top, wired in `text/build.zig`'s `test_roots`, with its
    values, shapes, lanes, folding, and each error's code, message, hint, and span; and a seed

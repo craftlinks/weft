@@ -102,5 +102,5 @@ test "every file opens with its guide" {
             checked += 1;
         }
     }
-    try testing.expectEqual(@as(usize, 24), checked);
+    try testing.expectEqual(@as(usize, 25), checked);
 }

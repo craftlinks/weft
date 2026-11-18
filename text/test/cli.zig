@@ -588,7 +588,7 @@ const many_cues =
     \\
 ;
 
-/// Nine nodes, one past the client's 8: a wave and eight sums.
+/// Nine bindings, past the client's 8 nodes: a wave and eight sums of 1, which share the 1.
 const nine_nodes = "a = wave(sine, 1hz)\nb = a + 1\nc = b + 1\nd = c + 1\ne = d + 1\nf = e + 1\n" ++
     "g = f + 1\nh = g + 1\ni = h + 1\n";
 
@@ -629,18 +629,19 @@ test "a client checks and samples its own Compiled, at its own limits" {
     try testing.expectEqualStrings(sampled.buffered(), again.buffered());
 }
 
-// Locks step 37's limit errors: each names the client's number, not the command's. Nine nodes
-// are past the client's 8, which the command holds; two libraries are past its one. Under the
-// node error, the least `Limits` the file needs, counted past the limit (step 49): 17 nodes.
+// Locks step 37's limit errors: each names the client's number, not the command's. Ten nodes, a
+// wave, one 1 that every sum shares (step 50), and eight sums, are past the client's 8, which the
+// command holds, so the error is on `h`, the ninth node; two libraries are past its one. Under the
+// node error, the least `Limits` the file needs, counted past the limit (step 49): 10 nodes.
 test "a client's limit errors name the client's limits" {
     const nine: commands.Source = .{ .name = "nine.jig", .text = nine_nodes };
     var writer: std.Io.Writer = .fixed(&output);
     try testing.expect(try commands.check(&compiled, &writer, nine, &.{}, &.{}));
     writer = .fixed(&output);
     try testing.expect(!try client_command.check(&client_compiled, &writer, nine, &.{}, &.{}));
-    try testing.expectEqualStrings("nine.jig:5:5: error: the program needs more than 8 nodes\n" ++
-        "    e = d + 1\n        ^^^^^\n    hint: raise `Limits.nodes`\n" ++
-        "limits: .{ .tokens = 58, .tree = 36, .names = 9, .nodes = 17, .slab = 17, .cues = 0, .goals = 0, .regions = 0, .tracks = 0, .modules = 0, .libraries = 0 }\n", writer.buffered());
+    try testing.expectEqualStrings("nine.jig:8:5: error: the program needs more than 8 nodes\n" ++
+        "    h = g + 1\n        ^^^^^\n    hint: raise `Limits.nodes`\n" ++
+        "limits: .{ .tokens = 58, .tree = 36, .names = 9, .nodes = 10, .slab = 10, .cues = 0, .goals = 0, .regions = 0, .tracks = 0, .modules = 0, .libraries = 0 }\n", writer.buffered());
 
     const two: []const jig.Source = &.{
         .{ .name = "std", .text = weft_text.std_library },
@@ -793,10 +794,11 @@ const costs_source =
     \\
 ;
 
-// Locks `check --costs` (step 49), worked by hand: `x` is 2, a product, 3, a product, 2, a
-// product, and a sum, 7 nodes, the module's at each use; `row` is `lane` (4 values), 0.25, and a
-// product (4 values), 3 nodes and a slab of 9; the module's own row has its 9 tokens and no node;
-// the last row is the comment, eight newlines, and the `eof`. `check`'s lines come first, byte for
+// Locks `check --costs` (step 49), worked by hand: `x` is 2, a product, 3, a product, a product,
+// and a sum, 6 nodes, the module's at each use, its second 2 the first one shared (step 50);
+// `row` is `lane` (4 values), 0.25, and a product (4 values), 3 nodes and a slab of 9; the
+// module's own row has its 9 tokens and no node; the last row is the comment, eight newlines, and
+// the `eof`. `check`'s lines come first, byte for
 // byte as `check` prints them.
 test "check_costs lists each declaration's tokens, nodes, and slab" {
     var writer: std.Io.Writer = .fixed(&output);
@@ -829,26 +831,27 @@ test "check_costs gives a feed its own row" {
         "      5       0       0       -  between declarations\n", table);
 }
 
-// Locks the table of a file past the client's 8 nodes (step 49): it is the counted program's, 17
-// nodes, after the error and the `limits:` line; each sum is 2 nodes, its 1 and itself, in line
-// order, then `a`'s wave.
+// Locks the table of a file past the client's 8 nodes (step 49): it is the counted program's, 10
+// nodes, after the error and the `limits:` line; `b` is 2 nodes, its 1 and itself, and every later
+// sum 1, the 1 shared (step 50): the most nodes first, then the most tokens (`a`'s 8), then the
+// line.
 test "check_costs past the node limit gives the counted program's table" {
     var writer: std.Io.Writer = .fixed(&output);
     const nine: commands.Source = .{ .name = "nine.jig", .text = nine_nodes };
     try testing.expect(!try client_command.check_costs(&client_compiled, &writer, nine, &.{}, &.{}));
-    try testing.expectEqualStrings("nine.jig:5:5: error: the program needs more than 8 nodes\n" ++
-        "    e = d + 1\n        ^^^^^\n    hint: raise `Limits.nodes`\n" ++
-        "limits: .{ .tokens = 58, .tree = 36, .names = 9, .nodes = 17, .slab = 17, .cues = 0, .goals = 0, .regions = 0, .tracks = 0, .modules = 0, .libraries = 0 }\n" ++
-        "costs: 58 tokens, 17 nodes, a slab of 17\n" ++ costs_head ++
+    try testing.expectEqualStrings("nine.jig:8:5: error: the program needs more than 8 nodes\n" ++
+        "    h = g + 1\n        ^^^^^\n    hint: raise `Limits.nodes`\n" ++
+        "limits: .{ .tokens = 58, .tree = 36, .names = 9, .nodes = 10, .slab = 10, .cues = 0, .goals = 0, .regions = 0, .tracks = 0, .modules = 0, .libraries = 0 }\n" ++
+        "costs: 58 tokens, 10 nodes, a slab of 10\n" ++ costs_head ++
         "      5       2       2       2  bind b\n" ++
-        "      5       2       2       3  bind c\n" ++
-        "      5       2       2       4  bind d\n" ++
-        "      5       2       2       5  bind e\n" ++
-        "      5       2       2       6  bind f\n" ++
-        "      5       2       2       7  bind g\n" ++
-        "      5       2       2       8  bind h\n" ++
-        "      5       2       2       9  bind i\n" ++
         "      8       1       1       1  bind a\n" ++
+        "      5       1       1       3  bind c\n" ++
+        "      5       1       1       4  bind d\n" ++
+        "      5       1       1       5  bind e\n" ++
+        "      5       1       1       6  bind f\n" ++
+        "      5       1       1       7  bind g\n" ++
+        "      5       1       1       8  bind h\n" ++
+        "      5       1       1       9  bind i\n" ++
         "     10       0       0       -  between declarations\n", writer.buffered());
 }
 

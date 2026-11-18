@@ -111,7 +111,8 @@ test "std's clamp is min of max, node for node" {
 
 // Locks section 2: numbers fold to one constant each, the core's own answer: |-2| is 2, min(1,
 // -0.5) is -0.5, max(-0, 0) is +0 and min(0, -0) is -0, |-0| is +0, and a clamp of numbers,
-// clamp(3, 0, 1), is 1, with no node of its own. A call that reads a signal is a node.
+// clamp(3, 0, 1), is 1, with no node of its own. A call that reads a signal is a node. The +0
+// of `c` and of `e` is one node (step 50), so the six are 5 nodes.
 test "abs, min, and max of numbers fold to a constant" {
     const source =
         \\use std
@@ -124,7 +125,7 @@ test "abs, min, and max of numbers fold to a constant" {
         \\
     ;
     try compile(&with_module, source);
-    try testing.expectEqual(@as(usize, 6), with_module.program.nodes.len);
+    try testing.expectEqual(@as(usize, 5), with_module.program.nodes.len);
     const expected = [_]struct { []const u8, f64 }{
         .{ "a", 2 }, .{ "b", -0.5 }, .{ "c", 0 }, .{ "d", -0.0 }, .{ "e", 0 }, .{ "f", 1 },
     };
@@ -272,7 +273,7 @@ test "abs, min, and max refuse what does not fit, as arithmetic does" {
 // Locks step 33's folding: each function of a number is the constant the core's function gives,
 // bit for bit, one node each: sin(1), cos(0) = 1, exp(1000) held at e^709, ln(0) held at the log
 // of 2^-1074, sqrt(-4) = 0, floor(-0.5) = -1, round(2.5) = 3, round(-0.5) = -1, and pow(3, 4) =
-// 81.
+// 81. The -1 of `f` and of `h` is one node (step 50), so the nine are 8 nodes.
 test "the functions of a value fold numbers to the core's constant" {
     const source =
         \\a = sin(1)
@@ -287,7 +288,7 @@ test "the functions of a value fold numbers to the core's constant" {
         \\
     ;
     try compile(&with_module, source);
-    try testing.expectEqual(@as(usize, 9), with_module.program.nodes.len);
+    try testing.expectEqual(@as(usize, 8), with_module.program.nodes.len);
     const F = weft.graph.Function;
     const expected = [_]struct { []const u8, f64 }{
         .{ "a", F.of(.sin, 1) }, .{ "b", 1 },  .{ "c", F.of(.exp, 709) }, .{ "d", F.of(.ln, 0x1p-1074) },

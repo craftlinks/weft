@@ -198,6 +198,8 @@ pub fn For(comptime client_limits: weft_text.Limits) type {
         /// The node array a file past `Limits.nodes` or `Limits.slab` is built into again, to
         /// count what it needs (section 4b).
         var counted_nodes: [nodes_counted_factor * client_limits.nodes]weft.Node = undefined;
+        /// The sharing table of that count: two slots a counted node.
+        var counted_shared: [2 * nodes_counted_max]weft_text.back_end.Shared = undefined;
         /// The rows of `costs`' table: one a declaration of the file, and the one between them.
         var cost_rows: [client_limits.names + 1]Cost = undefined;
 
@@ -292,7 +294,11 @@ pub fn For(comptime client_limits: weft_text.Limits) type {
             for (compiled.errors()) |found| {
                 if (found.code == .limit) break;
             } else return null;
-            switch (compiled.count_program(.{ .nodes = &counted_nodes })) {
+            const lent: ClientCompiled.Lent = .{
+                .nodes = &counted_nodes,
+                .shared = &counted_shared,
+            };
+            switch (compiled.count_program(lent)) {
                 .program => |program| {
                     assert(program.nodes.len <= nodes_counted_max);
                     try write_limits(writer, compiled.needs_of(program));
