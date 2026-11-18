@@ -55,6 +55,10 @@
 //!   differs by target. `@floor` is IEEE 754's roundToIntegralTowardNegative everywhere.
 //! - `power` multiplies x by itself n - 1 times, left to right, so `power(x, 2)` is `x * x` bit
 //!   for bit. It overflows to an infinity as a product does.
+//! - `step` (step 51) is 0 below 0 and 1 from 0 on, and `sign` is -1 below 0, 1 above, and +0 at
+//!   either zero, its sign bit cleared as `abs` clears it. A signed zero has one answer, so
+//!   `step(-0)` is 1, as -0 is 0. Each is a comparison and a constant: no rounding at all, and
+//!   an infinity is below or above 0 as any number. Both are non-decreasing.
 //!
 //! ## 5. TigerStyle Invariants
 //! - No allocation, no state, no libc, and fixed-length loops: safe on an audio thread.
@@ -182,6 +186,25 @@ pub fn round_half_away(x: f64) f64 {
     return if (std.math.signbit(x)) -rounded else rounded;
 }
 
+/// 0 below 0 and 1 from 0 on, -0 included; NaN passes through (section 4a).
+pub fn step(x: f64) f64 {
+    if (std.math.isNan(x)) return x;
+    const result: f64 = if (x >= 0) 1 else 0;
+    assert(result == 0 or result == 1);
+    if (x < 0) assert(result == 0);
+    return result;
+}
+
+/// -1 below 0, 1 above, and +0 at either zero; NaN passes through (section 4a).
+pub fn sign(x: f64) f64 {
+    if (std.math.isNan(x)) return x;
+    // A zero of either sign is equal to 0, so both take the third arm, a +0 literal.
+    const result: f64 = if (x < 0) -1 else if (x > 0) 1 else 0;
+    assert(!std.math.signbit(result) or result == -1);
+    assert(@abs(result) <= 1);
+    return result;
+}
+
 /// The fewest and the most factors `power` takes.
 pub const power_min = 2;
 pub const power_max = 8;
@@ -279,18 +302,18 @@ comptime {
     assert(@abs(@as(comptime_float, ln2_high) + ln2_low - std.math.ln2) < 1e-30);
 }
 
-/// 1 / n! for every `step`-th n from `power_first`, each `sign` times the one before.
+/// 1 / n! for every `stride`-th n from `power_first`, each `sign_change` times the one before.
 fn series_terms(
     comptime count: u32,
     comptime power_first: u32,
-    comptime step: u32,
+    comptime stride: u32,
     comptime sign_change: f64,
 ) [count]f64 {
     var terms: [count]f64 = undefined;
-    var sign: f64 = 1;
+    var term_sign: f64 = 1;
     for (&terms, 0..) |*term, index| {
-        term.* = sign / @as(f64, @floatFromInt(factorial(power_first + step * index)));
-        sign *= sign_change;
+        term.* = term_sign / @as(f64, @floatFromInt(factorial(power_first + stride * index)));
+        term_sign *= sign_change;
     }
     return terms;
 }
@@ -368,7 +391,7 @@ test "the functions of a value are total and finite" {
     for ([_]f64{ 0.1, -1.7, 3e100 }) |x| try testing.expectEqual(x * x, power(x, 2));
     try testing.expectEqual(@as(f64, -3.375), power(-1.5, 3));
     const nan = std.math.nan(f64);
-    const functions = [_]*const fn (f64) f64{ exponential, logarithm, square_root, round_half_away, sine_radians, cosine_radians };
+    const functions = [_]*const fn (f64) f64{ exponential, logarithm, square_root, round_half_away, sine_radians, cosine_radians, step, sign };
     for (functions) |f| try testing.expect(std.math.isNan(f(nan)));
 }
 

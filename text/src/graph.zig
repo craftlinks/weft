@@ -936,7 +936,9 @@ const Words = struct {
             .{ graph.Id, 1 },    .{ Time, 1 },       .{ Cue, 1 },
         };
         for (counts) |pair| assert(@typeInfo(pair[0]).@"struct".field_names.len == pair[1]);
-        assert(@typeInfo(graph.Function).@"union".field_names.len == 9);
+        // Step 51's `step` and `sign` make 11: the tag tells them apart, and neither has a
+        // payload, so `of_op` puts 0 for them as for every function but `pow`.
+        assert(@typeInfo(graph.Function).@"union".field_names.len == 11);
         // A tween's words: its 11 are the most an op has.
         assert(max == 11);
     }

@@ -58,7 +58,7 @@ zig-out/bin/weft sample FILE --signal NAME               # one signal
 - **Which calls take lanes**: `describe` gives each call's `"lanes"`. In `lanes(n, …)`, `noise`,
   `follow`, `shift`, and `delay` have the region's lanes (`region`), and so do `wave`, `tween`,
   `spring`, `newtonian`, and `bounce` given a `stagger:` (`stagger`). Every other call, `chase`,
-  `crossing`, `map`, `oscillator`, `min`, `max`, every function of a value (`abs`, `sin`, …),
+  `crossing`, `map`, `oscillator`, `min`, `max`, every function of a value (`abs`, `sin`, `step`, …),
   and the arithmetic among them, has the
   most lanes of the signals it reads (`inputs`).
 
@@ -100,6 +100,8 @@ soft = snappy(moves)                     # a module: a macro with types
 far = abs(wave - 0.5) + max(rise, 0.25)  # abs, min, max: calls, per component like +
 held = clamp(sum, -1, 1)                 # std's clamp: min(max(sum, -1), 1)
 curve = sin(index * tau) + pow(wave, 2)  # sin and cos in radians; also exp, ln, sqrt, floor, round
+gate = step(wave - 0.25)                 # 0 below 0, 1 from 0 on; sign(x) is -1, 0, or 1
+pick = 2 + step(wave) * (5 - 2)          # a choice is arithmetic: a + step(c) * (b - a)
 module bob2(base, amount: 0.1) = base + amount * wave(sine, 2hz)
 ```
 
@@ -123,6 +125,10 @@ Rules that trip agents most often:
   about -744.44, and `exp` above 709 holds e^709. `round` takes a half away from zero. `pow`'s
   `n` is a whole number from 2 to 8, fixed when the program is built, and `pow(x, 2)` has a tighter range than `x * x`.
   `quantize(x, step)` in `std` snaps to multiples of a fixed number `step`.
+- **No comparison and no `if`: `step(x)` and `sign(x)` instead.** `step` is 0 below 0 and 1
+  from 0 on (`step(-0)` is 1), `sign` is -1, +0, or 1. Both are exact and pure, with exact
+  ranges, so a gate needs no stepped node (`step(w - level)`, not a `crossing`) and a choice is
+  `a + step(c) * (b - a)`.
 - **A tween `after` a tween may leave out `from`**, and starts from that tween's `to`:
   `tween(to: 0, at: c1, over: 1s, after: rise)`. `after` must be a name bound to a tween;
   anything else needs `from`.

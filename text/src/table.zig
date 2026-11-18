@@ -280,6 +280,12 @@ const written = [_]Entry{
     .{ .name = "round", .op = tag(.function), .function = .round, .role = .signal, .folds = true, .shape = .{ .of = "input" }, .summary = "the nearest whole number to a signal, a half away from zero, per component", .params = &.{
         .{ .name = "input", .kind = .signal, .positional = true, .shaped = true, .doc = function_input_doc },
     } },
+    .{ .name = "step", .op = tag(.function), .function = .step, .role = .signal, .folds = true, .shape = .{ .of = "input" }, .summary = "0 where a signal is below 0 and 1 from 0 on, per component", .params = &.{
+        .{ .name = "input", .kind = .signal, .positional = true, .shaped = true, .doc = "the signal compared with 0, -0 counted as 0, per component of a vector or a colour" },
+    } },
+    .{ .name = "sign", .op = tag(.function), .function = .sign, .role = .signal, .folds = true, .shape = .{ .of = "input" }, .summary = "-1, 0, or 1 by a signal's sign, per component", .params = &.{
+        .{ .name = "input", .kind = .signal, .positional = true, .shaped = true, .doc = "the signal whose sign it gives, 0 for either zero, per component of a vector or a colour" },
+    } },
     .{ .name = "pow", .op = tag(.function), .function = .{ .pow = 0 }, .role = .signal, .folds = true, .shape = .{ .of = "input" }, .summary = "a signal to a whole power from 2 to 8, per component", .params = &.{
         .{ .name = "input", .kind = .signal, .positional = true, .shaped = true, .doc = function_input_doc },
         .{ .name = "n", .kind = .integer, .positional = true, .range = .{ elementary.power_min, elementary.power_max }, .hint = "for 1 write the signal itself; for more than 8 multiply two, such as `pow(x, 8) * pow(x, 2)`", .doc = "the power, a whole number literal from 2 to 8" },

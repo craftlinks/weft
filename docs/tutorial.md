@@ -940,17 +940,21 @@ The limits worth knowing before you design around Weft:
 - **Most parameters are constants.** Only those marked `live` take a signal. A tween's ends, a
   spring's goals, and a bounce's walls are fixed when the program is built: a literal, `pi`,
   `tau`, or their `+ - * /`, and no call or binding.
-- **Division by a number only, no comparison, no `if`.** `x / 4` is `x * 0.25`, so a divisor is
+- **Division by a number only.** `x / 4` is `x * 0.25`, so a divisor is
   a number other than 0 that is fixed when the program is built, never a signal, whose range
   could hold 0. The product is the quotient exactly when the divisor is a power of two, and
-  otherwise within one unit in the last place, the same on every target. A `crossing` is the one
-  way to make a gate; a `map` is the one way to rescale. Since 0.2, `abs(x)`, `min(a, b)`, and
+  otherwise within one unit in the last place, the same on every target. A `map` is the one way
+  to rescale. Since 0.2, `abs(x)`, `min(a, b)`, and
   `max(a, b)` exist, per component and per lane like `+`, with exact ranges, and `use std` gives
   `clamp(x, low, high)`. So do `sin` and `cos` in radians, `exp`, `ln`, `sqrt`, `floor`,
   `round` (a half away from zero), and `pow(x, n)` for a whole n from 2 to 8, each total:
   `sqrt(-1)` is 0, `ln(0)` about -744.44, `exp(1000)` e^709. `sin` and `cos` lose accuracy as
   their input grows: about 1e-10 at a million radians, and from 2^53 tau on they are 0 and 1.
   `use std` gives `quantize(x, step)` for a fixed `step`. There is no `tan` or `atan2`.
+- **No comparison, no `if`: `step(x)` and `sign(x)`.** `step` is 0 below 0 and 1 from 0 on, so
+  `step(-0)` is 1, and `sign` is -1, +0, or 1. Both are exact and pure, with exact ranges, so a
+  gate needs no stepped node, `step(w - 0.25)` where a `crossing` is simulated, and a choice is
+  arithmetic: `a + step(c) * (b - a)`. A `crossing` is still the way to an event at a level.
 - **No strings in a signal.** A value is one to four numbers. Since step 27 a string literal,
   `"text"`, exists for one use: a parameter of a client's noun (README, A Client's Nouns).
 - **A track holds a bounded number of writes** (`Limits.track_samples`, 1,024 by default).
@@ -992,6 +996,8 @@ target).
 | `not a whole number of flicks` | A time finer than the grid | Write the literal the hint names |
 | `4 lanes and 5 lanes do not go together` | Two regions of different sizes | Make the counts equal |
 | `` `n` is a whole number from 2 to 8 `` | `pow(x, 1)`, `pow(x, 10)`, `pow(x, 0.5)`, or `pow(x, k)` with k a name | Write `x`, multiply powers, use `sqrt`, or write the number |
+| A gate or a choice written as a ramp, `min(max(10000 * x + 1, 0), 1)`, or a `crossing` used only for its level | Before step 51 the language had no `step` | Write `step(x)`; a choice is `a + step(c) * (b - a)`, a sign `sign(x)` |
+| A file with a module of its own named `step` or `sign` is refused | The names are calls since step 51 | Rename the module, or delete it and use the call |
 | A `floor` of a chase steps between frames, or at a frame you did not expect | `floor` reads the chase's value interpolated between its fixed steps | Expected: a step falls where the smooth value crosses a whole number |
 | ``there is no call `clamp` `` | `clamp` is a module of `std`, not a primitive | Add `use std`, and pass `--use std=text/src/std.jig` to `weft` |
 | `` `min` is a primitive, not a module's name ``, or ``the module `clamp` is declared twice`` | A module of your own from before 0.2 named `abs`, `min`, or `max`, or `clamp` beside `use std` | Rename it, or delete it and use the call |

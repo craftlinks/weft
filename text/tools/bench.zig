@@ -651,7 +651,7 @@ fn beside(io: std.Io) void {
 }
 
 /// The ops of case 9, each 64 nodes of a program of its own.
-const Kind = enum { constant, add, multiply, map, abs, min, max, sin, cos, exp, ln, sqrt, floor, round, pow, wave, noise, tween, spring, newtonian, bounce, cues, track, chase, follow, shift, delay, crossing, oscillator };
+const Kind = enum { constant, add, multiply, map, abs, min, max, sin, cos, exp, ln, sqrt, floor, round, step, sign, pow, wave, noise, tween, spring, newtonian, bounce, cues, track, chase, follow, shift, delay, crossing, oscillator };
 
 var kind_goal_entries: [2]weft.Goal = undefined;
 var kind_region_entries: [1]weft.Region = undefined;
@@ -702,6 +702,8 @@ fn kind_program(kind: Kind) weft.Program {
             .sqrt => builder.apply(.sqrt, positive),
             .floor => builder.apply(.floor, input),
             .round => builder.apply(.round, input),
+            .step => builder.apply(.step, input),
+            .sign => builder.apply(.sign, input),
             .pow => builder.apply(.{ .pow = 3 }, input),
             .min => builder.minimum(input, half),
             .max => builder.maximum(input, half),
