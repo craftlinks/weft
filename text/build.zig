@@ -62,6 +62,7 @@ pub fn build(b: *std.Build) void {
         "test/modules.zig",
         "test/motion_by_lane.zig",
         "test/nouns.zig",
+        "test/sharing.zig",
         "test/sources.zig",
         "test/vectors.zig",
     };

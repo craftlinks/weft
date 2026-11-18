@@ -375,9 +375,10 @@ pub const Bouncers = struct {
     }
 };
 
-/// The vectors page's program (section 7).
-pub const vector_node_count = 25;
-pub const vector_slab_count = 55;
+/// The vectors page's program (section 7). `drift`'s two products read one 0.12, built once (Weft
+/// step 50).
+pub const vector_node_count = 24;
+pub const vector_slab_count = 54;
 pub const vector_goal_count = 4;
 pub const vector_source = @embedFile("vectors.jig");
 
@@ -437,8 +438,9 @@ pub const Vectors = struct {
 
 /// The lanes page's program (section 8).
 pub const field_count = 1000;
-pub const field_node_count = 14;
-pub const field_slab_count = 13 * field_count + 3;
+/// `tint`'s two products read one 0.13, built once (Weft step 50).
+pub const field_node_count = 13;
+pub const field_slab_count = 13 * field_count + 2;
 pub const field_source = @embedFile("lanes.jig");
 
 const FieldCompiled = weft_text.Compiled(.{
@@ -481,8 +483,9 @@ pub const Field = struct {
 
 /// The swarm page's program (section 9).
 pub const swarm_count = 48;
-pub const swarm_node_count = 15;
-pub const swarm_slab_count = 1876;
+/// `tint`'s two products read one 0.13, built once (Weft step 50).
+pub const swarm_node_count = 14;
+pub const swarm_slab_count = 1875;
 pub const swarm_source = @embedFile("swarm.jig");
 /// Seconds of checkpoints the swarm's reader keeps: the timeline and a little more.
 pub const swarm_checkpoint_seconds = 604;

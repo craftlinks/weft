@@ -499,7 +499,11 @@ from zero. So (`text/text.zig`, section 5):
 
 1. Each declaration gets a **fingerprint**: a hash of its tokens (ignoring comments and spacing)
    and of the fingerprints of the declarations it names.
-2. Nodes of declarations with the same name and fingerprint in both programs are **twins**.
+2. A declaration with the same name and fingerprint in both programs pairs its nodes that keep
+   state, simulated nodes and inputs, in order: the k-th such node with the old declaration's
+   k-th. These pairs are **twins**; no other node has one. A number or a pure call written
+   twice is built once, so a declaration's pure nodes depend on what earlier lines built, which
+   its fingerprint does not cover; the nodes that keep state are never shared.
 3. If every simulated node has a twin, the new reader **adopts** the old one's slab regions and
    checkpoints, copied to their new offsets.
 

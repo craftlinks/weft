@@ -1,9 +1,9 @@
-ok: 11 nodes, a slab of 17, 1 cues, 0 goals, 0 regions, 0 tracks, seekable, closed form
-limits: .{ .tokens = 56, .tree = 27, .names = 6, .nodes = 11, .slab = 17, .cues = 1, .goals = 0, .regions = 0, .tracks = 0, .modules = 1, .libraries = 0 }
+ok: 10 nodes, a slab of 16, 1 cues, 0 goals, 0 regions, 0 tracks, seekable, closed form
+limits: .{ .tokens = 56, .tree = 27, .names = 6, .nodes = 10, .slab = 16, .cues = 1, .goals = 0, .regions = 0, .tracks = 0, .modules = 1, .libraries = 0 }
 a lane costs 2 of the slab
-costs: 56 tokens, 11 nodes, a slab of 17
+costs: 56 tokens, 10 nodes, a slab of 16
  tokens   nodes    slab    line  declaration
-     13       7       7       7  bind x
+     13       6       6       7  bind x
      10       3       9       8  bind row
       8       1       1       6  bind w
       9       0       0       5  module twice

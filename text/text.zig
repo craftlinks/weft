@@ -28,11 +28,11 @@
 //! its field of `Limits`, never a crash.
 //!
 //! Past `Limits.nodes` or `Limits.slab`, a caller can lend memory to count what the file needs
-//! (step 49): `count_program` builds the program again into a node array of the caller's, `Lent`,
-//! with the slab only counted, and `needs_of` gives the least `Limits` of that program. Nothing of
-//! the failed compile changes but the tables and the arrays that describe the program, so the
-//! diagnostics stay as they were and `ok` stays false. `declaration_ends` splits the node array by
-//! checked declaration, for a table of what each costs.
+//! (step 49): `count_program` builds the program again into a node array and a sharing table of
+//! the caller's, `Lent`, with the slab only counted, and `needs_of` gives the least `Limits` of
+//! that program. Nothing of the failed compile changes but the tables and the arrays that describe
+//! the program, so the diagnostics stay as they were and `ok` stays false. `declaration_ends`
+//! splits the node array by checked declaration, for a table of what each costs.
 //!
 //! ## 2a. The Language's Part
 //! `Compiled` is two jobs in one struct (step 57). Its fields from `syntax` to `checked` are the
@@ -94,8 +94,12 @@
 //! - A binding's fingerprint hashes its declaration's tokens (comments and spacing left out),
 //!   the fingerprints of the earlier bindings it names, and the seed, the start, the modules, and
 //!   the libraries. Two bindings with one name and one fingerprint build the same nodes.
-//! - `twins` pairs each node with the node at the same place among its binding's nodes in the
-//!   old program; a track's node is skipped, since it is built where it is first read.
+//! - `twins` pairs the k-th node of a binding that keeps state, a simulated node or an `input`,
+//!   with the k-th such node of the old binding, and gives every other node none. The back end
+//!   builds a number or a pure call written twice once (`src/graph.zig`, section 10), so a
+//!   binding's pure nodes depend on what earlier lines happened to build, which its fingerprint
+//!   does not cover; the nodes that keep state are never shared, so they are always its own, and
+//!   they are the only ones `State.adopt` reads a twin for.
 //! - `State.adopt` takes the old reader's state only when every simulated node has a twin, so a
 //!   changed simulated node, or one whose input changed, starts the whole reader fresh, which is
 //!   right: its history is a new one. A file that feeds a delay never carries.
@@ -198,6 +202,13 @@ fn through_spread(nodes: []const graph.Node, id: graph.Id) graph.Id {
     };
 }
 
+/// Whether `node` keeps state a recompile carries: a simulated node or an `input`, the nodes
+/// `State.adopt` reads a twin for (section 5). The back end never shares one.
+fn keeps_state(node: *const graph.Node) bool {
+    assert(node.extent.lanes >= 1);
+    return node.op.simulated() or node.op == .input;
+}
+
 /// Hashes the tags and texts of an item's tokens, comments and newlines left out, so spacing and
 /// comments never change a fingerprint.
 fn hash_tokens(hash: *std.hash.Fnv1a_64, tree: *const parse.Tree, index: u32) void {
@@ -263,6 +274,8 @@ pub fn Compiled(comptime limits: Limits) type {
         node_ranges: [limits.names]back_end.NodeRange,
         /// Each checked declaration's node count once built (`back_end.Memory.declaration_ends`).
         declaration_ends: [limits.names]u32,
+        /// The back end's sharing table (`back_end.Memory.shared`): two slots a node.
+        shared: [2 * limits.nodes]back_end.Shared,
         /// Each binding's fingerprint (section 5), for a recompile's carry.
         fingerprints: [limits.names]u64,
         /// The file feeds a delay, so a recompile never carries its state (section 5).
@@ -285,7 +298,11 @@ pub fn Compiled(comptime limits: Limits) type {
 
         /// Memory a caller lends `count_program` (section 2): a struct, so a field can join
         /// without changing the call.
-        pub const Lent = struct { nodes: []graph.Node };
+        pub const Lent = struct {
+            nodes: []graph.Node,
+            /// The sharing table of the count, at least twice `nodes.len` slots.
+            shared: []back_end.Shared,
+        };
 
         /// Compiles `source` in place. On an error, `errors` lists what was found, and the
         /// program is not set.
@@ -321,7 +338,7 @@ pub fn Compiled(comptime limits: Limits) type {
         pub fn build_program(compiled: *Self, libraries: []const Source) error{Invalid}!void {
             assert(compiled.checked.ok);
             assert(!compiled.ok);
-            const memory = compiled.memory_of(&compiled.nodes);
+            const memory = compiled.memory_of(&compiled.nodes, &compiled.shared);
             const tree = &compiled.syntax.tree;
             const diagnostics = &compiled.syntax.diagnostics;
             const checked = &compiled.checked;
@@ -342,8 +359,9 @@ pub fn Compiled(comptime limits: Limits) type {
             assert(compiled.checked.ok);
             assert(!compiled.ok);
             assert(lent.nodes.len >= 1);
+            assert(lent.shared.len >= 2 * lent.nodes.len);
             const errors_before = compiled.syntax.diagnostics.total();
-            const memory = compiled.memory_of(lent.nodes);
+            const memory = compiled.memory_of(lent.nodes, lent.shared);
             const tree = &compiled.syntax.tree;
             const counted = back_end.count(&compiled.checked, tree, memory, &compiled.tables);
             assert(compiled.syntax.diagnostics.total() == errors_before);
@@ -351,9 +369,15 @@ pub fn Compiled(comptime limits: Limits) type {
             return counted;
         }
 
-        /// The back end's memory: this `Compiled`'s arrays, with `nodes` for the node array.
-        fn memory_of(compiled: *Self, nodes: []graph.Node) back_end.Memory {
+        /// The back end's memory: this `Compiled`'s arrays, with `nodes` for the node array and
+        /// `shared` for its sharing table.
+        fn memory_of(
+            compiled: *Self,
+            nodes: []graph.Node,
+            shared: []back_end.Shared,
+        ) back_end.Memory {
             assert(nodes.len >= 1);
+            assert(shared.len >= 2 * nodes.len);
             assert(compiled.checked.ok);
             return .{
                 .nodes = nodes,
@@ -372,6 +396,7 @@ pub fn Compiled(comptime limits: Limits) type {
                 .call_ids = &compiled.call_ids,
                 .node_ranges = &compiled.node_ranges,
                 .declaration_ends = &compiled.declaration_ends,
+                .shared = shared,
             };
         }
 
@@ -463,9 +488,10 @@ pub fn Compiled(comptime limits: Limits) type {
             }
         }
 
-        /// For each node of this program, its twin in `old`'s (section 5), or null: a node of a
-        /// binding with the same name and fingerprint in both, at the same place among the
-        /// binding's nodes, a track's nodes not counted.
+        /// For each node of this program, its twin in `old`'s (section 5), or null: for a node
+        /// that keeps state, a simulated node or an `input`, of a binding with the same name and
+        /// fingerprint in both, the node at the same place among the old binding's nodes that
+        /// keep state. Every other node has none: `State.adopt` reads no twin for it.
         pub fn twins(compiled: *const Self, old: *const Self, out: []?u32) void {
             assert(compiled.ok and old.ok);
             assert(out.len == compiled.program.nodes.len);
@@ -478,10 +504,11 @@ pub fn Compiled(comptime limits: Limits) type {
                 const old_range = old.node_ranges[old_at];
                 var j = old_range.first;
                 for (range.first..range.end) |i| {
-                    if (compiled.program.nodes[i].op == .track) continue;
-                    while (j < old_range.end and old.program.nodes[j].op == .track) j += 1;
+                    if (!keeps_state(&compiled.program.nodes[i])) continue;
+                    while (j < old_range.end and !keeps_state(&old.program.nodes[j])) j += 1;
                     if (j == old_range.end) break;
-                    out[i] = j;
+                    assert(keeps_state(&old.program.nodes[j]));
+                    out[i] = @intCast(j);
                     j += 1;
                 }
             }
@@ -970,11 +997,12 @@ const Eight = Compiled(.{
 
 var eight: Eight = undefined;
 var lent_nodes: [32]graph.Node = undefined;
+var lent_shared: [2 * lent_nodes.len]back_end.Shared = undefined;
 
 /// A delay, the feed that closes it, and a sum that reads it.
 const fed = "cue c0 = 0s\nd = delay(0)\nd <- d * 0.5 + 1\nout = d + 2\n";
 
-/// Nine bindings and 17 nodes: a wave and eight sums of a fresh 1 each.
+/// Nine bindings and 10 nodes: a wave, one 1 that every sum shares (step 50), and eight sums.
 const nine = "a = wave(sine, 1hz)\nb = a + 1\nc = b + 1\nd = c + 1\ne = d + 1\nf = e + 1\n" ++
     "g = f + 1\nh = g + 1\ni = h + 1\n";
 
@@ -989,21 +1017,22 @@ test "each declaration's end in the node array, a feed's own" {
 }
 
 // Locks `count_program` past `Limits.nodes` (8): `nine` fails to compile with one error; 32 lent
-// nodes build its program of 17 nodes and a slab of 17, whose least limits are 17 nodes, a slab
-// of 17, 58 tokens, a tree of 36, and 9 names. The file stays not `ok`, and its one error is
-// unchanged, byte for byte.
+// nodes build its program of 10 nodes and a slab of 10 (a wave, one shared 1, eight sums), whose
+// least limits are 10 nodes, a slab of 10, 58 tokens, a tree of 36, and 9 names. The file stays
+// not `ok`, and its one error is unchanged, byte for byte.
 test "count_program builds a file past its node limit into lent memory" {
     try testing.expectError(error.Invalid, eight.compile(nine));
     try testing.expectEqual(@as(usize, 1), eight.errors().len);
     const before = eight.errors()[0];
-    const counted = eight.count_program(.{ .nodes = &lent_nodes });
+    const lent: Eight.Lent = .{ .nodes = &lent_nodes, .shared = &lent_shared };
+    const counted = eight.count_program(lent);
     try testing.expect(counted == .program);
     const program = counted.program;
-    try testing.expectEqual(@as(usize, 17), program.nodes.len);
-    try testing.expectEqual(@as(u32, 17), program.slab_count);
+    try testing.expectEqual(@as(usize, 10), program.nodes.len);
+    try testing.expectEqual(@as(u32, 10), program.slab_count);
     const needs = eight.needs_of(program);
-    try testing.expectEqual(@as(u32, 17), needs.nodes);
-    try testing.expectEqual(@as(u32, 17), needs.slab);
+    try testing.expectEqual(@as(u32, 10), needs.nodes);
+    try testing.expectEqual(@as(u32, 10), needs.slab);
     try testing.expectEqual(@as(u32, 58), needs.tokens);
     try testing.expectEqual(@as(u32, 36), needs.tree);
     try testing.expectEqual(@as(u32, 9), needs.names);
@@ -1016,14 +1045,16 @@ test "count_program builds a file past its node limit into lent memory" {
     try testing.expectEqualStrings(before.hint_text(), after.hint_text());
 }
 
-// Locks the lent array's own bound: 16 nodes are one short of `nine`'s 17 and say so; exactly 17
+// Locks the lent array's own bound: 9 nodes are one short of `nine`'s 10 and say so; exactly 10
 // build it.
 test "count_program says when the lent nodes are too few as well" {
     try testing.expectError(error.Invalid, eight.compile(nine));
-    try testing.expect(eight.count_program(.{ .nodes = lent_nodes[0..16] }) == .nodes_full);
-    const counted = eight.count_program(.{ .nodes = lent_nodes[0..17] });
+    const short: Eight.Lent = .{ .nodes = lent_nodes[0..9], .shared = &lent_shared };
+    try testing.expect(eight.count_program(short) == .nodes_full);
+    const exact: Eight.Lent = .{ .nodes = lent_nodes[0..10], .shared = &lent_shared };
+    const counted = eight.count_program(exact);
     try testing.expect(counted == .program);
-    try testing.expectEqual(@as(usize, 17), counted.program.nodes.len);
+    try testing.expectEqual(@as(usize, 10), counted.program.nodes.len);
     try testing.expectEqual(@as(usize, 1), eight.errors().len);
 }
 
@@ -1035,7 +1066,8 @@ test "count_program says when the builder refuses the file for another reason" {
     try testing.expect(small.checked.ok);
     try testing.expectEqual(@as(usize, 1), small.errors().len);
     try testing.expectEqual(diagnostic.Code.refused, small.errors()[0].code);
-    try testing.expect(small.count_program(.{ .nodes = &lent_nodes }) == .refused);
+    const lent: Small.Lent = .{ .nodes = &lent_nodes, .shared = &lent_shared };
+    try testing.expect(small.count_program(lent) == .refused);
     try testing.expectEqual(@as(usize, 1), small.errors().len);
     try testing.expectEqualStrings("chase: `overshoot` must be in [0, 1)", small.errors()[0].message_text());
 }

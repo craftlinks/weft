@@ -380,8 +380,8 @@ test "a declared range allows the analysis's rounding margin" {
 }
 
 // Locks Jig's step 2: a module with a local is the graph written by hand, node for node, and
-// the table of Why is 4 nodes (the wave, the abs, the product, the sum) where the body written
-// twice is 6.
+// the table of Why is 4 nodes (the wave, the abs, the product, the sum). The body written twice
+// was 6 and is now 4 as well, since the back end builds an `abs` of one input once (step 50).
 test "a module's local is one node however often it is read" {
     try expect_same(
         "w = wave(sine, 1hz)\nmodule m(x) =\n    a = abs(x)\n    a + a * a\nout = m(w)\n",
@@ -392,7 +392,7 @@ test "a module's local is one node however often it is read" {
         "w = wave(sine, 1hz)\nmodule m(x) = abs(x) + abs(x) * abs(x)\nout = m(w)\n",
         "w = wave(sine, 1hz)\nout = abs(w) + abs(w) * abs(w)\n",
     );
-    try testing.expectEqual(@as(usize, 6), with_modules.program.nodes.len);
+    try testing.expectEqual(@as(usize, 4), with_modules.program.nodes.len);
 }
 
 // Locks Jig's step 2 in Weft: a local `bounce` read as `b` and as `b.velocity` is one `bounce`,
