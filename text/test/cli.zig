@@ -601,7 +601,7 @@ test "a client checks and samples its own Compiled, at its own limits" {
     const source: commands.Source = .{ .name = "cues.jig", .text = many_cues };
     var writer: std.Io.Writer = .fixed(&output);
     try testing.expect(!try commands.check(&compiled, &writer, source, &.{}, &.{}));
-    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "error: the file needs more than 512 cues") != null);
+    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "error: the file needs at least 601 cues, and `Limits.cues` is 512") != null);
 
     // One compile, as a client's own load makes it, then its lines and its JSON.
     try client_compiled.compile_client(&.{}, &.{}, many_cues);
