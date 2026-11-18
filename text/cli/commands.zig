@@ -73,11 +73,11 @@
 //! ## 4b. By How Much, and What Costs Most (step 49)
 //! A file past a limit gets, under its diagnostics, which stay as they were, a `limits:` line of
 //! the least `Limits` it needs, the line a file that compiles gets. Past `Limits.tokens`, the text
-//! the errors are about is counted with Jig's `token.next`, and the line is `at least .{ .tokens =
-//! N }`, since the checker stopped. Past `Limits.nodes` or `Limits.slab`, the program is built
-//! again into `counted_nodes`, `nodes_counted_factor` times the client's `nodes`, and the line has
-//! every field; past that array too, it is `at least` one node more than it holds. A refusal that
-//! is not a limit gets no line.
+//! the errors are about is counted with Jig's `token.count`, the count Jig's error gives (Jig's
+//! step 6), and the line is `at least .{ .tokens = N }`, since the checker stopped. Past
+//! `Limits.nodes` or `Limits.slab`, the program is built again into `counted_nodes`,
+//! `nodes_counted_factor` times the client's `nodes`, and the line has every field; past that array
+//! too, it is `at least` one node more than it holds. A refusal that is not a limit gets no line.
 //!
 //! `check_costs` prints what `check` prints, then a table of the file's declarations, where there
 //! is a program, the counted one included, or a file of a client's signals, whose rows have no
@@ -278,7 +278,7 @@ pub fn For(comptime client_limits: weft_text.Limits) type {
         ) !void {
             assert(!compiled.checked.ok);
             const text = if (compiled.failed_library) |at| libraries[at].text else source.text;
-            const tokens = token_count(text);
+            const tokens = jig.token.count(text);
             assert(tokens >= 1);
             if (tokens <= client_limits.tokens) return;
             try writer.print("limits: at least .{{ .tokens = {d} }}\n", .{tokens});
@@ -660,28 +660,6 @@ fn write_limits(writer: *std.Io.Writer, needs: weft_text.Limits) !void {
         try writer.print("{s} .{s} = {d}", .{ comma, name, @field(needs, name) });
     }
     try writer.writeAll(" }\n");
-}
-
-/// The tokens Jig's tokenizer writes for `text` into an array large enough, the `eof` included
-/// (section 4b): one a token from `jig.token.next` at each byte that is not a space, a tab, or a
-/// carriage return. Bounded by the text's length, since each token takes at least one byte.
-fn token_count(text: []const u8) u64 {
-    assert(text.len < std.math.maxInt(u32));
-    var count: u64 = 0;
-    var index: u32 = 0;
-    while (index < text.len) {
-        const byte = text[index];
-        if (byte == ' ' or byte == '\t' or byte == '\r') {
-            index += 1;
-            continue;
-        }
-        const found = jig.token.next(text, index);
-        assert(found.len > 0);
-        index += found.len;
-        count += 1;
-    }
-    assert(count <= text.len);
-    return count + 1;
 }
 
 /// One row of `costs`' table (section 4b).
