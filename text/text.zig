@@ -54,9 +54,10 @@
 //! A client that writes a number back into its text, a knob, a slider, a retime, finds it
 //! through the checker's own grammar (step 41), never a copy of it: `cue_form` gives what a
 //! cue's declaration is made of, `track_form` a track's three numbers as plain literals' bytes
-//! or what else they are, and `read_time` and `write_time` read and write a time literal
-//! exactly (`check.zig`, sections 3c, 4, and 4a). `Syntax.track_form` reads the tree alone, for
-//! a client that binds its numbers while another line has an error. Weft never edits the text:
+//! or what else they are, `number_form` any number's (Jig step 12), and `read_time` and
+//! `write_time` read and write a time literal exactly (`check.zig`, sections 3c, 4, and 4a).
+//! `Syntax.track_form` reads the tree alone, for a client that binds its numbers while another
+//! line has an error. Weft never edits the text:
 //! the client replaces its own bytes and compiles again, which checks the edit.
 //!
 //! ## 3b. Where Text Is Written (Jig step 3)
@@ -734,6 +735,12 @@ pub fn Compiled(comptime limits: Limits) type {
             out: *[schema.params_max]u32,
         ) ?[]const u32 {
             return jig.file.constructor_parts(&compiled.syntax.tree, entries, item, out);
+        }
+
+        /// How the number at `item` is written (section 3a, Jig step 12): its kind, its bytes,
+        /// and through them its value.
+        pub fn number_form(compiled: *const Self, item: u32) check.NumberForm {
+            return check.number_form(&compiled.syntax.tree, item);
         }
 
         /// The declaration of `name`, of any kind.

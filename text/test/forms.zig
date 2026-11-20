@@ -256,6 +256,32 @@ test "a track's forms are read while the file has an error" {
     try testing.expectEqual(@as(?jig.check.TrackForm, null), syntax.track_form("r"));
 }
 
+// Locks Compiled.number_form, as a client reads a `vec2`'s parts: of `vec2(-0.5, 1e3)`, `-0.5`
+// is plain, its bytes `-0.5` and its value -0.5, and `1e3` an exponent of value 1000 with no
+// plain bytes; of `vec2(2 * 0.25, tau)`, both are folded with no value.
+test "a number is read through its form" {
+    const source =
+        \\p = vec2(-0.5, 1e3)
+        \\q = vec2(2 * 0.25, tau)
+        \\
+    ;
+    const file = try compile(source);
+    var out: [jig.schema.params_max]u32 = undefined;
+    const p = file.syntax.tree.item(file.declaration_of("p").?.item).a;
+    const p_parts = file.constructor_parts(weft_text.table.vocabulary.entries, p, &out).?;
+    try testing.expectEqualStrings("-0.5", file.number_form(p_parts[0]).plain().?.of(source));
+    try testing.expectEqual(@as(?f64, -0.5), file.number_form(p_parts[0]).value(source));
+    try testing.expectEqual(jig.check.NumberForm.Kind.exponent, file.number_form(p_parts[1]).kind);
+    try testing.expectEqual(@as(?jig.check.Bytes, null), file.number_form(p_parts[1]).plain());
+    try testing.expectEqual(@as(?f64, 1000), file.number_form(p_parts[1]).value(source));
+    const q = file.syntax.tree.item(file.declaration_of("q").?.item).a;
+    const q_parts = file.constructor_parts(weft_text.table.vocabulary.entries, q, &out).?;
+    for (q_parts) |part| {
+        try testing.expectEqual(jig.check.NumberForm.Kind.folded, file.number_form(part).kind);
+        try testing.expectEqual(@as(?f64, null), file.number_form(part).value(source));
+    }
+}
+
 /// Whether `text` is the shortest literal of its value: no zero ends a fraction, and no zero
 /// starts a whole part of more than one digit.
 fn shortest(text: []const u8) bool {
